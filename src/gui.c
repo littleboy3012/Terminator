@@ -10,6 +10,7 @@
 #include <poll.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <signal.h>
 
 #define DEFAULT_FONT_NAME "fixed"
 #define PROMPT_STRING "user@terminator> "

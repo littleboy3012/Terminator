@@ -34,6 +34,9 @@ index 0a32a09..4c6afea 100644
  test: $(TARGET)
  	@echo "Testing built-in and external command execution..."
  	./$(TARGET) < /dev/null
+diff --git a/diffs/phase2_gui.diff b/diffs/phase2_gui.diff
+new file mode 100644
+index 0000000..e69de29
 diff --git a/include/gui.h b/include/gui.h
 new file mode 100644
 index 0000000..371c261
@@ -238,10 +241,10 @@ index 0000000..371c261
 +#endif /* GUI_H */
 diff --git a/src/gui.c b/src/gui.c
 new file mode 100644
-index 0000000..0d430da
+index 0000000..cfdee8f
 --- /dev/null
 +++ b/src/gui.c
-@@ -0,0 +1,909 @@
+@@ -0,0 +1,910 @@
 +#include "gui.h"
 +#include "parser.h"
 +#include "builtins.h"
@@ -254,6 +257,7 @@ index 0000000..0d430da
 +#include <poll.h>
 +#include <sys/wait.h>
 +#include <sys/types.h>
++#include <signal.h>
 +
 +#define DEFAULT_FONT_NAME "fixed"
 +#define PROMPT_STRING "user@terminator> "
