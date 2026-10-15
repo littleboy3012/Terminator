@@ -1,0 +1,9 @@
+# Build artifacts
+build/
+terminator
+*.o
+
+# Temporary test files
+test_file.txt
+test_out.txt
+*.tmp
