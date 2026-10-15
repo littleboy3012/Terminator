@@ -1,0 +1,72 @@
+#ifndef SHELL_H
+#define SHELL_H
+
+#include <stddef.h>
+#include <limits.h>
+
+#ifndef PATH_MAX
+#define PATH_MAX 4096
+#endif
+
+/**
+ * @brief Structure representing a single parsed command,
+ *        including its arguments and I/O redirection targets.
+ */
+typedef struct {
+    char **argv;          /**< NULL-terminated array of argument strings (argv[0] is the command name) */
+    int argc;             /**< Number of arguments in argv */
+    char *input_file;     /**< Path to file for input redirection ('<'), or NULL if none */
+    char *output_file;    /**< Path to file for output redirection ('>'), or NULL if none */
+} Command;
+
+/**
+ * @brief Structure representing an entire pipeline of commands (e.g. cmd1 | cmd2 | cmd3).
+ */
+typedef struct {
+    Command *commands;    /**< Array of Command structures in the pipeline */
+    int num_commands;     /**< Total number of commands connected by pipes */
+} Pipeline;
+
+/**
+ * @brief Structure maintaining the persistent state of an individual shell instance / tab.
+ */
+typedef struct {
+    int last_exit_status; /**< Exit status of the most recently executed foreground command ($?) */
+    int should_exit;      /**< Non-zero if the shell received an 'exit' command and should shut down */
+    char cwd[PATH_MAX];   /**< Current working directory of this shell session */
+} ShellContext;
+
+/**
+ * @brief Initializes a ShellContext structure to its default starting values.
+ *
+ * @param[out] ctx Pointer to the ShellContext to initialize. Must not be NULL.
+ * @return 0 on success, or -1 if ctx is NULL or getting the initial cwd fails.
+ */
+int shell_init(ShellContext *ctx);
+
+/**
+ * @brief Cleans up any resources held by a ShellContext before destruction.
+ *
+ * @param[in,out] ctx Pointer to the ShellContext to clean up.
+ */
+void shell_cleanup(ShellContext *ctx);
+
+/**
+ * @brief Executes a complete pipeline of commands with support for I/O redirection and piping.
+ *
+ * @param[in,out] ctx Pointer to the active ShellContext (used for cwd, built-ins, and storing $?).
+ * @param[in] pipeline Pointer to the Pipeline structure describing commands to run.
+ * @return Exit status of the last command in the pipeline (or built-in status).
+ */
+int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline);
+
+/**
+ * @brief Executes a single Command, either as a built-in function or by forking an external executable.
+ *
+ * @param[in,out] ctx Pointer to the active ShellContext.
+ * @param[in] cmd Pointer to the Command structure to execute.
+ * @return Exit status code of the command (0 on success, non-zero on error).
+ */
+int shell_execute_command(ShellContext *ctx, const Command *cmd);
+
+#endif /* SHELL_H */
