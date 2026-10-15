@@ -3,7 +3,11 @@
 
 CC = gcc
 CFLAGS = -Wall -Wextra -g -O2 -Iinclude
-LDFLAGS = -lpthread -lrt
+# LDFLAGS includes:
+# -lX11: Xlib client-side library for window rendering and keyboard events
+# -lpthread: POSIX threads support for thread mode
+# -lrt: POSIX real-time library for shared memory and semaphores
+LDFLAGS = -lX11 -lpthread -lrt
 
 # Project directories
 SRC_DIR = src
@@ -15,7 +19,8 @@ TARGET = terminator
 SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/shell.c \
        $(SRC_DIR)/parser.c \
-       $(SRC_DIR)/builtins.c
+       $(SRC_DIR)/builtins.c \
+       $(SRC_DIR)/gui.c
 
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 
@@ -35,7 +40,7 @@ $(BUILD_DIR):
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
 
-# Quick test rule to verify execution in WSL environment
+# Quick test rule to verify execution in headless environment
 test: $(TARGET)
 	@echo "Testing built-in and external command execution..."
 	./$(TARGET) < /dev/null

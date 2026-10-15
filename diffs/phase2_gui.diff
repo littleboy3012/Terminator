@@ -1,0 +1,1321 @@
+diff --git a/Makefile b/Makefile
+index 0a32a09..4c6afea 100644
+--- a/Makefile
++++ b/Makefile
+@@ -3,7 +3,11 @@
+ 
+ CC = gcc
+ CFLAGS = -Wall -Wextra -g -O2 -Iinclude
+-LDFLAGS = -lpthread -lrt
++# LDFLAGS includes:
++# -lX11: Xlib client-side library for window rendering and keyboard events
++# -lpthread: POSIX threads support for thread mode
++# -lrt: POSIX real-time library for shared memory and semaphores
++LDFLAGS = -lX11 -lpthread -lrt
+ 
+ # Project directories
+ SRC_DIR = src
+@@ -15,7 +19,8 @@ TARGET = terminator
+ SRCS = $(SRC_DIR)/main.c \
+        $(SRC_DIR)/shell.c \
+        $(SRC_DIR)/parser.c \
+-       $(SRC_DIR)/builtins.c
++       $(SRC_DIR)/builtins.c \
++       $(SRC_DIR)/gui.c
+ 
+ OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
+ 
+@@ -35,7 +40,7 @@ $(BUILD_DIR):
+ clean:
+ 	rm -rf $(BUILD_DIR) $(TARGET)
+ 
+-# Quick test rule to verify execution in WSL environment
++# Quick test rule to verify execution in headless environment
+ test: $(TARGET)
+ 	@echo "Testing built-in and external command execution..."
+ 	./$(TARGET) < /dev/null
+diff --git a/include/gui.h b/include/gui.h
+new file mode 100644
+index 0000000..371c261
+--- /dev/null
++++ b/include/gui.h
+@@ -0,0 +1,196 @@
++#ifndef GUI_H
++#define GUI_H
++
++#include <X11/Xlib.h>
++#include <X11/Xutil.h>
++#include <X11/keysym.h>
++#include <sys/types.h>
++#include <limits.h>
++#include "shell.h"
++
++#define MAX_TABS 16
++#define MAX_LINE_CHARS 1024
++#define MAX_BUFFER_LINES 2000
++#define TAB_BAR_HEIGHT 28
++
++/**
++ * @brief Represents the visual category of a line in the terminal buffer.
++ */
++typedef enum {
++    LINE_TYPE_OUTPUT,       /**< Standard program output (rendered in light output color) */
++    LINE_TYPE_PROMPT_INPUT  /**< Command line containing red prompt and green user command */
++} LineType;
++
++/**
++ * @brief Represents a single line of text stored in a tab's scrollback buffer.
++ */
++typedef struct {
++    char text[MAX_LINE_CHARS]; /**< Null-terminated string content of the line */
++    LineType type;             /**< Visual style/type for rendering */
++    int prompt_len;            /**< Length of the prompt prefix in characters, if applicable */
++} TermLine;
++
++/**
++ * @brief Represents a single independent terminal tab.
++ *
++ * Each tab maintains:
++ * - Its own scrollback text buffer.
++ * - Current directory (`cwd`).
++ * - Active input line being typed by the user.
++ * - Non-blocking pipes to receive asynchronous output from commands.
++ * - Independent ShellContext for exit status ($?) and variables.
++ */
++typedef struct {
++    int tab_id;                             /**< Unique numeric identifier for this tab (1-indexed) */
++    char cwd[PATH_MAX];                     /**< Tab's current working directory */
++    TermLine lines[MAX_BUFFER_LINES];       /**< Scrollback line buffer */
++    int num_lines;                          /**< Total number of lines currently stored in buffer */
++    int scroll_offset;                      /**< Vertical scroll offset (0 = scrolled to bottom) */
++    char input_buffer[MAX_LINE_CHARS];      /**< Line currently being typed by the user */
++    int input_len;                          /**< Number of characters in input_buffer */
++    int cursor_pos;                         /**< Current cursor position within input_buffer */
++    ShellContext shell_ctx;                 /**< Shell context specific to this tab */
++    int is_running_cmd;                     /**< Flag indicating whether a background command is currently running */
++    pid_t running_pid;                      /**< PID of the running child command (or 0 if idle) */
++    int out_pipe_fd;                        /**< Read end of the pipe capturing stdout/stderr from child process */
++} Tab;
++
++/**
++ * @brief Main GUI application structure holding all X11 state and tabs.
++ */
++typedef struct {
++    Display *display;        /**< Connection handle to the X server */
++    int screen;              /**< Default screen number on the display */
++    Window window;           /**< Top-level X11 window handle */
++    Pixmap back_buffer;      /**< Off-screen pixmap for double-buffered flicker-free rendering */
++    XFontStruct *font;       /**< Loaded monospace font structure */
++    int font_width;          /**< Width in pixels of a single character */
++    int font_height;         /**< Height in pixels of a text line (ascent + descent) */
++    int font_ascent;         /**< Font ascent in pixels (baseline distance from top of character) */
++    int win_width;           /**< Current window width in pixels */
++    int win_height;          /**< Current window height in pixels */
++
++    /* Graphical Contexts (GC) with distinct colors */
++    GC gc_bg;                /**< Graphics Context for black background */
++    GC gc_prompt;            /**< Graphics Context for Red prompt ("user@terminator>") */
++    GC gc_input;             /**< Graphics Context for Neon Green typed user commands */
++    GC gc_output;            /**< Graphics Context for Command output text */
++    GC gc_cursor;            /**< Graphics Context for drawing the blinking / solid block cursor */
++    GC gc_tab_bar_bg;        /**< Graphics Context for the tab bar strip background */
++    GC gc_tab_text;          /**< Graphics Context for inactive tab labels */
++    GC gc_tab_active_bg;     /**< Graphics Context for active tab highlight background */
++    GC gc_tab_active_text;   /**< Graphics Context for active tab label text */
++
++    /* Tab management */
++    Tab *tabs[MAX_TABS];     /**< Array of active Tab pointers */
++    int num_tabs;            /**< Count of currently open tabs */
++    int active_tab_idx;      /**< Zero-based index of the currently displayed tab */
++
++    int is_running;          /**< Application loop flag (1 = running, 0 = exit application) */
++} GuiApp;
++
++/**
++ * @brief Initializes the X11 GUI window, allocates color GCs, loads fonts, and creates the first tab.
++ *
++ * @param[out] app Pointer to GuiApp structure to initialize.
++ * @param[in] width Initial window width in pixels.
++ * @param[in] height Initial window height in pixels.
++ * @param[in] title Window title string displayed on titlebar.
++ * @return 0 on success, or -1 on initialization failure (e.g. Cannot open X display).
++ */
++int gui_init(GuiApp *app, int width, int height, const char *title);
++
++/**
++ * @brief Frees all X11 resources, closed tabs, GCs, pixmaps, and closes connection to X server.
++ *
++ * @param[in,out] app Pointer to GuiApp to clean up.
++ */
++void gui_cleanup(GuiApp *app);
++
++/**
++ * @brief Creates a new terminal tab with its own shell context and initial directory.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] initial_cwd Starting directory for the tab (or NULL to use current process directory).
++ * @return Index of the newly created tab, or -1 if maximum tabs limit reached.
++ */
++int gui_create_tab(GuiApp *app, const char *initial_cwd);
++
++/**
++ * @brief Closes an existing tab by index and frees its memory.
++ *
++ * If the active tab is closed, switches to an adjacent tab.
++ * If the last remaining tab is closed, sets app->is_running = 0 to exit Terminator.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] tab_idx Zero-based index of the tab to close.
++ */
++void gui_close_tab(GuiApp *app, int tab_idx);
++
++/**
++ * @brief Switches the active view to the specified tab.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] tab_idx Zero-based index of the tab to activate.
++ */
++void gui_switch_tab(GuiApp *app, int tab_idx);
++
++/**
++ * @brief Appends raw text output (e.g. read from child process pipe) to a tab's buffer.
++ *
++ * Parses newline characters ('\n') to break text into distinct lines, wraps long lines,
++ * and scrolls the buffer if the maximum line count is reached.
++ *
++ * @param[in,out] tab Pointer to the target Tab.
++ * @param[in] text Pointer to buffer containing incoming character bytes.
++ * @param[in] len Number of bytes in text buffer.
++ */
++void tab_append_output(Tab *tab, const char *text, int len);
++
++/**
++ * @brief Submits the current input buffer in the active tab for execution.
++ *
++ * Spawns a child process or executes a built-in command, wiring stdout and stderr
++ * to an asynchronous pipe monitored by the X11 event loop.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in,out] tab Pointer to Tab where Enter was pressed.
++ */
++void tab_submit_command(GuiApp *app, Tab *tab);
++
++/**
++ * @brief Handles X11 KeyPress events (typing characters, Enter, Backspace, arrows, hotkeys).
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] event Pointer to XKeyEvent.
++ */
++void gui_handle_key_press(GuiApp *app, XKeyEvent *event);
++
++/**
++ * @brief Handles X11 ButtonPress events (clicking tabs on the tab bar, '+' button, etc.).
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] event Pointer to XButtonEvent.
++ */
++void gui_handle_button_press(GuiApp *app, XButtonEvent *event);
++
++/**
++ * @brief Redraws the entire terminal window: tab bar, scrollback text, prompt, and input line.
++ *
++ * Implements double-buffering using an off-screen pixmap to ensure zero flicker.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ */
++void gui_redraw(GuiApp *app);
++
++/**
++ * @brief Main non-blocking event loop using poll().
++ *
++ * Sleeps until either an X11 event arrives on ConnectionNumber(display) OR data is ready
++ * to be read on any running tab's output pipe. Redraws only when state changes.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ */
++void gui_run_loop(GuiApp *app);
++
++#endif /* GUI_H */
+diff --git a/src/gui.c b/src/gui.c
+new file mode 100644
+index 0000000..0d430da
+--- /dev/null
++++ b/src/gui.c
+@@ -0,0 +1,909 @@
++#include "gui.h"
++#include "parser.h"
++#include "builtins.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <errno.h>
++#include <poll.h>
++#include <sys/wait.h>
++#include <sys/types.h>
++
++#define DEFAULT_FONT_NAME "fixed"
++#define PROMPT_STRING "user@terminator> "
++
++/**
++ * @brief Helper function to allocate a color in X11 using 16-bit RGB values.
++ *
++ * @param[in] display Connection to the X server.
++ * @param[in] colormap Colormap of the screen.
++ * @param[in] red 16-bit red intensity (0x0000 - 0xFFFF).
++ * @param[in] green 16-bit green intensity (0x0000 - 0xFFFF).
++ * @param[in] blue 16-bit blue intensity (0x0000 - 0xFFFF).
++ * @return Pixel value representing the allocated color.
++ */
++static unsigned long allocate_color(Display *display, Colormap colormap,
++                                   unsigned short red, unsigned short green, unsigned short blue) {
++    XColor color;
++    color.red = red;
++    color.green = green;
++    color.blue = blue;
++    color.flags = DoRed | DoGreen | DoBlue;
++
++    if (XAllocColor(display, colormap, &color)) {
++        return color.pixel;
++    }
++
++    /* Fallback to WhitePixel if color allocation fails */
++    return WhitePixel(display, DefaultScreen(display));
++}
++
++/**
++ * @brief Initializes the graphical user interface, creates window, sets up double buffering,
++ *        and prepares graphics contexts with custom hacker color schemes.
++ *
++ * @param[out] app Pointer to the GuiApp structure to initialize.
++ * @param[in] width Desired starting window width in pixels.
++ * @param[in] height Desired starting window height in pixels.
++ * @param[in] title Window title string to display on the desktop window manager bar.
++ * @return 0 on success, -1 on failure (e.g. Cannot open X display).
++ */
++int gui_init(GuiApp *app, int width, int height, const char *title) {
++    if (!app) {
++        return -1;
++    }
++    memset(app, 0, sizeof(GuiApp));
++
++    /* Connect to the X server (uses $DISPLAY environment variable, or falls back to :0) */
++    app->display = XOpenDisplay(NULL);
++    if (!app->display) {
++        app->display = XOpenDisplay(":0");
++    }
++    if (!app->display) {
++        fprintf(stderr, "terminator: cannot open X display. Is an X server or WSLg running?\n");
++        return -1;
++    }
++
++    app->screen = DefaultScreen(app->display);
++    app->win_width = width;
++    app->win_height = height;
++    Colormap colormap = DefaultColormap(app->display, app->screen);
++
++    /* Allocate custom hacker colors:
++     * - Background: Pitch Black (#000000)
++     * - Prompt: Vivid Red (#FF3333) for "user@terminator>"
++     * - Input: Neon Hacker Green (#33FF33) for typed commands
++     * - Output: Crisp Matrix Light-Green / Gray (#CCEECC) for clean readability
++     * - Cursor: Bright Green block (#33FF33)
++     */
++    unsigned long col_black     = BlackPixel(app->display, app->screen);
++    unsigned long col_red       = allocate_color(app->display, colormap, 0xFFFF, 0x3333, 0x3333);
++    unsigned long col_green     = allocate_color(app->display, colormap, 0x3333, 0xFFFF, 0x3333);
++    unsigned long col_output    = allocate_color(app->display, colormap, 0xCCCC, 0xEEEE, 0xCCCC);
++    unsigned long col_tab_bg    = allocate_color(app->display, colormap, 0x1818, 0x1818, 0x1818);
++    unsigned long col_tab_act   = allocate_color(app->display, colormap, 0x2A2A, 0x4444, 0x2A2A);
++    unsigned long col_tab_text  = allocate_color(app->display, colormap, 0x8888, 0xAAAA, 0x8888);
++
++    /* Create the top-level window */
++    app->window = XCreateSimpleWindow(
++        app->display,
++        RootWindow(app->display, app->screen),
++        100, 100,
++        app->win_width, app->win_height,
++        1,
++        col_green, /* Border color: neon green */
++        col_black  /* Background: pure black */
++    );
++
++    /* Set window title and class name for window managers */
++    XStoreName(app->display, app->window, title);
++    XSetIconName(app->display, app->window, title);
++
++    /* Select events we want to receive from X11:
++     * - KeyPressMask: Keyboard input
++     * - ButtonPressMask: Mouse clicks (tabs, + button)
++     * - ExposureMask: Window exposed and needs redrawing
++     * - StructureNotifyMask: Window resized or moved
++     */
++    XSelectInput(app->display, app->window,
++                 KeyPressMask | ButtonPressMask | ExposureMask | StructureNotifyMask);
++
++    /* Load monospace terminal font */
++    app->font = XLoadQueryFont(app->display, DEFAULT_FONT_NAME);
++    if (!app->font) {
++        app->font = XLoadQueryFont(app->display, "9x15");
++    }
++    if (!app->font) {
++        app->font = XQueryFont(app->display, XGContextFromGC(DefaultGC(app->display, app->screen)));
++    }
++
++    if (app->font) {
++        app->font_width = app->font->max_bounds.width;
++        if (app->font_width <= 0) app->font_width = 8;
++        app->font_ascent = app->font->ascent;
++        app->font_height = app->font->ascent + app->font->descent;
++        if (app->font_height <= 0) app->font_height = 16;
++    } else {
++        app->font_width = 8;
++        app->font_height = 16;
++        app->font_ascent = 12;
++    }
++
++    /* Create Graphics Contexts (GC) for each text element */
++    XGCValues gcv;
++    memset(&gcv, 0, sizeof(gcv));
++    if (app->font) gcv.font = app->font->fid;
++
++    /* Background GC */
++    gcv.foreground = col_black;
++    app->gc_bg = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    /* Prompt GC (Vivid Red) */
++    gcv.foreground = col_red;
++    app->gc_prompt = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    /* Input GC (Neon Hacker Green) */
++    gcv.foreground = col_green;
++    app->gc_input = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    /* Output GC (Crisp Light Text) */
++    gcv.foreground = col_output;
++    app->gc_output = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    /* Cursor GC (Neon Green) */
++    gcv.foreground = col_green;
++    app->gc_cursor = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    /* Tab bar GCs */
++    gcv.foreground = col_tab_bg;
++    app->gc_tab_bar_bg = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    gcv.foreground = col_tab_act;
++    app->gc_tab_active_bg = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    gcv.foreground = col_tab_text;
++    app->gc_tab_text = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    gcv.foreground = col_green;
++    app->gc_tab_active_text = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
++
++    /* Create off-screen back buffer for double-buffered flicker-free rendering */
++    app->back_buffer = XCreatePixmap(app->display, app->window,
++                                     app->win_width, app->win_height,
++                                     DefaultDepth(app->display, app->screen));
++
++    /* Map (show) the window on the desktop screen */
++    XMapWindow(app->display, app->window);
++    XFlush(app->display);
++
++    app->is_running = 1;
++
++    /* Create initial Tab 1 starting in the current working directory */
++    gui_create_tab(app, NULL);
++
++    return 0;
++}
++
++/**
++ * @brief Releases all allocated X11 resources, closes pipes, and frees memory.
++ *
++ * @param[in,out] app Pointer to GuiApp structure.
++ */
++void gui_cleanup(GuiApp *app) {
++    if (!app || !app->display) {
++        return;
++    }
++
++    /* Close and free all tabs */
++    for (int i = 0; i < app->num_tabs; i++) {
++        if (app->tabs[i]) {
++            if (app->tabs[i]->out_pipe_fd >= 0) {
++                close(app->tabs[i]->out_pipe_fd);
++            }
++            if (app->tabs[i]->running_pid > 0) {
++                kill(app->tabs[i]->running_pid, SIGTERM);
++            }
++            free(app->tabs[i]);
++            app->tabs[i] = NULL;
++        }
++    }
++    app->num_tabs = 0;
++
++    /* Free X11 Graphics Contexts and off-screen pixmap */
++    if (app->back_buffer) XFreePixmap(app->display, app->back_buffer);
++    if (app->gc_bg) XFreeGC(app->display, app->gc_bg);
++    if (app->gc_prompt) XFreeGC(app->display, app->gc_prompt);
++    if (app->gc_input) XFreeGC(app->display, app->gc_input);
++    if (app->gc_output) XFreeGC(app->display, app->gc_output);
++    if (app->gc_cursor) XFreeGC(app->display, app->gc_cursor);
++    if (app->gc_tab_bar_bg) XFreeGC(app->display, app->gc_tab_bar_bg);
++    if (app->gc_tab_text) XFreeGC(app->display, app->gc_tab_text);
++    if (app->gc_tab_active_bg) XFreeGC(app->display, app->gc_tab_active_bg);
++    if (app->gc_tab_active_text) XFreeGC(app->display, app->gc_tab_active_text);
++
++    if (app->font) XFreeFont(app->display, app->font);
++    if (app->window) XDestroyWindow(app->display, app->window);
++
++    XCloseDisplay(app->display);
++    app->display = NULL;
++}
++
++/**
++ * @brief Creates a new terminal tab and initializes its shell context and buffers.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] initial_cwd Starting path for this tab, or NULL for current directory.
++ * @return Index of the created tab (0-indexed), or -1 if maximum tabs limit reached.
++ */
++int gui_create_tab(GuiApp *app, const char *initial_cwd) {
++    if (!app || app->num_tabs >= MAX_TABS) {
++        return -1;
++    }
++
++    Tab *tab = malloc(sizeof(Tab));
++    if (!tab) {
++        return -1;
++    }
++    memset(tab, 0, sizeof(Tab));
++
++    tab->tab_id = app->num_tabs + 1;
++    tab->out_pipe_fd = -1;
++    tab->running_pid = 0;
++    tab->is_running_cmd = 0;
++    tab->num_lines = 0;
++    tab->scroll_offset = 0;
++    tab->input_len = 0;
++    tab->cursor_pos = 0;
++
++    /* Initialize tab shell context */
++    shell_init(&tab->shell_ctx);
++
++    if (initial_cwd) {
++        snprintf(tab->cwd, sizeof(tab->cwd), "%s", initial_cwd);
++        snprintf(tab->shell_ctx.cwd, sizeof(tab->shell_ctx.cwd), "%s", initial_cwd);
++    } else {
++        if (!getcwd(tab->cwd, sizeof(tab->cwd))) {
++            strncpy(tab->cwd, "/", sizeof(tab->cwd) - 1);
++        }
++        snprintf(tab->shell_ctx.cwd, sizeof(tab->shell_ctx.cwd), "%s", tab->cwd);
++    }
++
++    int new_idx = app->num_tabs;
++    app->tabs[new_idx] = tab;
++    app->num_tabs++;
++    app->active_tab_idx = new_idx;
++
++    return new_idx;
++}
++
++/**
++ * @brief Closes an existing tab by index and frees its memory.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] tab_idx Index of tab to close.
++ */
++void gui_close_tab(GuiApp *app, int tab_idx) {
++    if (!app || tab_idx < 0 || tab_idx >= app->num_tabs) {
++        return;
++    }
++
++    Tab *tab = app->tabs[tab_idx];
++    if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
++    if (tab->running_pid > 0) kill(tab->running_pid, SIGTERM);
++    free(tab);
++
++    /* Shift remaining tabs in array left */
++    for (int i = tab_idx; i < app->num_tabs - 1; i++) {
++        app->tabs[i] = app->tabs[i + 1];
++    }
++    app->tabs[app->num_tabs - 1] = NULL;
++    app->num_tabs--;
++
++    /* If all tabs closed, exit program */
++    if (app->num_tabs == 0) {
++        app->is_running = 0;
++        return;
++    }
++
++    /* Adjust active tab index */
++    if (app->active_tab_idx >= app->num_tabs) {
++        app->active_tab_idx = app->num_tabs - 1;
++    }
++}
++
++/**
++ * @brief Switches the active view to another tab.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] tab_idx Index of the target tab.
++ */
++void gui_switch_tab(GuiApp *app, int tab_idx) {
++    if (!app || tab_idx < 0 || tab_idx >= app->num_tabs) {
++        return;
++    }
++    app->active_tab_idx = tab_idx;
++}
++
++/**
++ * @brief Appends raw incoming character bytes from command output into the tab's buffer.
++ *
++ * Handles newlines ('\n') and line wrapping so text stays formatted cleanly.
++ *
++ * @param[in,out] tab Pointer to target Tab.
++ * @param[in] text Character buffer read from child pipe.
++ * @param[in] len Number of bytes read.
++ */
++void tab_append_output(Tab *tab, const char *text, int len) {
++    if (!tab || !text || len <= 0) {
++        return;
++    }
++
++    for (int i = 0; i < len; i++) {
++        char c = text[i];
++
++        if (c == '\r') {
++            continue; /* Ignore carriage returns */
++        }
++
++        if (c == '\n') {
++            /* Start a new output line */
++            if (tab->num_lines < MAX_BUFFER_LINES) {
++                tab->num_lines++;
++            } else {
++                /* Scroll buffer up by one line */
++                memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
++            }
++            TermLine *cur = &tab->lines[tab->num_lines - 1];
++            memset(cur, 0, sizeof(TermLine));
++            cur->type = LINE_TYPE_OUTPUT;
++            continue;
++        }
++
++        /* If we have no lines yet, initialize line 0 */
++        if (tab->num_lines == 0) {
++            tab->num_lines = 1;
++            memset(&tab->lines[0], 0, sizeof(TermLine));
++            tab->lines[0].type = LINE_TYPE_OUTPUT;
++        }
++
++        TermLine *cur = &tab->lines[tab->num_lines - 1];
++        size_t cur_len = strlen(cur->text);
++
++        /* Wrap line if exceeding buffer line capacity */
++        if (cur_len >= MAX_LINE_CHARS - 2) {
++            if (tab->num_lines < MAX_BUFFER_LINES) {
++                tab->num_lines++;
++            } else {
++                memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
++            }
++            cur = &tab->lines[tab->num_lines - 1];
++            memset(cur, 0, sizeof(TermLine));
++            cur->type = LINE_TYPE_OUTPUT;
++            cur_len = 0;
++        }
++
++        cur->text[cur_len] = c;
++        cur->text[cur_len + 1] = '\0';
++    }
++}
++
++/**
++ * @brief Submits the current typed input in the tab for asynchronous execution.
++ *
++ * Creates a pipe to capture stdout/stderr from the command, forks the execution child,
++ * records the input into the scrollback buffer with prompt styling, and clears the input line.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in,out] tab Pointer to Tab where Enter was pressed.
++ */
++void tab_submit_command(GuiApp *app, Tab *tab) {
++    if (!app || !tab) {
++        return;
++    }
++
++    /* Record prompt + typed input into tab scrollback buffer */
++    if (tab->num_lines < MAX_BUFFER_LINES) {
++        tab->num_lines++;
++    } else {
++        memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
++    }
++    TermLine *prompt_line = &tab->lines[tab->num_lines - 1];
++    prompt_line->type = LINE_TYPE_PROMPT_INPUT;
++    prompt_line->prompt_len = strlen(PROMPT_STRING);
++    snprintf(prompt_line->text, sizeof(prompt_line->text), "%s%.*s",
++             PROMPT_STRING, (int)(sizeof(prompt_line->text) - strlen(PROMPT_STRING) - 1), tab->input_buffer);
++
++    /* Check for empty input (user just pressed Enter) */
++    if (tab->input_len == 0) {
++        return;
++    }
++
++    /* Copy command string and reset input buffer */
++    char cmd_str[MAX_LINE_CHARS];
++    strncpy(cmd_str, tab->input_buffer, sizeof(cmd_str) - 1);
++    cmd_str[sizeof(cmd_str) - 1] = '\0';
++    tab->input_buffer[0] = '\0';
++    tab->input_len = 0;
++    tab->cursor_pos = 0;
++
++    /* Parse command into pipeline */
++    Pipeline pipeline;
++    if (parse_line(cmd_str, &tab->shell_ctx, &pipeline) != 0) {
++        tab_append_output(tab, "terminator: syntax error\n", 25);
++        return;
++    }
++
++    /* Check for built-ins that only modify shell state and don't need piping (e.g. exit, cd) */
++    if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
++        Command *cmd = &pipeline.commands[0];
++        if (strcmp(cmd->argv[0], "exit") == 0) {
++            free_pipeline(&pipeline);
++            /* Close tab on exit */
++            gui_close_tab(app, app->active_tab_idx);
++            return;
++        } else if (strcmp(cmd->argv[0], "cd") == 0) {
++            /* Execute cd directly in tab context so cwd changes */
++            execute_builtin(&tab->shell_ctx, cmd);
++            snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
++            free_pipeline(&pipeline);
++            return;
++        }
++    }
++
++    /* Asynchronous command execution using a pipe:
++     * 1. pipe() creates a channel [0]=read, [1]=write.
++     * 2. fork() child: redirects stdout & stderr to write-end using dup2().
++     * 3. Parent: sets read-end to non-blocking and registers it with poll() loop.
++     */
++    int pipefds[2];
++    if (pipe(pipefds) < 0) {
++        perror("terminator: pipe failed");
++        free_pipeline(&pipeline);
++        return;
++    }
++
++    /* Make read-end non-blocking so read() won't hang the GUI */
++    int flags = fcntl(pipefds[0], F_GETFL, 0);
++    fcntl(pipefds[0], F_SETFL, flags | O_NONBLOCK);
++
++    pid_t pid = fork();
++    if (pid < 0) {
++        perror("terminator: fork failed");
++        close(pipefds[0]);
++        close(pipefds[1]);
++        free_pipeline(&pipeline);
++        return;
++    }
++
++    if (pid == 0) {
++        /* Child process: change to tab's current working directory */
++        if (chdir(tab->cwd) != 0) {
++            /* If cwd changed or deleted, ignore */
++        }
++
++        /* Redirect stdout and stderr to the write end of the pipe */
++        dup2(pipefds[1], STDOUT_FILENO);
++        dup2(pipefds[1], STDERR_FILENO);
++        close(pipefds[0]);
++        close(pipefds[1]);
++
++        /* Execute the parsed pipeline */
++        int ret = shell_execute_pipeline(&tab->shell_ctx, &pipeline);
++        _exit(ret);
++    }
++
++    /* Parent process: close write-end, store read-end for poll() loop */
++    close(pipefds[1]);
++    tab->out_pipe_fd = pipefds[0];
++    tab->running_pid = pid;
++    tab->is_running_cmd = 1;
++
++    free_pipeline(&pipeline);
++}
++
++/**
++ * @brief Handles keyboard input: typing, Backspace, Enter, arrows, and tab management shortcuts.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] event Pointer to XKeyEvent.
++ */
++void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
++    if (!app || app->num_tabs == 0) {
++        return;
++    }
++    Tab *tab = app->tabs[app->active_tab_idx];
++
++    KeySym keysym;
++    char buffer[32];
++    int count = XLookupString(event, buffer, sizeof(buffer) - 1, &keysym, NULL);
++    buffer[count] = '\0';
++
++    int is_ctrl = (event->state & ControlMask);
++    int is_shift = (event->state & ShiftMask);
++
++    /* Keyboard shortcut: Ctrl+Shift+T creates a new tab */
++    if (is_ctrl && is_shift && (keysym == XK_T || keysym == XK_t)) {
++        gui_create_tab(app, tab->cwd);
++        gui_redraw(app);
++        return;
++    }
++
++    /* Keyboard shortcut: Ctrl+Shift+W closes the active tab */
++    if (is_ctrl && is_shift && (keysym == XK_W || keysym == XK_w)) {
++        gui_close_tab(app, app->active_tab_idx);
++        gui_redraw(app);
++        return;
++    }
++
++    /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */
++    if (is_shift && keysym == XK_Left) {
++        if (app->active_tab_idx > 0) {
++            gui_switch_tab(app, app->active_tab_idx - 1);
++            gui_redraw(app);
++        }
++        return;
++    }
++    if (is_shift && keysym == XK_Right) {
++        if (app->active_tab_idx < app->num_tabs - 1) {
++            gui_switch_tab(app, app->active_tab_idx + 1);
++            gui_redraw(app);
++        }
++        return;
++    }
++
++    /* Handle Return / Enter key */
++    if (keysym == XK_Return || keysym == XK_KP_Enter) {
++        tab_submit_command(app, tab);
++        gui_redraw(app);
++        return;
++    }
++
++    /* Handle Backspace key */
++    if (keysym == XK_BackSpace) {
++        if (tab->cursor_pos > 0) {
++            memmove(&tab->input_buffer[tab->cursor_pos - 1],
++                    &tab->input_buffer[tab->cursor_pos],
++                    tab->input_len - tab->cursor_pos + 1);
++            tab->cursor_pos--;
++            tab->input_len--;
++            gui_redraw(app);
++        }
++        return;
++    }
++
++    /* Handle Left / Right arrow navigation within the input buffer */
++    if (keysym == XK_Left) {
++        if (tab->cursor_pos > 0) {
++            tab->cursor_pos--;
++            gui_redraw(app);
++        }
++        return;
++    }
++    if (keysym == XK_Right) {
++        if (tab->cursor_pos < tab->input_len) {
++            tab->cursor_pos++;
++            gui_redraw(app);
++        }
++        return;
++    }
++
++    /* Handle printable character input */
++    if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
++        if (tab->input_len < MAX_LINE_CHARS - 2) {
++            memmove(&tab->input_buffer[tab->cursor_pos + 1],
++                    &tab->input_buffer[tab->cursor_pos],
++                    tab->input_len - tab->cursor_pos + 1);
++            tab->input_buffer[tab->cursor_pos] = buffer[0];
++            tab->cursor_pos++;
++            tab->input_len++;
++            gui_redraw(app);
++        }
++        return;
++    }
++}
++
++/**
++ * @brief Handles mouse clicks on the tab bar: tab selection, '+' button to add tabs.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ * @param[in] event Pointer to XButtonEvent.
++ */
++void gui_handle_button_press(GuiApp *app, XButtonEvent *event) {
++    if (!app || event->y > TAB_BAR_HEIGHT) {
++        return; /* Click outside tab bar */
++    }
++
++    /* Compute tab positions on the tab bar */
++    int current_x = 10;
++    for (int i = 0; i < app->num_tabs; i++) {
++        char label[128];
++        const char *cwd = app->tabs[i]->cwd;
++        const char *last_slash = strrchr(cwd, '/');
++        const char *short_name = last_slash ? (last_slash + 1) : cwd;
++        if (!short_name || short_name[0] == '\0') short_name = "/";
++
++        snprintf(label, sizeof(label), " [ %d: %.30s ] ", i + 1, short_name);
++        int tab_width = strlen(label) * app->font_width + 10;
++
++        if (event->x >= current_x && event->x < current_x + tab_width) {
++            gui_switch_tab(app, i);
++            gui_redraw(app);
++            return;
++        }
++        current_x += tab_width + 5;
++    }
++
++    /* Check click on '+' new tab button */
++    int plus_width = 4 * app->font_width + 10;
++    if (event->x >= current_x && event->x < current_x + plus_width) {
++        gui_create_tab(app, app->tabs[app->active_tab_idx]->cwd);
++        gui_redraw(app);
++        return;
++    }
++}
++
++/**
++ * @brief Redraws the terminal window:
++ *        1. Tab bar at the top with tabs and '+' button.
++ *        2. Terminal scrollback lines.
++ *        3. Red prompt string ("user@terminator> ").
++ *        4. Neon green typed user command and cursor block.
++ *
++ * Uses double-buffering via back_buffer to prevent screen flickering.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ */
++void gui_redraw(GuiApp *app) {
++    if (!app || !app->display || app->num_tabs == 0) {
++        return;
++    }
++
++    Tab *tab = app->tabs[app->active_tab_idx];
++
++    /* 1. Clear off-screen back buffer to pitch black */
++    XFillRectangle(app->display, app->back_buffer, app->gc_bg,
++                   0, 0, app->win_width, app->win_height);
++
++    /* 2. Draw Tab Bar strip at top */
++    XFillRectangle(app->display, app->back_buffer, app->gc_tab_bar_bg,
++                   0, 0, app->win_width, TAB_BAR_HEIGHT);
++
++    int cur_x = 10;
++    int tab_text_y = TAB_BAR_HEIGHT - 8;
++
++    for (int i = 0; i < app->num_tabs; i++) {
++        char label[128];
++        const char *cwd = app->tabs[i]->cwd;
++        const char *last_slash = strrchr(cwd, '/');
++        const char *short_name = last_slash ? (last_slash + 1) : cwd;
++        if (!short_name || short_name[0] == '\0') short_name = "/";
++
++        snprintf(label, sizeof(label), " [ %d: %.30s ] ", i + 1, short_name);
++        int label_len = strlen(label);
++        int tab_width = label_len * app->font_width + 10;
++
++        if (i == app->active_tab_idx) {
++            /* Highlight active tab */
++            XFillRectangle(app->display, app->back_buffer, app->gc_tab_active_bg,
++                           cur_x, 3, tab_width, TAB_BAR_HEIGHT - 6);
++            XDrawString(app->display, app->back_buffer, app->gc_tab_active_text,
++                        cur_x + 5, tab_text_y, label, label_len);
++        } else {
++            XDrawString(app->display, app->back_buffer, app->gc_tab_text,
++                        cur_x + 5, tab_text_y, label, label_len);
++        }
++
++        cur_x += tab_width + 5;
++    }
++
++    /* Draw '[ + ]' button for creating a new tab */
++    const char *plus_label = " [ + ] ";
++    XDrawString(app->display, app->back_buffer, app->gc_tab_active_text,
++                cur_x + 5, tab_text_y, plus_label, strlen(plus_label));
++
++    /* 3. Calculate terminal text area dimensions */
++    int content_top = TAB_BAR_HEIGHT + 10;
++    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
++    if (visible_rows <= 0) visible_rows = 1;
++
++    /* Determine which scrollback lines to render */
++    int start_line = 0;
++    if (tab->num_lines > visible_rows) {
++        start_line = tab->num_lines - visible_rows;
++    }
++
++    int current_y = content_top + app->font_ascent;
++
++    /* Render scrollback lines */
++    for (int i = start_line; i < tab->num_lines; i++) {
++        TermLine *line = &tab->lines[i];
++
++        if (line->type == LINE_TYPE_PROMPT_INPUT) {
++            /* Render Prompt prefix in RED */
++            int p_len = line->prompt_len;
++            if (p_len > 0) {
++                XDrawString(app->display, app->back_buffer, app->gc_prompt,
++                            10, current_y, line->text, p_len);
++            }
++            /* Render the typed command in NEON GREEN */
++            int cmd_len = strlen(line->text) - p_len;
++            if (cmd_len > 0) {
++                XDrawString(app->display, app->back_buffer, app->gc_input,
++                            10 + (p_len * app->font_width), current_y,
++                            line->text + p_len, cmd_len);
++            }
++        } else {
++            /* Render program output in crisp Light Text */
++            XDrawString(app->display, app->back_buffer, app->gc_output,
++                        10, current_y, line->text, strlen(line->text));
++        }
++
++        current_y += app->font_height;
++    }
++
++    /* 4. Render Active Input Line:
++     * - "user@terminator> " drawn in Vivid Red.
++     * - User's typed input drawn in Neon Hacker Green.
++     * - Cursor block drawn at current cursor position.
++     */
++    int prompt_len = strlen(PROMPT_STRING);
++    XDrawString(app->display, app->back_buffer, app->gc_prompt,
++                10, current_y, PROMPT_STRING, prompt_len);
++
++    if (tab->input_len > 0) {
++        XDrawString(app->display, app->back_buffer, app->gc_input,
++                    10 + (prompt_len * app->font_width), current_y,
++                    tab->input_buffer, tab->input_len);
++    }
++
++    /* Draw block cursor in neon green */
++    int cursor_x = 10 + ((prompt_len + tab->cursor_pos) * app->font_width);
++    int cursor_y = current_y - app->font_ascent;
++    XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
++                   cursor_x, cursor_y, app->font_width, app->font_height);
++
++    /* 5. Copy off-screen back buffer onto the visible X11 window in one shot */
++    XCopyArea(app->display, app->back_buffer, app->window, app->gc_bg,
++              0, 0, app->win_width, app->win_height, 0, 0);
++
++    XFlush(app->display);
++}
++
++/**
++ * @brief Main non-blocking event loop implementing poll() over X11 descriptor and pipes.
++ *
++ * Implements the architecture from slide 8:
++ * - Sleeps via poll() when idle (0% CPU usage).
++ * - Wakes up immediately when an X event arrives or when child command output arrives.
++ * - Captures output from background tabs simultaneously without freezing the GUI.
++ *
++ * @param[in,out] app Pointer to GuiApp.
++ */
++void gui_run_loop(GuiApp *app) {
++    if (!app || !app->display) {
++        return;
++    }
++
++    int x_fd = ConnectionNumber(app->display);
++
++    while (app->is_running) {
++        /* Process all pending X11 events first */
++        while (XPending(app->display) > 0) {
++            XEvent ev;
++            XNextEvent(app->display, &ev);
++
++            switch (ev.type) {
++                case Expose:
++                    gui_redraw(app);
++                    break;
++
++                case ConfigureNotify:
++                    /* Window resized */
++                    if (ev.xconfigure.width != app->win_width ||
++                        ev.xconfigure.height != app->win_height) {
++                        app->win_width = ev.xconfigure.width;
++                        app->win_height = ev.xconfigure.height;
++
++                        /* Recreate back buffer matching new dimensions */
++                        if (app->back_buffer) XFreePixmap(app->display, app->back_buffer);
++                        app->back_buffer = XCreatePixmap(app->display, app->window,
++                                                         app->win_width, app->win_height,
++                                                         DefaultDepth(app->display, app->screen));
++                        gui_redraw(app);
++                    }
++                    break;
++
++                case KeyPress:
++                    gui_handle_key_press(app, &ev.xkey);
++                    break;
++
++                case ButtonPress:
++                    gui_handle_button_press(app, &ev.xbutton);
++                    break;
++
++                default:
++                    break;
++            }
++        }
++
++        /* Check if GUI was closed during event processing */
++        if (!app->is_running) {
++            break;
++        }
++
++        /* Set up pollfd array:
++         * fds[0] = X11 connection descriptor (x_fd)
++         * fds[1..N] = Read ends of active command pipes across all tabs
++         */
++        struct pollfd fds[1 + MAX_TABS];
++        int num_poll_fds = 1;
++
++        fds[0].fd = x_fd;
++        fds[0].events = POLLIN;
++        fds[0].revents = 0;
++
++        int tab_indices[1 + MAX_TABS];
++        tab_indices[0] = -1;
++
++        for (int i = 0; i < app->num_tabs; i++) {
++            Tab *t = app->tabs[i];
++            if (t && t->is_running_cmd && t->out_pipe_fd >= 0) {
++                fds[num_poll_fds].fd = t->out_pipe_fd;
++                fds[num_poll_fds].events = POLLIN | POLLHUP;
++                fds[num_poll_fds].revents = 0;
++                tab_indices[num_poll_fds] = i;
++                num_poll_fds++;
++            }
++        }
++
++        /* Sleep until an X11 event arrives OR child pipe data is ready (timeout 50ms) */
++        int ret = poll(fds, num_poll_fds, 50);
++        if (ret < 0) {
++            if (errno == EINTR) continue;
++            perror("terminator: poll error");
++            break;
++        }
++
++        int needs_redraw = 0;
++
++        /* Check active child pipes for output */
++        for (int i = 1; i < num_poll_fds; i++) {
++            if (fds[i].revents & (POLLIN | POLLHUP)) {
++                int t_idx = tab_indices[i];
++                Tab *t = app->tabs[t_idx];
++                char buf[512];
++                ssize_t n = read(t->out_pipe_fd, buf, sizeof(buf));
++
++                if (n > 0) {
++                    tab_append_output(t, buf, (int)n);
++                    if (t_idx == app->active_tab_idx) {
++                        needs_redraw = 1;
++                    }
++                } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
++                    /* Pipe closed / child finished */
++                    close(t->out_pipe_fd);
++                    t->out_pipe_fd = -1;
++
++                    int status = 0;
++                    waitpid(t->running_pid, &status, WNOHANG);
++                    if (WIFEXITED(status)) {
++                        t->shell_ctx.last_exit_status = WEXITSTATUS(status);
++                    }
++
++                    t->is_running_cmd = 0;
++                    t->running_pid = 0;
++
++                    if (t_idx == app->active_tab_idx) {
++                        needs_redraw = 1;
++                    }
++                }
++            }
++        }
++
++        if (needs_redraw) {
++            gui_redraw(app);
++        }
++    }
++}
+diff --git a/src/main.c b/src/main.c
+index e8ba128..283581a 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -4,14 +4,14 @@
+ #include <unistd.h>
+ #include "shell.h"
+ #include "parser.h"
++#include "gui.h"
+ 
+ #define MAX_LINE_LEN 4096
+ 
+ /**
+- * @brief Prints the interactive Terminator shell prompt.
++ * @brief Prints the interactive Terminator shell prompt to standard output.
+  *
+- * As mandated by the specification, the prompt format is:
+- * user@terminator> 
++ * Used in CLI fallback / headless testing mode.
+  */
+ static void print_prompt(void) {
+     printf("user@terminator> ");
+@@ -19,47 +19,23 @@ static void print_prompt(void) {
+ }
+ 
+ /**
+- * @brief Entry point for the Terminator shell.
++ * @brief Runs Terminator in text-only CLI mode.
+  *
+- * Supports command-line flag evaluation (e.g. useProcess=True).
+- * In Phase 1, runs the command execution engine directly to verify:
+- * - Parsing and execution of external commands (fork + execvp + waitpid)
+- * - Built-in commands (cd, exit) and $? status tracking
+- * - File redirection (< and >)
+- * - Arbitrary pipeline length (cmd1 | cmd2 | ... | cmdN)
++ * This mode is used when stdin is piped (e.g. automated test suites),
++ * when the user explicitly passes the "--cli" flag, or when no X11 display is available.
+  *
+- * @param[in] argc Argument count passed from command line.
+- * @param[in] argv Argument vector. argv[1] can optionally be "useProcess=True".
+- * @return 0 on normal exit, or non-zero exit status code.
++ * @param[in,out] ctx Pointer to initialized ShellContext.
++ * @return Final exit code of the shell session.
+  */
+-int main(int argc, char *argv[]) {
+-    int use_process_mode = 0;
+-
+-    /* Check launch arguments for execution mode */
+-    if (argc > 1 && strcmp(argv[1], "useProcess=True") == 0) {
+-        use_process_mode = 1;
+-        printf("[Terminator] Launching in Process Mode (useProcess=True)\n");
+-    } else {
+-        printf("[Terminator] Launching in Thread Mode (default)\n");
+-    }
+-    (void)use_process_mode;
+-
+-    /* Initialize the active shell context */
+-    ShellContext ctx;
+-    if (shell_init(&ctx) != 0) {
+-        fprintf(stderr, "terminator: failed to initialize shell context\n");
+-        return 1;
+-    }
+-
++static int run_cli_mode(ShellContext *ctx) {
+     char line_buffer[MAX_LINE_LEN];
+ 
+-    /* Phase 1 REPL (Read-Eval-Print Loop) */
+-    while (!ctx.should_exit) {
++    while (!ctx->should_exit) {
+         print_prompt();
+ 
+         /* Read one line of user input from stdin */
+         if (fgets(line_buffer, sizeof(line_buffer), stdin) == NULL) {
+-            /* EOF encountered (e.g. Ctrl+D) */
++            /* EOF encountered (e.g. Ctrl+D or end of test input stream) */
+             printf("\n");
+             break;
+         }
+@@ -77,19 +53,83 @@ int main(int argc, char *argv[]) {
+ 
+         /* Parse line into pipeline structure */
+         Pipeline pipeline;
+-        if (parse_line(line_buffer, &ctx, &pipeline) != 0) {
+-            ctx.last_exit_status = 2; /* Syntax error code */
++        if (parse_line(line_buffer, ctx, &pipeline) != 0) {
++            ctx->last_exit_status = 2; /* Syntax error code */
+             continue;
+         }
+ 
+         /* Execute the parsed pipeline */
+-        shell_execute_pipeline(&ctx, &pipeline);
++        shell_execute_pipeline(ctx, &pipeline);
+ 
+         /* Clean up allocated pipeline resources */
+         free_pipeline(&pipeline);
+     }
+ 
+-    int exit_code = ctx.last_exit_status;
+-    shell_cleanup(&ctx);
+-    return exit_code;
++    return ctx->last_exit_status;
++}
++
++/**
++ * @brief Entry point for Terminator.
++ *
++ * Evaluates execution flags:
++ * - "useProcess=True": Selects process-based tab execution mode.
++ * - "--cli": Forces text-only CLI execution (ideal for batch scripts and automated test suites).
++ * - By default: launches the X11 GUI with hacker color scheme (red prompt, green input).
++ *
++ * @param[in] argc Number of command-line arguments.
++ * @param[in] argv Array of argument strings.
++ * @return 0 on normal exit, or non-zero exit status code.
++ */
++int main(int argc, char *argv[]) {
++    int use_process_mode = 0;
++    int force_cli = 0;
++
++    /* Parse command line arguments */
++    for (int i = 1; i < argc; i++) {
++        if (strcmp(argv[i], "useProcess=True") == 0) {
++            use_process_mode = 1;
++        } else if (strcmp(argv[i], "--cli") == 0) {
++            force_cli = 1;
++        }
++    }
++
++    if (use_process_mode) {
++        printf("[Terminator] Mode: Process Mode (useProcess=True)\n");
++    } else {
++        printf("[Terminator] Mode: Thread Mode (default)\n");
++    }
++    (void)use_process_mode;
++
++    /* If stdin is not a terminal (e.g. redirected from test file) or --cli requested, run CLI */
++    if (force_cli || !isatty(STDIN_FILENO)) {
++        ShellContext ctx;
++        if (shell_init(&ctx) != 0) {
++            fprintf(stderr, "terminator: failed to initialize shell context\n");
++            return 1;
++        }
++        int status = run_cli_mode(&ctx);
++        shell_cleanup(&ctx);
++        return status;
++    }
++
++    /* Otherwise, launch the full X11 Graphical User Interface */
++    GuiApp app;
++    if (gui_init(&app, 900, 600, "Terminator [Hacker Shell]") != 0) {
++        fprintf(stderr, "terminator: X11 GUI initialization failed; falling back to CLI mode.\n");
++        ShellContext ctx;
++        if (shell_init(&ctx) != 0) {
++            return 1;
++        }
++        int status = run_cli_mode(&ctx);
++        shell_cleanup(&ctx);
++        return status;
++    }
++
++    /* Run the non-blocking X11 event loop */
++    gui_run_loop(&app);
++
++    /* Free all X11 resources upon window closure */
++    gui_cleanup(&app);
++
++    return 0;
+ }

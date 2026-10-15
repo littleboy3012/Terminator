@@ -4,14 +4,14 @@
 #include <unistd.h>
 #include "shell.h"
 #include "parser.h"
+#include "gui.h"
 
 #define MAX_LINE_LEN 4096
 
 /**
- * @brief Prints the interactive Terminator shell prompt.
+ * @brief Prints the interactive Terminator shell prompt to standard output.
  *
- * As mandated by the specification, the prompt format is:
- * user@terminator> 
+ * Used in CLI fallback / headless testing mode.
  */
 static void print_prompt(void) {
     printf("user@terminator> ");
@@ -19,47 +19,23 @@ static void print_prompt(void) {
 }
 
 /**
- * @brief Entry point for the Terminator shell.
+ * @brief Runs Terminator in text-only CLI mode.
  *
- * Supports command-line flag evaluation (e.g. useProcess=True).
- * In Phase 1, runs the command execution engine directly to verify:
- * - Parsing and execution of external commands (fork + execvp + waitpid)
- * - Built-in commands (cd, exit) and $? status tracking
- * - File redirection (< and >)
- * - Arbitrary pipeline length (cmd1 | cmd2 | ... | cmdN)
+ * This mode is used when stdin is piped (e.g. automated test suites),
+ * when the user explicitly passes the "--cli" flag, or when no X11 display is available.
  *
- * @param[in] argc Argument count passed from command line.
- * @param[in] argv Argument vector. argv[1] can optionally be "useProcess=True".
- * @return 0 on normal exit, or non-zero exit status code.
+ * @param[in,out] ctx Pointer to initialized ShellContext.
+ * @return Final exit code of the shell session.
  */
-int main(int argc, char *argv[]) {
-    int use_process_mode = 0;
-
-    /* Check launch arguments for execution mode */
-    if (argc > 1 && strcmp(argv[1], "useProcess=True") == 0) {
-        use_process_mode = 1;
-        printf("[Terminator] Launching in Process Mode (useProcess=True)\n");
-    } else {
-        printf("[Terminator] Launching in Thread Mode (default)\n");
-    }
-    (void)use_process_mode;
-
-    /* Initialize the active shell context */
-    ShellContext ctx;
-    if (shell_init(&ctx) != 0) {
-        fprintf(stderr, "terminator: failed to initialize shell context\n");
-        return 1;
-    }
-
+static int run_cli_mode(ShellContext *ctx) {
     char line_buffer[MAX_LINE_LEN];
 
-    /* Phase 1 REPL (Read-Eval-Print Loop) */
-    while (!ctx.should_exit) {
+    while (!ctx->should_exit) {
         print_prompt();
 
         /* Read one line of user input from stdin */
         if (fgets(line_buffer, sizeof(line_buffer), stdin) == NULL) {
-            /* EOF encountered (e.g. Ctrl+D) */
+            /* EOF encountered (e.g. Ctrl+D or end of test input stream) */
             printf("\n");
             break;
         }
@@ -77,19 +53,83 @@ int main(int argc, char *argv[]) {
 
         /* Parse line into pipeline structure */
         Pipeline pipeline;
-        if (parse_line(line_buffer, &ctx, &pipeline) != 0) {
-            ctx.last_exit_status = 2; /* Syntax error code */
+        if (parse_line(line_buffer, ctx, &pipeline) != 0) {
+            ctx->last_exit_status = 2; /* Syntax error code */
             continue;
         }
 
         /* Execute the parsed pipeline */
-        shell_execute_pipeline(&ctx, &pipeline);
+        shell_execute_pipeline(ctx, &pipeline);
 
         /* Clean up allocated pipeline resources */
         free_pipeline(&pipeline);
     }
 
-    int exit_code = ctx.last_exit_status;
-    shell_cleanup(&ctx);
-    return exit_code;
+    return ctx->last_exit_status;
+}
+
+/**
+ * @brief Entry point for Terminator.
+ *
+ * Evaluates execution flags:
+ * - "useProcess=True": Selects process-based tab execution mode.
+ * - "--cli": Forces text-only CLI execution (ideal for batch scripts and automated test suites).
+ * - By default: launches the X11 GUI with hacker color scheme (red prompt, green input).
+ *
+ * @param[in] argc Number of command-line arguments.
+ * @param[in] argv Array of argument strings.
+ * @return 0 on normal exit, or non-zero exit status code.
+ */
+int main(int argc, char *argv[]) {
+    int use_process_mode = 0;
+    int force_cli = 0;
+
+    /* Parse command line arguments */
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "useProcess=True") == 0) {
+            use_process_mode = 1;
+        } else if (strcmp(argv[i], "--cli") == 0) {
+            force_cli = 1;
+        }
+    }
+
+    if (use_process_mode) {
+        printf("[Terminator] Mode: Process Mode (useProcess=True)\n");
+    } else {
+        printf("[Terminator] Mode: Thread Mode (default)\n");
+    }
+    (void)use_process_mode;
+
+    /* If stdin is not a terminal (e.g. redirected from test file) or --cli requested, run CLI */
+    if (force_cli || !isatty(STDIN_FILENO)) {
+        ShellContext ctx;
+        if (shell_init(&ctx) != 0) {
+            fprintf(stderr, "terminator: failed to initialize shell context\n");
+            return 1;
+        }
+        int status = run_cli_mode(&ctx);
+        shell_cleanup(&ctx);
+        return status;
+    }
+
+    /* Otherwise, launch the full X11 Graphical User Interface */
+    GuiApp app;
+    if (gui_init(&app, 900, 600, "Terminator [Hacker Shell]") != 0) {
+        fprintf(stderr, "terminator: X11 GUI initialization failed; falling back to CLI mode.\n");
+        ShellContext ctx;
+        if (shell_init(&ctx) != 0) {
+            return 1;
+        }
+        int status = run_cli_mode(&ctx);
+        shell_cleanup(&ctx);
+        return status;
+    }
+
+    /* Run the non-blocking X11 event loop */
+    gui_run_loop(&app);
+
+    /* Free all X11 resources upon window closure */
+    gui_cleanup(&app);
+
+    return 0;
 }
