@@ -379,7 +379,7 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
             pipeline->commands = NULL;
             pipeline->num_commands = 0;
 
-            for (int k = 0; k < seg_count; k++) free(segments[k]);
+            for (int k = i; k < seg_count; k++) free(segments[k]);
             free(segments);
             return -1;
         }

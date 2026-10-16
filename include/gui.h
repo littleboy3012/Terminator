@@ -85,6 +85,7 @@ typedef struct {
     Tab *tabs[MAX_TABS];     /**< Array of active Tab pointers */
     int num_tabs;            /**< Count of currently open tabs */
     int active_tab_idx;      /**< Zero-based index of the currently displayed tab */
+    Atom wm_delete_window;   /**< X11 Atom for intercepting window manager close ('X' button) */
 
     int is_running;          /**< Application loop flag (1 = running, 0 = exit application) */
 } GuiApp;

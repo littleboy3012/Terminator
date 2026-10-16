@@ -34,15 +34,12 @@ index 0a32a09..4c6afea 100644
  test: $(TARGET)
  	@echo "Testing built-in and external command execution..."
  	./$(TARGET) < /dev/null
-diff --git a/diffs/phase2_gui.diff b/diffs/phase2_gui.diff
-new file mode 100644
-index 0000000..e69de29
 diff --git a/include/gui.h b/include/gui.h
 new file mode 100644
-index 0000000..371c261
+index 0000000..36faf53
 --- /dev/null
 +++ b/include/gui.h
-@@ -0,0 +1,196 @@
+@@ -0,0 +1,197 @@
 +#ifndef GUI_H
 +#define GUI_H
 +
@@ -130,6 +127,7 @@ index 0000000..371c261
 +    Tab *tabs[MAX_TABS];     /**< Array of active Tab pointers */
 +    int num_tabs;            /**< Count of currently open tabs */
 +    int active_tab_idx;      /**< Zero-based index of the currently displayed tab */
++    Atom wm_delete_window;   /**< X11 Atom for intercepting window manager close ('X' button) */
 +
 +    int is_running;          /**< Application loop flag (1 = running, 0 = exit application) */
 +} GuiApp;
@@ -241,10 +239,10 @@ index 0000000..371c261
 +#endif /* GUI_H */
 diff --git a/src/gui.c b/src/gui.c
 new file mode 100644
-index 0000000..cfdee8f
+index 0000000..987e883
 --- /dev/null
 +++ b/src/gui.c
-@@ -0,0 +1,910 @@
+@@ -0,0 +1,930 @@
 +#include "gui.h"
 +#include "parser.h"
 +#include "builtins.h"
@@ -421,6 +419,10 @@ index 0000000..cfdee8f
 +    app->back_buffer = XCreatePixmap(app->display, app->window,
 +                                     app->win_width, app->win_height,
 +                                     DefaultDepth(app->display, app->screen));
++
++    /* Register window manager delete protocol so clicking 'X' exits gracefully */
++    app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
++    XSetWMProtocols(app->display, app->window, &app->wm_delete_window, 1);
 +
 +    /* Map (show) the window on the desktop screen */
 +    XMapWindow(app->display, app->window);
@@ -693,8 +695,15 @@ index 0000000..cfdee8f
 +            return;
 +        } else if (strcmp(cmd->argv[0], "cd") == 0) {
 +            /* Execute cd directly in tab context so cwd changes */
-+            execute_builtin(&tab->shell_ctx, cmd);
-+            snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
++            int status = execute_builtin(&tab->shell_ctx, cmd);
++            if (status != 0) {
++                char err_buf[256];
++                snprintf(err_buf, sizeof(err_buf), "terminator: cd: %s: No such file or directory\n",
++                         cmd->argv[1] ? cmd->argv[1] : "");
++                tab_append_output(tab, err_buf, strlen(err_buf));
++            } else {
++                snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
++            }
 +            free_pipeline(&pipeline);
 +            return;
 +        }
@@ -1071,6 +1080,13 @@ index 0000000..cfdee8f
 +                    gui_handle_button_press(app, &ev.xbutton);
 +                    break;
 +
++                case ClientMessage:
++                    /* Window close button clicked */
++                    if ((Atom)ev.xclient.data.l[0] == app->wm_delete_window) {
++                        app->is_running = 0;
++                    }
++                    break;
++
 +                default:
 +                    break;
 +            }
@@ -1138,6 +1154,8 @@ index 0000000..cfdee8f
 +                    waitpid(t->running_pid, &status, WNOHANG);
 +                    if (WIFEXITED(status)) {
 +                        t->shell_ctx.last_exit_status = WEXITSTATUS(status);
++                    } else if (WIFSIGNALED(status)) {
++                        t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
 +                    }
 +
 +                    t->is_running_cmd = 0;
@@ -1323,3 +1341,57 @@ index e8ba128..283581a 100644
 +
 +    return 0;
  }
+diff --git a/src/parser.c b/src/parser.c
+index 992b936..f1e4c48 100644
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -379,7 +379,7 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
+             pipeline->commands = NULL;
+             pipeline->num_commands = 0;
+ 
+-            for (int k = 0; k < seg_count; k++) free(segments[k]);
++            for (int k = i; k < seg_count; k++) free(segments[k]);
+             free(segments);
+             return -1;
+         }
+diff --git a/src/shell.c b/src/shell.c
+index 48a8b10..37b90c0 100644
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -202,7 +202,7 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+  * @return Exit status code of the pipeline.
+  */
+ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+-    if (!ctx || !pipeline || pipeline->num_commands == 0) {
++    if (!ctx || !pipeline || pipeline->num_commands <= 0) {
+         return 0;
+     }
+ 
+@@ -240,12 +240,14 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+     }
+ 
+     /* Fork each command in the pipeline */
++    int children_spawned = 0;
+     for (int i = 0; i < num_cmds; i++) {
+         pids[i] = fork();
+         if (pids[i] < 0) {
+             perror("terminator: pipeline fork failed");
+             break;
+         }
++        children_spawned++;
+ 
+         if (pids[i] == 0) {
+             /* Child process i: rewire stdin from previous pipe if not first */
+@@ -290,10 +292,10 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+ 
+     /* Wait for all children to complete */
+     int last_status = 0;
+-    for (int i = 0; i < num_cmds; i++) {
++    for (int i = 0; i < children_spawned; i++) {
+         int status = 0;
+         waitpid(pids[i], &status, 0);
+-        if (i == num_cmds - 1) {
++        if (i == children_spawned - 1) {
+             last_status = status;
+         }
+     }

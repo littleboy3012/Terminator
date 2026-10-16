@@ -175,6 +175,10 @@ int gui_init(GuiApp *app, int width, int height, const char *title) {
                                      app->win_width, app->win_height,
                                      DefaultDepth(app->display, app->screen));
 
+    /* Register window manager delete protocol so clicking 'X' exits gracefully */
+    app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(app->display, app->window, &app->wm_delete_window, 1);
+
     /* Map (show) the window on the desktop screen */
     XMapWindow(app->display, app->window);
     XFlush(app->display);
@@ -446,8 +450,15 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             return;
         } else if (strcmp(cmd->argv[0], "cd") == 0) {
             /* Execute cd directly in tab context so cwd changes */
-            execute_builtin(&tab->shell_ctx, cmd);
-            snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
+            int status = execute_builtin(&tab->shell_ctx, cmd);
+            if (status != 0) {
+                char err_buf[256];
+                snprintf(err_buf, sizeof(err_buf), "terminator: cd: %s: No such file or directory\n",
+                         cmd->argv[1] ? cmd->argv[1] : "");
+                tab_append_output(tab, err_buf, strlen(err_buf));
+            } else {
+                snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
+            }
             free_pipeline(&pipeline);
             return;
         }
@@ -824,6 +835,13 @@ void gui_run_loop(GuiApp *app) {
                     gui_handle_button_press(app, &ev.xbutton);
                     break;
 
+                case ClientMessage:
+                    /* Window close button clicked */
+                    if ((Atom)ev.xclient.data.l[0] == app->wm_delete_window) {
+                        app->is_running = 0;
+                    }
+                    break;
+
                 default:
                     break;
             }
@@ -891,6 +909,8 @@ void gui_run_loop(GuiApp *app) {
                     waitpid(t->running_pid, &status, WNOHANG);
                     if (WIFEXITED(status)) {
                         t->shell_ctx.last_exit_status = WEXITSTATUS(status);
+                    } else if (WIFSIGNALED(status)) {
+                        t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
                     }
 
                     t->is_running_cmd = 0;

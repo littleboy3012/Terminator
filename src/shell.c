@@ -202,7 +202,7 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
  * @return Exit status code of the pipeline.
  */
 int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
-    if (!ctx || !pipeline || pipeline->num_commands == 0) {
+    if (!ctx || !pipeline || pipeline->num_commands <= 0) {
         return 0;
     }
 
@@ -240,12 +240,14 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
     }
 
     /* Fork each command in the pipeline */
+    int children_spawned = 0;
     for (int i = 0; i < num_cmds; i++) {
         pids[i] = fork();
         if (pids[i] < 0) {
             perror("terminator: pipeline fork failed");
             break;
         }
+        children_spawned++;
 
         if (pids[i] == 0) {
             /* Child process i: rewire stdin from previous pipe if not first */
@@ -290,10 +292,10 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
 
     /* Wait for all children to complete */
     int last_status = 0;
-    for (int i = 0; i < num_cmds; i++) {
+    for (int i = 0; i < children_spawned; i++) {
         int status = 0;
         waitpid(pids[i], &status, 0);
-        if (i == num_cmds - 1) {
+        if (i == children_spawned - 1) {
             last_status = status;
         }
     }
