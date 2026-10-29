@@ -1,4 +1,5 @@
 #include "builtins.h"
+#include "multiwatch.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,7 +18,8 @@ int is_builtin_command(const char *name) {
         return 0;
     }
 
-    if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 || strcmp(name, "clear") == 0) {
+    if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
+        strcmp(name, "clear") == 0 || strcmp(name, "multiWatch") == 0) {
         return 1;
     }
 
@@ -46,6 +48,8 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
         return builtin_exit(ctx, cmd->argv);
     } else if (strcmp(cmd->argv[0], "clear") == 0) {
         return builtin_clear(ctx, cmd->argv);
+    } else if (strcmp(cmd->argv[0], "multiWatch") == 0) {
+        return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
     }
 
     return 1;

@@ -624,7 +624,10 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     }
 
     if (pid == 0) {
-        /* Child process: change to tab's current working directory */
+        /* Child process: become process group leader so Ctrl+C signals target it */
+        setpgid(0, 0);
+
+        /* Change to tab's current working directory */
         if (chdir(tab->cwd) != 0) {
             /* If cwd changed or deleted, ignore */
         }
@@ -681,6 +684,25 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
         gui_close_tab(app, app->active_tab_idx);
         gui_redraw(app);
         return;
+    }
+
+    /* Keyboard shortcut: Ctrl+C stops running command (Task 6 & Task 8) */
+    if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
+        if (tab->is_running_cmd && tab->running_pid > 0) {
+            kill(-tab->running_pid, SIGINT);
+            kill(tab->running_pid, SIGINT);
+            tab_append_output(tab, "^C\n", 3);
+            gui_redraw(app);
+            return;
+        } else {
+            tab->input_buffer[0] = '\0';
+            tab->input_len = 0;
+            tab->cursor_pos = 0;
+            tab->history_pos = -1;
+            tab_append_output(tab, "^C\n", 3);
+            gui_redraw(app);
+            return;
+        }
     }
 
     /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */

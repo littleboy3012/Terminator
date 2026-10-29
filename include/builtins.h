@@ -58,4 +58,16 @@ int builtin_exit(ShellContext *ctx, char **argv);
  */
 int builtin_clear(ShellContext *ctx, char **argv);
 
+/**
+ * @brief Built-in command: Runs commands in parallel with multiWatch.
+ *
+ * Syntax: multiWatch ["cmd1", "cmd2", ...]
+ *
+ * @param[in,out] ctx Pointer to the active ShellContext.
+ * @param[in] argc Argument count.
+ * @param[in] argv Argument array.
+ * @return 0 on completion/interruption, 1 on error.
+ */
+int builtin_multiwatch(ShellContext *ctx, int argc, char **argv);
+
 #endif /* BUILTINS_H */
