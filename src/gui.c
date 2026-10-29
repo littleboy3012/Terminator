@@ -11,6 +11,8 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <signal.h>
+#include <ctype.h>
+#include <X11/Xatom.h>
 
 #define DEFAULT_FONT_NAME "fixed"
 #define PROMPT_STRING "user@terminator> "
@@ -197,6 +199,17 @@ int gui_init(GuiApp *app, int width, int height, const char *title) {
     app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(app->display, app->window, &app->wm_delete_window, 1);
 
+    /* Initialize X11 selection clipboard atoms */
+    app->atom_clipboard = XInternAtom(app->display, "CLIPBOARD", False);
+    app->atom_utf8_string = XInternAtom(app->display, "UTF8_STRING", False);
+    app->atom_targets = XInternAtom(app->display, "TARGETS", False);
+    app->atom_terminator_sel = XInternAtom(app->display, "TERMINATOR_SELECTION", False);
+    app->clipboard_data[0] = '\0';
+    app->clipboard_len = 0;
+
+    /* Initialize Task 7 Hotkeys from ~/.terminatorrc */
+    hotkeys_init(&app->hotkeys);
+
     /* Map (show) the window on the desktop screen */
     XMapWindow(app->display, app->window);
     XFlush(app->display);
@@ -280,6 +293,8 @@ int gui_create_tab(GuiApp *app, const char *initial_cwd) {
     tab->scroll_offset = 0;
     tab->input_len = 0;
     tab->cursor_pos = 0;
+    tab->history_pos = -1;
+    tab->history_count = 0;
 
     /* Initialize tab shell context */
     shell_init(&tab->shell_ctx);
@@ -512,6 +527,21 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         snprintf(tab->multiline_accum + acc_len, sizeof(tab->multiline_accum) - acc_len, "\n%s", tab->input_buffer);
     }
 
+    /* Record command into history (avoiding consecutive duplicates) */
+    if (tab->input_len > 0) {
+        if (tab->history_count == 0 || strcmp(tab->history[tab->history_count - 1], tab->input_buffer) != 0) {
+            if (tab->history_count < MAX_TAB_HISTORY) {
+                snprintf(tab->history[tab->history_count], sizeof(tab->history[0]), "%s", tab->input_buffer);
+                tab->history_count++;
+            } else {
+                memmove(&tab->history[0], &tab->history[1], sizeof(tab->history[0]) * (MAX_TAB_HISTORY - 1));
+                snprintf(tab->history[MAX_TAB_HISTORY - 1], sizeof(tab->history[0]), "%s", tab->input_buffer);
+            }
+        }
+        tab->history_pos = -1;
+        tab->saved_input[0] = '\0';
+    }
+
     /* Clear the active typed input buffer */
     tab->input_buffer[0] = '\0';
     tab->input_len = 0;
@@ -653,23 +683,6 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
         return;
     }
 
-    /* Keyboard shortcut: Ctrl+D closes the tab / sends EOF (Task 7 requirement) */
-    if (is_ctrl && !is_shift && (keysym == XK_D || keysym == XK_d)) {
-        if (tab->input_len == 0) {
-            gui_close_tab(app, app->active_tab_idx);
-            gui_redraw(app);
-            return;
-        }
-    }
-
-    /* Keyboard shortcut: Ctrl+L clears the screen (Task 7 requirement) */
-    if (is_ctrl && !is_shift && (keysym == XK_L || keysym == XK_l)) {
-        tab->num_lines = 0;
-        tab->scroll_offset = 0;
-        gui_redraw(app);
-        return;
-    }
-
     /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */
     if (is_shift && keysym == XK_Left) {
         if (app->active_tab_idx > 0) {
@@ -698,7 +711,43 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
         return;
     }
 
-    /* Check wrapped line cursor navigation: Up / Down across visual lines of command */
+    /* Handle Return / Enter key */
+    if (keysym == XK_Return || keysym == XK_KP_Enter) {
+        tab_submit_command(app, tab);
+        gui_redraw(app);
+        return;
+    }
+
+    /* Handle Backspace key */
+    if (keysym == XK_BackSpace) {
+        if (tab->cursor_pos > 0) {
+            memmove(&tab->input_buffer[tab->cursor_pos - 1],
+                    &tab->input_buffer[tab->cursor_pos],
+                    tab->input_len - tab->cursor_pos + 1);
+            tab->cursor_pos--;
+            tab->input_len--;
+            gui_redraw(app);
+        }
+        return;
+    }
+
+    /* Handle Left / Right arrow navigation within the input buffer */
+    if (keysym == XK_Left && !is_ctrl && !is_shift) {
+        if (tab->cursor_pos > 0) {
+            tab->cursor_pos--;
+            gui_redraw(app);
+        }
+        return;
+    }
+    if (keysym == XK_Right && !is_ctrl && !is_shift) {
+        if (tab->cursor_pos < tab->input_len) {
+            tab->cursor_pos++;
+            gui_redraw(app);
+        }
+        return;
+    }
+
+    /* Check Task 7 configurable hotkeys table (Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+K, Ctrl+W, Ctrl+L, Ctrl+D, Ctrl+Shift+C, Ctrl+Shift+V, Up, Down) */
     int text_area_w = app->win_width - 25;
     int cols = text_area_w / app->font_width;
     if (cols < 20) cols = 20;
@@ -707,40 +756,155 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     int first_line_capacity = cols - prompt_len;
     if (first_line_capacity < 1) first_line_capacity = 1;
 
-    if (!is_shift && tab->input_len > first_line_capacity) {
-        if (keysym == XK_Up) {
-            /* If cursor is on Row 1 or below, move cursor up one visual row of input */
-            if (tab->cursor_pos > first_line_capacity) {
-                int rel = tab->cursor_pos - first_line_capacity;
-                int row = 1 + (rel / cols);
-                if (row == 1) {
-                    int col = rel % cols;
-                    int target = col - prompt_len;
-                    if (target < 0) target = 0;
-                    if (target > first_line_capacity) target = first_line_capacity;
-                    tab->cursor_pos = target;
-                } else {
-                    tab->cursor_pos -= cols;
-                }
+    int action = hotkeys_match(&app->hotkeys, event, keysym);
+    if (action >= 0) {
+        switch (action) {
+            case HOTKEY_MOVE_START:
+                tab->cursor_pos = 0;
                 gui_redraw(app);
                 return;
-            }
-        } else if (keysym == XK_Down) {
-            /* If cursor is on Row 0 or can move down one visual row */
-            int total_rows = 1 + (tab->input_len - first_line_capacity + cols - 1) / cols;
-            int cur_row = (tab->cursor_pos <= first_line_capacity) ? 0 : 1 + ((tab->cursor_pos - first_line_capacity) / cols);
-            if (cur_row < total_rows - 1) {
-                int target;
-                if (cur_row == 0) {
-                    target = first_line_capacity + tab->cursor_pos;
-                } else {
-                    target = tab->cursor_pos + cols;
-                }
-                if (target > tab->input_len) target = tab->input_len;
-                tab->cursor_pos = target;
+
+            case HOTKEY_MOVE_END:
+                tab->cursor_pos = tab->input_len;
                 gui_redraw(app);
                 return;
-            }
+
+            case HOTKEY_DELETE_TO_START:
+                if (tab->cursor_pos > 0) {
+                    memmove(&tab->input_buffer[0],
+                            &tab->input_buffer[tab->cursor_pos],
+                            tab->input_len - tab->cursor_pos + 1);
+                    tab->input_len -= tab->cursor_pos;
+                    tab->cursor_pos = 0;
+                    gui_redraw(app);
+                }
+                return;
+
+            case HOTKEY_DELETE_TO_END:
+                if (tab->cursor_pos < tab->input_len) {
+                    tab->input_buffer[tab->cursor_pos] = '\0';
+                    tab->input_len = tab->cursor_pos;
+                    gui_redraw(app);
+                }
+                return;
+
+            case HOTKEY_DELETE_WORD:
+                if (tab->cursor_pos > 0) {
+                    int end = tab->cursor_pos;
+                    int start = end;
+                    while (start > 0 && isspace((unsigned char)tab->input_buffer[start - 1])) {
+                        start--;
+                    }
+                    while (start > 0 && !isspace((unsigned char)tab->input_buffer[start - 1])) {
+                        start--;
+                    }
+                    int del_len = end - start;
+                    memmove(&tab->input_buffer[start],
+                            &tab->input_buffer[end],
+                            tab->input_len - end + 1);
+                    tab->input_len -= del_len;
+                    tab->cursor_pos = start;
+                    gui_redraw(app);
+                }
+                return;
+
+            case HOTKEY_CLEAR_SCREEN:
+                tab->num_lines = 0;
+                tab->scroll_offset = 0;
+                gui_redraw(app);
+                return;
+
+            case HOTKEY_EXIT_SHELL:
+                if (tab->input_len == 0) {
+                    gui_close_tab(app, app->active_tab_idx);
+                    gui_redraw(app);
+                    return;
+                }
+                break;
+
+            case HOTKEY_COPY:
+                if (tab->input_len > 0) {
+                    snprintf(app->clipboard_data, sizeof(app->clipboard_data), "%s", tab->input_buffer);
+                    app->clipboard_len = (int)strlen(app->clipboard_data);
+                    XSetSelectionOwner(app->display, app->atom_clipboard, app->window, CurrentTime);
+                    XSetSelectionOwner(app->display, XA_PRIMARY, app->window, CurrentTime);
+                }
+                return;
+
+            case HOTKEY_PASTE:
+                XConvertSelection(app->display, app->atom_clipboard, app->atom_utf8_string,
+                                  app->atom_terminator_sel, app->window, CurrentTime);
+                return;
+
+            case HOTKEY_HISTORY_PREV:
+                /* If command is multi-line wrapped and cursor is on line 2+, navigate up inside command */
+                if (tab->input_len > first_line_capacity && tab->cursor_pos > first_line_capacity) {
+                    int rel = tab->cursor_pos - first_line_capacity;
+                    int row = 1 + (rel / cols);
+                    if (row == 1) {
+                        int col = rel % cols;
+                        int target = col - prompt_len;
+                        if (target < 0) target = 0;
+                        if (target > first_line_capacity) target = first_line_capacity;
+                        tab->cursor_pos = target;
+                    } else {
+                        tab->cursor_pos -= cols;
+                    }
+                    gui_redraw(app);
+                    return;
+                }
+                /* Otherwise browse command history backwards */
+                if (tab->history_count > 0) {
+                    if (tab->history_pos == -1) {
+                        snprintf(tab->saved_input, sizeof(tab->saved_input), "%s", tab->input_buffer);
+                        tab->history_pos = tab->history_count - 1;
+                    } else if (tab->history_pos > 0) {
+                        tab->history_pos--;
+                    }
+                    snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->history[tab->history_pos]);
+                    tab->input_len = (int)strlen(tab->input_buffer);
+                    tab->cursor_pos = tab->input_len;
+                    gui_redraw(app);
+                    return;
+                }
+                break;
+
+            case HOTKEY_HISTORY_NEXT:
+                /* If command is multi-line wrapped and cursor is not on last line, navigate down inside command */
+                if (tab->input_len > first_line_capacity) {
+                    int total_rows = 1 + (tab->input_len - first_line_capacity + cols - 1) / cols;
+                    int cur_row = (tab->cursor_pos <= first_line_capacity) ? 0 : 1 + ((tab->cursor_pos - first_line_capacity) / cols);
+                    if (cur_row < total_rows - 1) {
+                        int target;
+                        if (cur_row == 0) target = first_line_capacity + tab->cursor_pos;
+                        else target = tab->cursor_pos + cols;
+                        if (target > tab->input_len) target = tab->input_len;
+                        tab->cursor_pos = target;
+                        gui_redraw(app);
+                        return;
+                    }
+                }
+                /* Otherwise browse command history forwards */
+                if (tab->history_pos >= 0) {
+                    if (tab->history_pos < tab->history_count - 1) {
+                        tab->history_pos++;
+                        snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->history[tab->history_pos]);
+                        tab->input_len = (int)strlen(tab->input_buffer);
+                        tab->cursor_pos = tab->input_len;
+                    } else {
+                        /* Restores active draft */
+                        tab->history_pos = -1;
+                        snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->saved_input);
+                        tab->input_len = (int)strlen(tab->input_buffer);
+                        tab->cursor_pos = tab->input_len;
+                    }
+                    gui_redraw(app);
+                    return;
+                }
+                break;
+
+            default:
+                break;
         }
     }
 
@@ -1179,6 +1343,70 @@ void gui_run_loop(GuiApp *app) {
                         app->is_running = 0;
                     }
                     break;
+
+                case SelectionRequest: {
+                    /* Reply to other applications or Terminator requesting clipboard text */
+                    XSelectionRequestEvent *req = &ev.xselectionrequest;
+                    XEvent reply;
+                    memset(&reply, 0, sizeof(reply));
+                    reply.xselection.type = SelectionNotify;
+                    reply.xselection.display = req->display;
+                    reply.xselection.requestor = req->requestor;
+                    reply.xselection.selection = req->selection;
+                    reply.xselection.target = req->target;
+                    reply.xselection.time = req->time;
+                    reply.xselection.property = None;
+
+                    if (req->target == app->atom_targets) {
+                        Atom targets[] = { app->atom_targets, app->atom_utf8_string, XA_STRING };
+                        XChangeProperty(req->display, req->requestor, req->property,
+                                        XA_ATOM, 32, PropModeReplace,
+                                        (unsigned char *)targets, sizeof(targets) / sizeof(Atom));
+                        reply.xselection.property = req->property;
+                    } else if (req->target == XA_STRING || req->target == app->atom_utf8_string) {
+                        XChangeProperty(req->display, req->requestor, req->property,
+                                        req->target, 8, PropModeReplace,
+                                        (unsigned char *)app->clipboard_data, app->clipboard_len);
+                        reply.xselection.property = req->property;
+                    }
+                    XSendEvent(req->display, req->requestor, False, 0, &reply);
+                    XFlush(app->display);
+                    break;
+                }
+
+                case SelectionNotify: {
+                    /* Receive clipboard text from paste request */
+                    XSelectionEvent *sel = &ev.xselection;
+                    if (sel->property != None) {
+                        Atom type_ret;
+                        int format_ret;
+                        unsigned long nitems_ret, bytes_after_ret;
+                        unsigned char *prop_data = NULL;
+                        if (XGetWindowProperty(app->display, app->window, sel->property,
+                                               0, 4096, True, AnyPropertyType,
+                                               &type_ret, &format_ret, &nitems_ret,
+                                               &bytes_after_ret, &prop_data) == Success && prop_data) {
+                            if (app->num_tabs > 0) {
+                                Tab *tab = app->tabs[app->active_tab_idx];
+                                for (unsigned long i = 0; i < nitems_ret; i++) {
+                                    char c = prop_data[i];
+                                    if (c == '\r' || c == '\n') continue;
+                                    if (c >= 32 && c <= 126 && tab->input_len < MAX_LINE_CHARS - 2) {
+                                        memmove(&tab->input_buffer[tab->cursor_pos + 1],
+                                                &tab->input_buffer[tab->cursor_pos],
+                                                tab->input_len - tab->cursor_pos + 1);
+                                        tab->input_buffer[tab->cursor_pos] = c;
+                                        tab->cursor_pos++;
+                                        tab->input_len++;
+                                    }
+                                }
+                                gui_redraw(app);
+                            }
+                            XFree(prop_data);
+                        }
+                    }
+                    break;
+                }
 
                 default:
                     break;

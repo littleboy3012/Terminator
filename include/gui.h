@@ -7,10 +7,12 @@
 #include <sys/types.h>
 #include <limits.h>
 #include "shell.h"
+#include "hotkeys.h"
 
 #define MAX_TABS 16
 #define MAX_LINE_CHARS 1024
 #define MAX_BUFFER_LINES 2000
+#define MAX_TAB_HISTORY 1000
 #define TAB_BAR_HEIGHT 36
 
 /**
@@ -55,6 +57,10 @@ typedef struct {
     int out_pipe_fd;                        /**< Read end of the pipe capturing stdout/stderr from child process */
     int is_multiline;                       /**< Non-zero if currently reading multiline continuation input ('> ') */
     char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */
+    char history[MAX_TAB_HISTORY][MAX_LINE_CHARS]; /**< Command history ring buffer for this tab */
+    int history_count;                      /**< Number of recorded commands in history */
+    int history_pos;                        /**< Active position when browsing history (-1 when at bottom prompt) */
+    char saved_input[MAX_LINE_CHARS];       /**< Preserves in-progress typed text when browsing history */
 } Tab;
 
 /**
@@ -89,6 +95,15 @@ typedef struct {
     int num_tabs;            /**< Count of currently open tabs */
     int active_tab_idx;      /**< Zero-based index of the currently displayed tab */
     Atom wm_delete_window;   /**< X11 Atom for intercepting window manager close ('X' button) */
+
+    /* Hotkeys & Clipboard */
+    HotkeyConfig hotkeys;    /**< Active hotkey bindings table */
+    Atom atom_clipboard;     /**< X11 CLIPBOARD selection atom */
+    Atom atom_utf8_string;   /**< X11 UTF8_STRING target atom */
+    Atom atom_targets;       /**< X11 TARGETS atom */
+    Atom atom_terminator_sel;/**< Custom property atom for receiving pasted selection data */
+    char clipboard_data[MAX_LINE_CHARS * 4]; /**< Internal clipboard buffer for copy/paste */
+    int clipboard_len;       /**< Length of active clipboard content */
 
     int is_running;          /**< Application loop flag (1 = running, 0 = exit application) */
 } GuiApp;

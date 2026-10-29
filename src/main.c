@@ -5,6 +5,7 @@
 #include "shell.h"
 #include "parser.h"
 #include "gui.h"
+#include "hotkeys.h"
 
 #define MAX_LINE_LEN 4096
 
@@ -121,6 +122,10 @@ int main(int argc, char *argv[]) {
         printf("[Terminator] Mode: Thread Mode (default)\n");
     }
     (void)use_process_mode;
+
+    /* Ensure ~/.terminatorrc exists and custom hotkeys are loaded */
+    HotkeyConfig dummy_hk;
+    hotkeys_init(&dummy_hk);
 
     /* If stdin is not a terminal (e.g. redirected from test file) or --cli requested, run CLI */
     if (force_cli || !isatty(STDIN_FILENO)) {
