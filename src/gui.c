@@ -520,6 +520,13 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             }
             free_pipeline(&pipeline);
             return;
+        } else if (strcmp(cmd->argv[0], "clear") == 0) {
+            /* Clear visual scrollback buffer and reset vertical scroll position */
+            tab->num_lines = 0;
+            tab->scroll_offset = 0;
+            free_pipeline(&pipeline);
+            gui_redraw(app);
+            return;
         }
     }
 
@@ -615,6 +622,14 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
             gui_redraw(app);
             return;
         }
+    }
+
+    /* Keyboard shortcut: Ctrl+L clears the screen (Task 7 requirement) */
+    if (is_ctrl && !is_shift && (keysym == XK_L || keysym == XK_l)) {
+        tab->num_lines = 0;
+        tab->scroll_offset = 0;
+        gui_redraw(app);
+        return;
     }
 
     /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */

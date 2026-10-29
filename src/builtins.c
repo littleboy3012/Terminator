@@ -17,7 +17,7 @@ int is_builtin_command(const char *name) {
         return 0;
     }
 
-    if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0) {
+    if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 || strcmp(name, "clear") == 0) {
         return 1;
     }
 
@@ -44,6 +44,8 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
         return builtin_cd(ctx, cmd->argv);
     } else if (strcmp(cmd->argv[0], "exit") == 0) {
         return builtin_exit(ctx, cmd->argv);
+    } else if (strcmp(cmd->argv[0], "clear") == 0) {
+        return builtin_clear(ctx, cmd->argv);
     }
 
     return 1;
@@ -132,4 +134,22 @@ int builtin_exit(ShellContext *ctx, char **argv) {
     ctx->should_exit = 1;
     ctx->last_exit_status = exit_code;
     return exit_code;
+}
+
+/**
+ * @brief Clears the terminal screen in headless / command-line mode.
+ *
+ * Emits standard ANSI escape sequences (\033[H\033[2J) to reset cursor and wipe screen.
+ * In the X11 GUI mode, the screen is wiped directly by tab_submit_command.
+ *
+ * @param[in,out] ctx Pointer to active ShellContext (unused).
+ * @param[in] argv Null-terminated argument vector (unused).
+ * @return 0 on success.
+ */
+int builtin_clear(ShellContext *ctx, char **argv) {
+    (void)ctx;
+    (void)argv;
+    printf("\033[H\033[2J");
+    fflush(stdout);
+    return 0;
 }

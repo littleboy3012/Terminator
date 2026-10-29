@@ -46,4 +46,16 @@ int builtin_cd(ShellContext *ctx, char **argv);
  */
 int builtin_exit(ShellContext *ctx, char **argv);
 
+/**
+ * @brief Built-in command: Clears the terminal screen ('clear').
+ *
+ * In headless mode, prints ANSI escape sequences to clear the terminal.
+ * In GUI mode, this is intercepted by tab_submit_command to wipe the tab buffer.
+ *
+ * @param[in,out] ctx Pointer to the active ShellContext.
+ * @param[in] argv NULL-terminated array of arguments (argv[0]="clear").
+ * @return 0 on success.
+ */
+int builtin_clear(ShellContext *ctx, char **argv);
+
 #endif /* BUILTINS_H */
