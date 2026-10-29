@@ -37,12 +37,64 @@ static void mw_sigint_handler(int sig) {
 }
 
 /**
+ * @brief Helper to sanitize and add a watched command to the commands array.
+ */
+static void add_watched_cmd(WatchedCmd *cmds, int *count, int max_cmds, const char *raw) {
+    if (!raw || *count >= max_cmds) {
+        return;
+    }
+
+    char buf[MAX_LINE_CHARS];
+    snprintf(buf, sizeof(buf), "%s", raw);
+
+    char *p = buf;
+    while (*p && (isspace((unsigned char)*p) || *p == '[' || *p == ',')) {
+        p++;
+    }
+
+    int len = (int)strlen(p);
+    while (len > 0 && (isspace((unsigned char)p[len - 1]) || p[len - 1] == ']' || p[len - 1] == ',')) {
+        p[len - 1] = '\0';
+        len--;
+    }
+
+    /* Strip surrounding quotes if present: "cmd" -> cmd */
+    if (len >= 2 && ((p[0] == '"' && p[len - 1] == '"') || (p[0] == '\'' && p[len - 1] == '\''))) {
+        p[len - 1] = '\0';
+        p++;
+        len -= 2;
+    }
+
+    /* Trim any remaining spaces or brackets */
+    while (*p && (isspace((unsigned char)*p) || *p == '[')) {
+        p++;
+    }
+    len = (int)strlen(p);
+    while (len > 0 && (isspace((unsigned char)p[len - 1]) || p[len - 1] == ']')) {
+        p[len - 1] = '\0';
+        len--;
+    }
+
+    if (len > 0 && *count < max_cmds) {
+        snprintf(cmds[*count].name, sizeof(cmds[*count].name), "%s", p);
+        cmds[*count].pid = 0;
+        cmds[*count].pipe_fd = -1;
+        cmds[*count].last_finish_time = 0;
+        cmds[*count].output_len = 0;
+        cmds[*count].output_buf[0] = '\0';
+        (*count)++;
+    }
+}
+
+/**
  * @brief Parses commands from multiWatch arguments.
  *
  * Handles formats such as:
  * - multiWatch ["date +%T", "ls | wc -l"]
+ * - multiWatch ["date","ls"]
  * - multiWatch [ "cmd1" , "cmd2" ]
  * - multiWatch ["cmd1", "cmd2", "cmd3"]
+ * - multiWatch cmd1 cmd2
  *
  * @param[in] argc Number of arguments.
  * @param[in] argv Argument array.
@@ -54,35 +106,32 @@ static int parse_multiwatch_commands(int argc, char **argv, WatchedCmd *cmds, in
     int count = 0;
 
     for (int i = 1; i < argc; i++) {
-        char buf[MAX_LINE_CHARS];
-        strncpy(buf, argv[i], sizeof(buf) - 1);
-        buf[sizeof(buf) - 1] = '\0';
+        const char *arg = argv[i];
+        char cur_segment[MAX_LINE_CHARS];
+        int seg_len = 0;
+        int in_sq = 0, in_dq = 0;
 
-        char *p = buf;
-
-        /* Skip leading whitespace and '[' */
-        while (*p && (isspace((unsigned char)*p) || *p == '[')) {
-            p++;
-        }
-
-        /* Trim trailing whitespace, ']', and ',' */
-        int len = (int)strlen(p);
-        while (len > 0 && (isspace((unsigned char)p[len - 1]) || p[len - 1] == ']' || p[len - 1] == ',')) {
-            p[len - 1] = '\0';
-            len--;
-        }
-
-        if (len > 0) {
-            if (count < max_cmds) {
-                strncpy(cmds[count].name, p, sizeof(cmds[count].name) - 1);
-                cmds[count].name[sizeof(cmds[count].name) - 1] = '\0';
-                cmds[count].pid = 0;
-                cmds[count].pipe_fd = -1;
-                cmds[count].last_finish_time = 0;
-                cmds[count].output_len = 0;
-                cmds[count].output_buf[0] = '\0';
-                count++;
+        for (int j = 0; arg[j] != '\0'; j++) {
+            char ch = arg[j];
+            if (ch == '\'' && !in_dq) {
+                in_sq = !in_sq;
+                if (seg_len < MAX_LINE_CHARS - 1) cur_segment[seg_len++] = ch;
+            } else if (ch == '"' && !in_sq) {
+                in_dq = !in_dq;
+                if (seg_len < MAX_LINE_CHARS - 1) cur_segment[seg_len++] = ch;
+            } else if (ch == ',' && !in_sq && !in_dq) {
+                /* Comma outside quotes is a delimiter */
+                cur_segment[seg_len] = '\0';
+                add_watched_cmd(cmds, &count, max_cmds, cur_segment);
+                seg_len = 0;
+            } else {
+                if (seg_len < MAX_LINE_CHARS - 1) cur_segment[seg_len++] = ch;
             }
+        }
+
+        if (seg_len > 0) {
+            cur_segment[seg_len] = '\0';
+            add_watched_cmd(cmds, &count, max_cmds, cur_segment);
         }
     }
 
