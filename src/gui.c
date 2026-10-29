@@ -449,17 +449,55 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     const char *prompt_used = tab->is_multiline ? "> " : PROMPT_STRING;
     int p_len = (int)strlen(prompt_used);
 
-    /* Record prompt + typed input into tab scrollback buffer */
-    if (tab->num_lines < MAX_BUFFER_LINES) {
-        tab->num_lines++;
+    /* Record prompt + typed input into tab scrollback buffer with visual line wrapping */
+    int text_area_w = app->win_width - 25;
+    int cols = text_area_w / app->font_width;
+    if (cols < 20) cols = 20;
+    int first_line_capacity = cols - p_len;
+    if (first_line_capacity < 1) first_line_capacity = 1;
+
+    if (tab->input_len <= first_line_capacity) {
+        if (tab->num_lines < MAX_BUFFER_LINES) {
+            tab->num_lines++;
+        } else {
+            memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+        }
+        TermLine *prompt_line = &tab->lines[tab->num_lines - 1];
+        prompt_line->type = LINE_TYPE_PROMPT_INPUT;
+        prompt_line->prompt_len = p_len;
+        snprintf(prompt_line->text, sizeof(prompt_line->text), "%s%.*s",
+                 prompt_used, (int)(sizeof(prompt_line->text) - p_len - 1), tab->input_buffer);
     } else {
-        memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+        /* Record Row 0 with prompt */
+        if (tab->num_lines < MAX_BUFFER_LINES) {
+            tab->num_lines++;
+        } else {
+            memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+        }
+        TermLine *first_line = &tab->lines[tab->num_lines - 1];
+        first_line->type = LINE_TYPE_PROMPT_INPUT;
+        first_line->prompt_len = p_len;
+        snprintf(first_line->text, sizeof(first_line->text), "%s%.*s",
+                 prompt_used, first_line_capacity, tab->input_buffer);
+
+        /* Record subsequent wrapped rows cleanly */
+        int remaining = tab->input_len - first_line_capacity;
+        int buf_offset = first_line_capacity;
+        while (remaining > 0) {
+            int chunk = remaining > cols ? cols : remaining;
+            if (tab->num_lines < MAX_BUFFER_LINES) {
+                tab->num_lines++;
+            } else {
+                memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+            }
+            TermLine *wrap_line = &tab->lines[tab->num_lines - 1];
+            wrap_line->type = LINE_TYPE_PROMPT_INPUT;
+            wrap_line->prompt_len = 0;
+            snprintf(wrap_line->text, sizeof(wrap_line->text), "%.*s", chunk, tab->input_buffer + buf_offset);
+            buf_offset += chunk;
+            remaining -= chunk;
+        }
     }
-    TermLine *prompt_line = &tab->lines[tab->num_lines - 1];
-    prompt_line->type = LINE_TYPE_PROMPT_INPUT;
-    prompt_line->prompt_len = p_len;
-    snprintf(prompt_line->text, sizeof(prompt_line->text), "%s%.*s",
-             prompt_used, (int)(sizeof(prompt_line->text) - p_len - 1), tab->input_buffer);
 
     /* If user pressed Enter on an empty line and not in multiline, nothing to execute */
     if (tab->input_len == 0 && !tab->is_multiline) {
@@ -648,6 +686,64 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
         return;
     }
 
+    /* Handle Home / End keys for rapid line navigation */
+    if (keysym == XK_Home) {
+        tab->cursor_pos = 0;
+        gui_redraw(app);
+        return;
+    }
+    if (keysym == XK_End) {
+        tab->cursor_pos = tab->input_len;
+        gui_redraw(app);
+        return;
+    }
+
+    /* Check wrapped line cursor navigation: Up / Down across visual lines of command */
+    int text_area_w = app->win_width - 25;
+    int cols = text_area_w / app->font_width;
+    if (cols < 20) cols = 20;
+    const char *active_prompt = tab->is_multiline ? "> " : PROMPT_STRING;
+    int prompt_len = (int)strlen(active_prompt);
+    int first_line_capacity = cols - prompt_len;
+    if (first_line_capacity < 1) first_line_capacity = 1;
+
+    if (!is_shift && tab->input_len > first_line_capacity) {
+        if (keysym == XK_Up) {
+            /* If cursor is on Row 1 or below, move cursor up one visual row of input */
+            if (tab->cursor_pos > first_line_capacity) {
+                int rel = tab->cursor_pos - first_line_capacity;
+                int row = 1 + (rel / cols);
+                if (row == 1) {
+                    int col = rel % cols;
+                    int target = col - prompt_len;
+                    if (target < 0) target = 0;
+                    if (target > first_line_capacity) target = first_line_capacity;
+                    tab->cursor_pos = target;
+                } else {
+                    tab->cursor_pos -= cols;
+                }
+                gui_redraw(app);
+                return;
+            }
+        } else if (keysym == XK_Down) {
+            /* If cursor is on Row 0 or can move down one visual row */
+            int total_rows = 1 + (tab->input_len - first_line_capacity + cols - 1) / cols;
+            int cur_row = (tab->cursor_pos <= first_line_capacity) ? 0 : 1 + ((tab->cursor_pos - first_line_capacity) / cols);
+            if (cur_row < total_rows - 1) {
+                int target;
+                if (cur_row == 0) {
+                    target = first_line_capacity + tab->cursor_pos;
+                } else {
+                    target = tab->cursor_pos + cols;
+                }
+                if (target > tab->input_len) target = tab->input_len;
+                tab->cursor_pos = target;
+                gui_redraw(app);
+                return;
+            }
+        }
+    }
+
     /* Keyboard scrolling: Page_Up / Page_Down or Shift+Up / Shift+Down */
     int content_top = TAB_BAR_HEIGHT + 10;
     int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
@@ -765,32 +861,39 @@ void gui_handle_button_press(GuiApp *app, XButtonEvent *event) {
         return; /* Regular click outside tab bar */
     }
 
-    /* Compute tab positions on the tab bar */
+    /* Pinned '+' new tab button at top-right corner */
+    const char *plus_label = " [ + ] ";
+    int plus_width = (int)strlen(plus_label) * app->font_width + 8;
+    int plus_x = app->win_width - plus_width - 6;
+
+    if (event->x >= plus_x && event->x <= plus_x + plus_width) {
+        gui_create_tab(app, app->tabs[app->active_tab_idx]->cwd);
+        gui_redraw(app);
+        return;
+    }
+
+    /* Compute tab positions matching gui_redraw */
+    int avail_tabs_width = plus_x - 14;
+    int tab_spacing = 4;
+    int tab_width = 180;
+    if (app->num_tabs > 0) {
+        int max_allowed_w = (avail_tabs_width - ((app->num_tabs - 1) * tab_spacing)) / app->num_tabs;
+        if (max_allowed_w < tab_width) {
+            tab_width = max_allowed_w;
+        }
+        if (tab_width < 45) {
+            tab_width = 45;
+        }
+    }
+
     int current_x = 10;
     for (int i = 0; i < app->num_tabs; i++) {
-        char label[128];
-        const char *cwd = app->tabs[i]->cwd;
-        const char *last_slash = strrchr(cwd, '/');
-        const char *short_name = last_slash ? (last_slash + 1) : cwd;
-        if (!short_name || short_name[0] == '\0') short_name = "/";
-
-        snprintf(label, sizeof(label), " [ %d: %.30s ] ", i + 1, short_name);
-        int tab_width = strlen(label) * app->font_width + 10;
-
         if (event->x >= current_x && event->x < current_x + tab_width) {
             gui_switch_tab(app, i);
             gui_redraw(app);
             return;
         }
-        current_x += tab_width + 5;
-    }
-
-    /* Check click on '+' new tab button */
-    int plus_width = 4 * app->font_width + 10;
-    if (event->x >= current_x && event->x < current_x + plus_width) {
-        gui_create_tab(app, app->tabs[app->active_tab_idx]->cwd);
-        gui_redraw(app);
-        return;
+        current_x += tab_width + tab_spacing;
     }
 }
 
@@ -820,9 +923,33 @@ void gui_redraw(GuiApp *app) {
     XFillRectangle(app->display, app->back_buffer, app->gc_tab_bar_bg,
                    0, 0, app->win_width, TAB_BAR_HEIGHT);
 
-    int cur_x = 10;
+    /* Render docked '[ + ]' button pinned at the far-right corner */
+    const char *plus_label = " [ + ] ";
+    int plus_width = (int)strlen(plus_label) * app->font_width + 8;
+    int plus_x = app->win_width - plus_width - 6;
     int tab_text_y = TAB_BAR_HEIGHT - 8;
 
+    /* Draw distinct clickable background box for the '+' button */
+    XFillRectangle(app->display, app->back_buffer, app->gc_tab_active_bg,
+                   plus_x, 3, plus_width, TAB_BAR_HEIGHT - 6);
+    XDrawString(app->display, app->back_buffer, app->gc_tab_active_text,
+                plus_x + 4, tab_text_y, plus_label, (int)strlen(plus_label));
+
+    /* Compute available horizontal space for tabs */
+    int avail_tabs_width = plus_x - 14;
+    int tab_spacing = 4;
+    int tab_width = 180;
+    if (app->num_tabs > 0) {
+        int max_allowed_w = (avail_tabs_width - ((app->num_tabs - 1) * tab_spacing)) / app->num_tabs;
+        if (max_allowed_w < tab_width) {
+            tab_width = max_allowed_w;
+        }
+        if (tab_width < 45) {
+            tab_width = 45;
+        }
+    }
+
+    int cur_x = 10;
     for (int i = 0; i < app->num_tabs; i++) {
         char label[128];
         const char *cwd = app->tabs[i]->cwd;
@@ -830,9 +957,21 @@ void gui_redraw(GuiApp *app) {
         const char *short_name = last_slash ? (last_slash + 1) : cwd;
         if (!short_name || short_name[0] == '\0') short_name = "/";
 
-        snprintf(label, sizeof(label), " [ %d: %.30s ] ", i + 1, short_name);
-        int label_len = strlen(label);
-        int tab_width = label_len * app->font_width + 10;
+        /* Determine how many characters fit into the tab width */
+        int max_label_chars = (tab_width - 10) / app->font_width;
+        if (max_label_chars <= 4) {
+            snprintf(label, sizeof(label), " %d ", i + 1);
+        } else {
+            /* Format label with truncation if name is too long */
+            int name_chars_avail = max_label_chars - 7;
+            if (name_chars_avail > 0 && (int)strlen(short_name) > name_chars_avail) {
+                snprintf(label, sizeof(label), " [ %d: %.*s.. ] ", i + 1,
+                         name_chars_avail > 2 ? name_chars_avail - 2 : 1, short_name);
+            } else {
+                snprintf(label, sizeof(label), " [ %d: %.30s ] ", i + 1, short_name);
+            }
+        }
+        int label_len = (int)strlen(label);
 
         if (i == app->active_tab_idx) {
             /* Highlight active tab */
@@ -845,17 +984,28 @@ void gui_redraw(GuiApp *app) {
                         cur_x + 5, tab_text_y, label, label_len);
         }
 
-        cur_x += tab_width + 5;
+        cur_x += tab_width + tab_spacing;
     }
 
-    /* Draw '[ + ]' button for creating a new tab */
-    const char *plus_label = " [ + ] ";
-    XDrawString(app->display, app->back_buffer, app->gc_tab_active_text,
-                cur_x + 5, tab_text_y, plus_label, strlen(plus_label));
+    /* 3. Calculate terminal text area dimensions & visual line wrapping */
+    int text_area_w = app->win_width - 25;
+    int cols = text_area_w / app->font_width;
+    if (cols < 20) cols = 20;
 
-    /* 3. Calculate terminal text area dimensions */
+    const char *active_prompt = tab->is_multiline ? "> " : PROMPT_STRING;
+    int prompt_len = (int)strlen(active_prompt);
+    int first_line_capacity = cols - prompt_len;
+    if (first_line_capacity < 1) first_line_capacity = 1;
+
+    /* Calculate how many visual rows the active wrapped input will occupy */
+    int active_input_rows = 1;
+    if (tab->input_len > first_line_capacity) {
+        active_input_rows = 1 + (tab->input_len - first_line_capacity + cols - 1) / cols;
+    }
+
     int content_top = TAB_BAR_HEIGHT + 10;
-    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
+    int available_content_height = app->win_height - content_top - (active_input_rows * app->font_height);
+    int visible_rows = available_content_height / app->font_height;
     if (visible_rows <= 0) visible_rows = 1;
 
     /* Calculate scroll limits and determine starting/ending lines to render */
@@ -881,7 +1031,7 @@ void gui_redraw(GuiApp *app) {
                             10, current_y, line->text, p_len);
             }
             /* Render the typed command in NEON GREEN */
-            int cmd_len = strlen(line->text) - p_len;
+            int cmd_len = (int)strlen(line->text) - p_len;
             if (cmd_len > 0) {
                 XDrawString(app->display, app->back_buffer, app->gc_input,
                             10 + (p_len * app->font_width), current_y,
@@ -890,33 +1040,67 @@ void gui_redraw(GuiApp *app) {
         } else {
             /* Render program output in crisp Light Text */
             XDrawString(app->display, app->back_buffer, app->gc_output,
-                            10, current_y, line->text, strlen(line->text));
+                        10, current_y, line->text, (int)strlen(line->text));
         }
 
         current_y += app->font_height;
     }
 
-    /* 4. Render Active Input Line:
-     * - Primary "user@terminator> " or continuation "> " in Vivid Red.
+    /* 4. Render Active Input Line with Visual Line Wrapping:
+     * - Primary "user@terminator> " or continuation "> " in Vivid Red on Line 1.
      * - User's typed input drawn in Neon Hacker Green.
-     * - Cursor block drawn at current cursor position.
+     * - If input exceeds line width, wraps cleanly onto subsequent visual lines.
+     * - Block cursor rendered at exact wrapped (row, col) position.
      */
-    const char *active_prompt = tab->is_multiline ? "> " : PROMPT_STRING;
-    int prompt_len = (int)strlen(active_prompt);
     XDrawString(app->display, app->back_buffer, app->gc_prompt,
                 10, current_y, active_prompt, prompt_len);
 
-    if (tab->input_len > 0) {
+    if (tab->input_len <= first_line_capacity) {
+        if (tab->input_len > 0) {
+            XDrawString(app->display, app->back_buffer, app->gc_input,
+                        10 + (prompt_len * app->font_width), current_y,
+                        tab->input_buffer, tab->input_len);
+        }
+        int cursor_x = 10 + ((prompt_len + tab->cursor_pos) * app->font_width);
+        int cursor_y = current_y - app->font_ascent;
+        XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
+                       cursor_x, cursor_y, app->font_width, app->font_height);
+    } else {
+        /* Line 0: draw first_line_capacity characters */
         XDrawString(app->display, app->back_buffer, app->gc_input,
                     10 + (prompt_len * app->font_width), current_y,
-                    tab->input_buffer, tab->input_len);
-    }
+                    tab->input_buffer, first_line_capacity);
 
-    /* Draw block cursor in neon green */
-    int cursor_x = 10 + ((prompt_len + tab->cursor_pos) * app->font_width);
-    int cursor_y = current_y - app->font_ascent;
-    XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
-                   cursor_x, cursor_y, app->font_width, app->font_height);
+        /* Lines 1, 2, ...: draw remaining characters in wrapped lines */
+        int remaining = tab->input_len - first_line_capacity;
+        int buf_offset = first_line_capacity;
+        int wrap_row = 1;
+        while (remaining > 0) {
+            int chunk = remaining > cols ? cols : remaining;
+            int wrap_y = current_y + (wrap_row * app->font_height);
+            XDrawString(app->display, app->back_buffer, app->gc_input,
+                        10, wrap_y, tab->input_buffer + buf_offset, chunk);
+            buf_offset += chunk;
+            remaining -= chunk;
+            wrap_row++;
+        }
+
+        /* Calculate cursor position across wrapped lines */
+        int cur_row = 0;
+        int cur_col = 0;
+        if (tab->cursor_pos <= first_line_capacity) {
+            cur_row = 0;
+            cur_col = prompt_len + tab->cursor_pos;
+        } else {
+            int rel = tab->cursor_pos - first_line_capacity;
+            cur_row = 1 + (rel / cols);
+            cur_col = rel % cols;
+        }
+        int cursor_x = 10 + (cur_col * app->font_width);
+        int cursor_y = current_y + (cur_row * app->font_height) - app->font_ascent;
+        XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
+                       cursor_x, cursor_y, app->font_width, app->font_height);
+    }
 
     /* 5. Draw right-side scrollbar thumb if buffer exceeds screen height */
     if (tab->num_lines > visible_rows) {
