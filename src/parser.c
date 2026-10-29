@@ -3,9 +3,158 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <unistd.h>
+#include <sys/wait.h>
+#include <sys/types.h>
 
 #define MAX_ARGS 128
 #define MAX_TOKEN_LEN 4096
+
+/**
+ * @brief Checks if a command string is incomplete and requires continuation lines.
+ *
+ * Inspects:
+ * - Trailing unescaped backslash ('\')
+ * - Unclosed single quotes ('\'')
+ * - Unclosed double quotes ('\"')
+ * - Unclosed command substitution ("$(...)" or backticks)
+ * - Trailing pipe ('|') waiting for a command
+ *
+ * @param[in] line The accumulated command string entered so far.
+ * @return 1 if command is incomplete (continuation prompt needed), 0 if complete.
+ */
+int is_command_incomplete(const char *line) {
+    if (!line) {
+        return 0;
+    }
+
+    int in_single_quote = 0;
+    int in_double_quote = 0;
+    int subshell_depth = 0;
+    int in_backtick = 0;
+    const char *p = line;
+    const char *last_non_space = NULL;
+
+    while (*p) {
+        if (!isspace((unsigned char)*p)) {
+            last_non_space = p;
+        }
+
+        /* Check for escaped character */
+        if (*p == '\\') {
+            if (*(p + 1) == '\0') {
+                /* Trailing backslash at the very end of string */
+                if (!in_single_quote) {
+                    return 1;
+                }
+            } else if (*(p + 1) == '\n' && *(p + 2) == '\0') {
+                /* Backslash immediately followed by newline at the end */
+                if (!in_single_quote) {
+                    return 1;
+                }
+            }
+            if (!in_single_quote && *(p + 1) != '\0') {
+                p += 2;
+                continue;
+            }
+        }
+
+        if (*p == '\'' && !in_double_quote) {
+            in_single_quote = !in_single_quote;
+        } else if (*p == '"' && !in_single_quote) {
+            in_double_quote = !in_double_quote;
+        } else if (!in_single_quote && *p == '`') {
+            in_backtick = !in_backtick;
+        } else if (!in_single_quote && *p == '$' && *(p + 1) == '(') {
+            subshell_depth++;
+            p++;
+        } else if (!in_single_quote && subshell_depth > 0 && *p == ')') {
+            subshell_depth--;
+        }
+        p++;
+    }
+
+    if (in_single_quote || in_double_quote || in_backtick || subshell_depth > 0) {
+        return 1;
+    }
+
+    /* Trailing pipe '|' also requests continuation */
+    if (last_non_space && *last_non_space == '|' && !in_single_quote && !in_double_quote) {
+        return 1;
+    }
+
+    return 0;
+}
+
+/**
+ * @brief Executes an inner command string for command substitution ($(cmd) or `cmd`).
+ *
+ * Runs the inner command in a child process, captures its standard output via a pipe,
+ * strips any trailing newlines (per POSIX bash specification), and copies into out_buf.
+ *
+ * @param[in] sub_cmd The inner command string to execute.
+ * @param[in] ctx Pointer to active ShellContext.
+ * @param[out] out_buf Destination buffer for captured output.
+ * @param[in] max_len Maximum capacity of out_buf.
+ * @return Number of characters written into out_buf.
+ */
+static int execute_substitution(const char *sub_cmd, const ShellContext *ctx,
+                                char *out_buf, size_t max_len) {
+    if (!sub_cmd || !out_buf || max_len == 0) {
+        return 0;
+    }
+    out_buf[0] = '\0';
+
+    int pipefds[2];
+    if (pipe(pipefds) < 0) {
+        return 0;
+    }
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(pipefds[0]);
+        close(pipefds[1]);
+        return 0;
+    }
+
+    if (pid == 0) {
+        /* Child process: redirect stdout to pipe write end */
+        dup2(pipefds[1], STDOUT_FILENO);
+        close(pipefds[0]);
+        close(pipefds[1]);
+
+        Pipeline pipeline;
+        if (parse_line(sub_cmd, ctx, &pipeline) == 0) {
+            int ret = shell_execute_pipeline((ShellContext *)ctx, &pipeline);
+            free_pipeline(&pipeline);
+            _exit(ret);
+        }
+        _exit(1);
+    }
+
+    /* Parent process: read output from pipe read end */
+    close(pipefds[1]);
+    size_t total = 0;
+    ssize_t n;
+    while ((n = read(pipefds[0], out_buf + total, max_len - 1 - total)) > 0) {
+        total += (size_t)n;
+        if (total >= max_len - 1) {
+            break;
+        }
+    }
+    close(pipefds[0]);
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    /* Strip trailing newline characters per bash quoting/substitution rules */
+    while (total > 0 && (out_buf[total - 1] == '\n' || out_buf[total - 1] == '\r')) {
+        total--;
+    }
+    out_buf[total] = '\0';
+
+    return (int)total;
+}
 
 /**
  * @brief Helper function to free an individual Command structure and its heap-allocated members.
@@ -84,6 +233,36 @@ static int expand_variable(const char *str, char *out_buf, size_t max_len,
         *chars_consumed = 2;
         int exit_val = ctx ? ctx->last_exit_status : 0;
         return snprintf(out_buf, max_len, "%d", exit_val);
+    }
+
+    /* Command substitution $(...) */
+    if (str[1] == '(') {
+        int depth = 1;
+        int i = 2;
+        while (str[i] && depth > 0) {
+            if (str[i] == '$' && str[i + 1] == '(') {
+                depth++;
+                i += 2;
+                continue;
+            } else if (str[i] == ')') {
+                depth--;
+                if (depth == 0) {
+                    break;
+                }
+            }
+            i++;
+        }
+        if (depth == 0) {
+            *chars_consumed = i + 1; /* includes closing ')' */
+            char sub_cmd[MAX_TOKEN_LEN];
+            int cmd_len = i - 2;
+            if (cmd_len >= MAX_TOKEN_LEN) {
+                cmd_len = MAX_TOKEN_LEN - 1;
+            }
+            strncpy(sub_cmd, str + 2, cmd_len);
+            sub_cmd[cmd_len] = '\0';
+            return execute_substitution(sub_cmd, ctx, out_buf, max_len);
+        }
     }
 
     /* Collect alphanumeric variable name */
@@ -198,12 +377,48 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
             continue;
         }
 
-        /* Handle double quote: preserve whitespace, expand variables ($VAR, $?) */
+        /* Line continuation with trailing backslash outside quotes */
+        if (*p == '\\' && *(p + 1) == '\n') {
+            p += 2; /* Remove \<newline> continuation */
+            continue;
+        }
+
+        /* Handle backticks outside quotes */
+        if (*p == '`') {
+            in_token = 1;
+            p++; /* skip opening backtick */
+            const char *start_sub = p;
+            while (*p && *p != '`') {
+                p++;
+            }
+            size_t sub_len = p - start_sub;
+            char sub_cmd[MAX_TOKEN_LEN];
+            if (sub_len >= MAX_TOKEN_LEN) {
+                sub_len = MAX_TOKEN_LEN - 1;
+            }
+            strncpy(sub_cmd, start_sub, sub_len);
+            sub_cmd[sub_len] = '\0';
+            if (*p == '`') {
+                p++; /* skip closing backtick */
+            }
+
+            char exp_buf[MAX_TOKEN_LEN];
+            int exp_len = execute_substitution(sub_cmd, ctx, exp_buf, sizeof(exp_buf));
+            for (int j = 0; j < exp_len && token_len < MAX_TOKEN_LEN - 1; j++) {
+                token[token_len++] = exp_buf[j];
+            }
+            continue;
+        }
+
+        /* Handle double quote: preserve whitespace, expand variables ($VAR, $?) and $(...) */
         if (*p == '"') {
             in_token = 1;
             p++; /* skip opening quote */
             while (*p && *p != '"') {
-                if (*p == '$') {
+                if (*p == '\\' && *(p + 1) == '\n') {
+                    p += 2; /* Line continuation inside double quotes */
+                    continue;
+                } else if (*p == '$') {
                     int consumed = 0;
                     char exp_buf[MAX_TOKEN_LEN];
                     int exp_len = expand_variable(p, exp_buf, sizeof(exp_buf), ctx, &consumed);
@@ -211,6 +426,28 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
                         token[token_len++] = exp_buf[j];
                     }
                     p += consumed;
+                } else if (*p == '`') {
+                    p++; /* skip opening backtick */
+                    const char *start_sub = p;
+                    while (*p && *p != '`') {
+                        p++;
+                    }
+                    size_t sub_len = p - start_sub;
+                    char sub_cmd[MAX_TOKEN_LEN];
+                    if (sub_len >= MAX_TOKEN_LEN) {
+                        sub_len = MAX_TOKEN_LEN - 1;
+                    }
+                    strncpy(sub_cmd, start_sub, sub_len);
+                    sub_cmd[sub_len] = '\0';
+                    if (*p == '`') {
+                        p++;
+                    }
+
+                    char exp_buf[MAX_TOKEN_LEN];
+                    int exp_len = execute_substitution(sub_cmd, ctx, exp_buf, sizeof(exp_buf));
+                    for (int j = 0; j < exp_len && token_len < MAX_TOKEN_LEN - 1; j++) {
+                        token[token_len++] = exp_buf[j];
+                    }
                 } else if (*p == '\\' && *(p + 1) != '\0') {
                     /* Escape sequence inside double quotes */
                     p++;
@@ -320,14 +557,23 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
     const char *p = line;
     int in_single_quote = 0;
     int in_double_quote = 0;
+    int in_backtick = 0;
+    int subshell_depth = 0;
 
     while (*p) {
         if (*p == '\'' && !in_double_quote) {
             in_single_quote = !in_single_quote;
         } else if (*p == '"' && !in_single_quote) {
             in_double_quote = !in_double_quote;
-        } else if (*p == '|' && !in_single_quote && !in_double_quote) {
-            /* Found pipe operator outside quotes */
+        } else if (!in_single_quote && *p == '`') {
+            in_backtick = !in_backtick;
+        } else if (!in_single_quote && *p == '$' && *(p + 1) == '(') {
+            subshell_depth++;
+            p++;
+        } else if (!in_single_quote && subshell_depth > 0 && *p == ')') {
+            subshell_depth--;
+        } else if (*p == '|' && !in_single_quote && !in_double_quote && subshell_depth == 0 && !in_backtick) {
+            /* Found pipe operator outside quotes and command substitutions */
             size_t len = p - start;
             char *seg = malloc(len + 1);
             if (len > 0) {

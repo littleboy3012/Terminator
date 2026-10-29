@@ -29,9 +29,16 @@ static void print_prompt(void) {
  */
 static int run_cli_mode(ShellContext *ctx) {
     char line_buffer[MAX_LINE_LEN];
+    char accum[MAX_LINE_LEN * 4] = "";
+    int is_multiline = 0;
 
     while (!ctx->should_exit) {
-        print_prompt();
+        if (is_multiline) {
+            printf("> ");
+        } else {
+            print_prompt();
+        }
+        fflush(stdout);
 
         /* Read one line of user input from stdin */
         if (fgets(line_buffer, sizeof(line_buffer), stdin) == NULL) {
@@ -46,15 +53,29 @@ static int run_cli_mode(ShellContext *ctx) {
             line_buffer[len - 1] = '\0';
         }
 
-        /* Skip empty lines */
-        if (line_buffer[0] == '\0') {
+        if (!is_multiline) {
+            if (line_buffer[0] == '\0') {
+                continue;
+            }
+            snprintf(accum, sizeof(accum), "%s", line_buffer);
+        } else {
+            size_t a_len = strlen(accum);
+            snprintf(accum + a_len, sizeof(accum) - a_len, "\n%s", line_buffer);
+        }
+
+        /* Check for multiline continuation */
+        if (is_command_incomplete(accum)) {
+            is_multiline = 1;
             continue;
         }
 
+        is_multiline = 0;
+
         /* Parse line into pipeline structure */
         Pipeline pipeline;
-        if (parse_line(line_buffer, ctx, &pipeline) != 0) {
+        if (parse_line(accum, ctx, &pipeline) != 0) {
             ctx->last_exit_status = 2; /* Syntax error code */
+            accum[0] = '\0';
             continue;
         }
 
@@ -63,6 +84,7 @@ static int run_cli_mode(ShellContext *ctx) {
 
         /* Clean up allocated pipeline resources */
         free_pipeline(&pipeline);
+        accum[0] = '\0';
     }
 
     return ctx->last_exit_status;

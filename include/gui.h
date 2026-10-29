@@ -11,7 +11,7 @@
 #define MAX_TABS 16
 #define MAX_LINE_CHARS 1024
 #define MAX_BUFFER_LINES 2000
-#define TAB_BAR_HEIGHT 28
+#define TAB_BAR_HEIGHT 36
 
 /**
  * @brief Represents the visual category of a line in the terminal buffer.
@@ -53,6 +53,8 @@ typedef struct {
     int is_running_cmd;                     /**< Flag indicating whether a background command is currently running */
     pid_t running_pid;                      /**< PID of the running child command (or 0 if idle) */
     int out_pipe_fd;                        /**< Read end of the pipe capturing stdout/stderr from child process */
+    int is_multiline;                       /**< Non-zero if currently reading multiline continuation input ('> ') */
+    char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */
 } Tab;
 
 /**
@@ -80,6 +82,7 @@ typedef struct {
     GC gc_tab_text;          /**< Graphics Context for inactive tab labels */
     GC gc_tab_active_bg;     /**< Graphics Context for active tab highlight background */
     GC gc_tab_active_text;   /**< Graphics Context for active tab label text */
+    GC gc_scrollbar;         /**< Graphics Context for the right-side scrollbar indicator */
 
     /* Tab management */
     Tab *tabs[MAX_TABS];     /**< Array of active Tab pointers */

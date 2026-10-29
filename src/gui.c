@@ -86,6 +86,7 @@ int gui_init(GuiApp *app, int width, int height, const char *title) {
     unsigned long col_tab_bg    = allocate_color(app->display, colormap, 0x1818, 0x1818, 0x1818);
     unsigned long col_tab_act   = allocate_color(app->display, colormap, 0x2A2A, 0x4444, 0x2A2A);
     unsigned long col_tab_text  = allocate_color(app->display, colormap, 0x8888, 0xAAAA, 0x8888);
+    unsigned long col_scroll    = allocate_color(app->display, colormap, 0x5555, 0x7777, 0x5555);
 
     /* Create the top-level window */
     app->window = XCreateSimpleWindow(
@@ -111,10 +112,23 @@ int gui_init(GuiApp *app, int width, int height, const char *title) {
     XSelectInput(app->display, app->window,
                  KeyPressMask | ButtonPressMask | ExposureMask | StructureNotifyMask);
 
-    /* Load monospace terminal font */
-    app->font = XLoadQueryFont(app->display, DEFAULT_FONT_NAME);
-    if (!app->font) {
-        app->font = XLoadQueryFont(app->display, "9x15");
+    /* Load larger, crisp monospace terminal font */
+    const char *font_candidates[] = {
+        "-misc-fixed-medium-r-normal--20-*-*-*-*-*-iso8859-1",
+        "10x20",
+        "-misc-fixed-medium-r-normal--18-*-*-*-*-*-iso8859-1",
+        "9x18",
+        "-misc-fixed-medium-r-normal--15-*-*-*-*-*-iso8859-1",
+        "9x15",
+        "fixed",
+        NULL
+    };
+    app->font = NULL;
+    for (int i = 0; font_candidates[i]; i++) {
+        app->font = XLoadQueryFont(app->display, font_candidates[i]);
+        if (app->font) {
+            break;
+        }
     }
     if (!app->font) {
         app->font = XQueryFont(app->display, XGContextFromGC(DefaultGC(app->display, app->screen)));
@@ -169,6 +183,10 @@ int gui_init(GuiApp *app, int width, int height, const char *title) {
 
     gcv.foreground = col_green;
     app->gc_tab_active_text = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
+
+    /* Scrollbar GC */
+    gcv.foreground = col_scroll;
+    app->gc_scrollbar = XCreateGC(app->display, app->window, GCForeground, &gcv);
 
     /* Create off-screen back buffer for double-buffered flicker-free rendering */
     app->back_buffer = XCreatePixmap(app->display, app->window,
@@ -227,6 +245,7 @@ void gui_cleanup(GuiApp *app) {
     if (app->gc_tab_text) XFreeGC(app->display, app->gc_tab_text);
     if (app->gc_tab_active_bg) XFreeGC(app->display, app->gc_tab_active_bg);
     if (app->gc_tab_active_text) XFreeGC(app->display, app->gc_tab_active_text);
+    if (app->gc_scrollbar) XFreeGC(app->display, app->gc_scrollbar);
 
     if (app->font) XFreeFont(app->display, app->font);
     if (app->window) XDestroyWindow(app->display, app->window);
@@ -345,6 +364,21 @@ void tab_append_output(Tab *tab, const char *text, int len) {
         return;
     }
 
+    /* Auto-snap view to bottom when new command output arrives */
+    tab->scroll_offset = 0;
+
+    /* Ensure output begins on the line below the command prompt, never overwriting it */
+    if (tab->num_lines > 0 && tab->lines[tab->num_lines - 1].type == LINE_TYPE_PROMPT_INPUT) {
+        if (tab->num_lines < MAX_BUFFER_LINES) {
+            tab->num_lines++;
+        } else {
+            memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+        }
+        TermLine *first_out = &tab->lines[tab->num_lines - 1];
+        memset(first_out, 0, sizeof(TermLine));
+        first_out->type = LINE_TYPE_OUTPUT;
+    }
+
     for (int i = 0; i < len; i++) {
         char c = text[i];
 
@@ -408,6 +442,13 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         return;
     }
 
+    /* Snap view to bottom on submission */
+    tab->scroll_offset = 0;
+
+    /* Select active prompt prefix: primary "user@terminator> " or continuation "> " */
+    const char *prompt_used = tab->is_multiline ? "> " : PROMPT_STRING;
+    int p_len = (int)strlen(prompt_used);
+
     /* Record prompt + typed input into tab scrollback buffer */
     if (tab->num_lines < MAX_BUFFER_LINES) {
         tab->num_lines++;
@@ -416,22 +457,40 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     }
     TermLine *prompt_line = &tab->lines[tab->num_lines - 1];
     prompt_line->type = LINE_TYPE_PROMPT_INPUT;
-    prompt_line->prompt_len = strlen(PROMPT_STRING);
+    prompt_line->prompt_len = p_len;
     snprintf(prompt_line->text, sizeof(prompt_line->text), "%s%.*s",
-             PROMPT_STRING, (int)(sizeof(prompt_line->text) - strlen(PROMPT_STRING) - 1), tab->input_buffer);
+             prompt_used, (int)(sizeof(prompt_line->text) - p_len - 1), tab->input_buffer);
 
-    /* Check for empty input (user just pressed Enter) */
-    if (tab->input_len == 0) {
+    /* If user pressed Enter on an empty line and not in multiline, nothing to execute */
+    if (tab->input_len == 0 && !tab->is_multiline) {
         return;
     }
 
-    /* Copy command string and reset input buffer */
-    char cmd_str[MAX_LINE_CHARS];
-    strncpy(cmd_str, tab->input_buffer, sizeof(cmd_str) - 1);
-    cmd_str[sizeof(cmd_str) - 1] = '\0';
+    /* Accumulate into multiline buffer */
+    if (!tab->is_multiline) {
+        snprintf(tab->multiline_accum, sizeof(tab->multiline_accum), "%s", tab->input_buffer);
+    } else {
+        size_t acc_len = strlen(tab->multiline_accum);
+        snprintf(tab->multiline_accum + acc_len, sizeof(tab->multiline_accum) - acc_len, "\n%s", tab->input_buffer);
+    }
+
+    /* Clear the active typed input buffer */
     tab->input_buffer[0] = '\0';
     tab->input_len = 0;
     tab->cursor_pos = 0;
+
+    /* Check if the command is incomplete (unclosed quotes, trailing '\', etc.) */
+    if (is_command_incomplete(tab->multiline_accum)) {
+        tab->is_multiline = 1;
+        return; /* Keep reading with continuation prompt '> ' */
+    }
+
+    /* Command is complete; reset multiline flag and copy accumulated command */
+    tab->is_multiline = 0;
+    char cmd_str[MAX_LINE_CHARS];
+    strncpy(cmd_str, tab->multiline_accum, sizeof(cmd_str) - 1);
+    cmd_str[sizeof(cmd_str) - 1] = '\0';
+    tab->multiline_accum[0] = '\0';
 
     /* Parse command into pipeline */
     Pipeline pipeline;
@@ -565,6 +624,31 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
         return;
     }
 
+    /* Keyboard scrolling: Page_Up / Page_Down or Shift+Up / Shift+Down */
+    int content_top = TAB_BAR_HEIGHT + 10;
+    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
+    if (visible_rows <= 0) visible_rows = 1;
+    int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
+
+    if (keysym == XK_Page_Up || (is_shift && keysym == XK_Up)) {
+        int step = (keysym == XK_Page_Up) ? (visible_rows / 2 > 0 ? visible_rows / 2 : 1) : 1;
+        tab->scroll_offset += step;
+        if (tab->scroll_offset > max_scroll) {
+            tab->scroll_offset = max_scroll;
+        }
+        gui_redraw(app);
+        return;
+    }
+    if (keysym == XK_Page_Down || (is_shift && keysym == XK_Down)) {
+        int step = (keysym == XK_Page_Down) ? (visible_rows / 2 > 0 ? visible_rows / 2 : 1) : 1;
+        tab->scroll_offset -= step;
+        if (tab->scroll_offset < 0) {
+            tab->scroll_offset = 0;
+        }
+        gui_redraw(app);
+        return;
+    }
+
     /* Handle Return / Enter key */
     if (keysym == XK_Return || keysym == XK_KP_Enter) {
         tab_submit_command(app, tab);
@@ -623,8 +707,38 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
  * @param[in] event Pointer to XButtonEvent.
  */
 void gui_handle_button_press(GuiApp *app, XButtonEvent *event) {
-    if (!app || event->y > TAB_BAR_HEIGHT) {
-        return; /* Click outside tab bar */
+    if (!app || app->num_tabs == 0) {
+        return;
+    }
+    Tab *tab = app->tabs[app->active_tab_idx];
+
+    /* Mouse wheel scrolling: Button4 = Wheel Up, Button5 = Wheel Down */
+    int content_top = TAB_BAR_HEIGHT + 10;
+    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
+    if (visible_rows <= 0) visible_rows = 1;
+    int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
+
+    if (event->button == 4) {
+        /* Wheel up -> scroll into past history */
+        tab->scroll_offset += 3;
+        if (tab->scroll_offset > max_scroll) {
+            tab->scroll_offset = max_scroll;
+        }
+        gui_redraw(app);
+        return;
+    }
+    if (event->button == 5) {
+        /* Wheel down -> scroll down towards active prompt */
+        tab->scroll_offset -= 3;
+        if (tab->scroll_offset < 0) {
+            tab->scroll_offset = 0;
+        }
+        gui_redraw(app);
+        return;
+    }
+
+    if (event->y > TAB_BAR_HEIGHT) {
+        return; /* Regular click outside tab bar */
     }
 
     /* Compute tab positions on the tab bar */
@@ -720,16 +834,19 @@ void gui_redraw(GuiApp *app) {
     int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
     if (visible_rows <= 0) visible_rows = 1;
 
-    /* Determine which scrollback lines to render */
-    int start_line = 0;
-    if (tab->num_lines > visible_rows) {
-        start_line = tab->num_lines - visible_rows;
-    }
+    /* Calculate scroll limits and determine starting/ending lines to render */
+    int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
+    if (tab->scroll_offset > max_scroll) tab->scroll_offset = max_scroll;
+    if (tab->scroll_offset < 0) tab->scroll_offset = 0;
+
+    int start_line = max_scroll - tab->scroll_offset;
+    int end_line = start_line + visible_rows;
+    if (end_line > tab->num_lines) end_line = tab->num_lines;
 
     int current_y = content_top + app->font_ascent;
 
-    /* Render scrollback lines */
-    for (int i = start_line; i < tab->num_lines; i++) {
+    /* Render scrollback lines within visible window */
+    for (int i = start_line; i < end_line; i++) {
         TermLine *line = &tab->lines[i];
 
         if (line->type == LINE_TYPE_PROMPT_INPUT) {
@@ -749,20 +866,21 @@ void gui_redraw(GuiApp *app) {
         } else {
             /* Render program output in crisp Light Text */
             XDrawString(app->display, app->back_buffer, app->gc_output,
-                        10, current_y, line->text, strlen(line->text));
+                            10, current_y, line->text, strlen(line->text));
         }
 
         current_y += app->font_height;
     }
 
     /* 4. Render Active Input Line:
-     * - "user@terminator> " drawn in Vivid Red.
+     * - Primary "user@terminator> " or continuation "> " in Vivid Red.
      * - User's typed input drawn in Neon Hacker Green.
      * - Cursor block drawn at current cursor position.
      */
-    int prompt_len = strlen(PROMPT_STRING);
+    const char *active_prompt = tab->is_multiline ? "> " : PROMPT_STRING;
+    int prompt_len = (int)strlen(active_prompt);
     XDrawString(app->display, app->back_buffer, app->gc_prompt,
-                10, current_y, PROMPT_STRING, prompt_len);
+                10, current_y, active_prompt, prompt_len);
 
     if (tab->input_len > 0) {
         XDrawString(app->display, app->back_buffer, app->gc_input,
@@ -776,7 +894,19 @@ void gui_redraw(GuiApp *app) {
     XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
                    cursor_x, cursor_y, app->font_width, app->font_height);
 
-    /* 5. Copy off-screen back buffer onto the visible X11 window in one shot */
+    /* 5. Draw right-side scrollbar thumb if buffer exceeds screen height */
+    if (tab->num_lines > visible_rows) {
+        int bar_x = app->win_width - 8;
+        int bar_y_start = content_top;
+        int bar_height_total = app->win_height - content_top - 5;
+        int thumb_height = (visible_rows * bar_height_total) / tab->num_lines;
+        if (thumb_height < 15) thumb_height = 15;
+        int thumb_y = bar_y_start + (int)(((long)start_line * (bar_height_total - thumb_height)) / (tab->num_lines - visible_rows));
+        XFillRectangle(app->display, app->back_buffer, app->gc_scrollbar,
+                       bar_x, thumb_y, 5, thumb_height);
+    }
+
+    /* 6. Copy off-screen back buffer onto the visible X11 window in one shot */
     XCopyArea(app->display, app->back_buffer, app->window, app->gc_bg,
               0, 0, app->win_width, app->win_height, 0, 0);
 

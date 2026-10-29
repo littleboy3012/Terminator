@@ -20,6 +20,20 @@
 int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline);
 
 /**
+ * @brief Checks if a command string is incomplete and requires continuation lines.
+ *
+ * Checks for:
+ * - Trailing unescaped backslash ('\\')
+ * - Unclosed single quotes ('\'')
+ * - Unclosed double quotes ('\"')
+ * - Unclosed command substitution ("$(...)" or backticks)
+ *
+ * @param[in] line The accumulated command string entered so far.
+ * @return 1 if command is incomplete (continuation prompt needed), 0 if complete.
+ */
+int is_command_incomplete(const char *line);
+
+/**
  * @brief Deallocates all dynamically allocated memory within a Pipeline structure.
  *
  * Must be called after executing a pipeline to avoid memory leaks.
