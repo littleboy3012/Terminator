@@ -608,6 +608,15 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
         return;
     }
 
+    /* Keyboard shortcut: Ctrl+D closes the tab / sends EOF (Task 7 requirement) */
+    if (is_ctrl && !is_shift && (keysym == XK_D || keysym == XK_d)) {
+        if (tab->input_len == 0) {
+            gui_close_tab(app, app->active_tab_idx);
+            gui_redraw(app);
+            return;
+        }
+    }
+
     /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */
     if (is_shift && keysym == XK_Left) {
         if (app->active_tab_idx > 0) {
