@@ -138,6 +138,8 @@ static void *tab_worker_thread(void *arg) {
 }
 
 static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
+    signal(SIGINT, SIG_IGN);
+    signal(SIGTSTP, SIG_IGN);
     char cmd_line[MAX_LINE_CHARS * 4];
     FILE *in_fp = fdopen(in_fd, "r");
     if (!in_fp) _exit(1);
@@ -205,6 +207,8 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
         pid_t pid = fork();
         if (pid == 0) {
             setpgid(0, 0);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
             dup2(out_fd, STDOUT_FILENO);
             dup2(out_fd, STDERR_FILENO);
             close(in_fd);
@@ -240,6 +244,7 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
 
 int gui_init(GuiApp *app, int width, int height, const char *title, int use_process_mode) {
     if (!app) return -1;
+    XInitThreads();
     memset(app, 0, sizeof(GuiApp));
     app->use_process_mode = use_process_mode;
 
@@ -248,6 +253,12 @@ int gui_init(GuiApp *app, int width, int height, const char *title, int use_proc
     if (!app->display) {
         fprintf(stderr, "terminator: cannot open X display. Is an X server or WSLg running?\n");
         return -1;
+    }
+
+    int x_fd = ConnectionNumber(app->display);
+    if (x_fd >= 0) {
+        int flags = fcntl(x_fd, F_GETFD);
+        if (flags >= 0) fcntl(x_fd, F_SETFD, flags | FD_CLOEXEC);
     }
 
     app->screen = DefaultScreen(app->display);
@@ -415,9 +426,15 @@ int gui_create_tab(GuiApp *app, const char *initial_cwd) {
 
         if (pid == 0) {
             setpgid(0, 0);
-            /* GUI is the only part that touches X11 */
+            /* The GUI process is the sole owner of the X11 connection.
+             * DO NOT call XCloseDisplay() in the child process!
+             * XCloseDisplay() flushes the buffer and sends protocol teardown packets
+             * over the shared socket, which immediately desynchronizes XCB sequence
+             * numbers in the parent GUI event loop ('Assertion !xcb_xlib_threads_sequence_lost failed').
+             * Instead, simply close the child's inherited socket descriptor directly. */
             if (app->display) {
-                XCloseDisplay(app->display);
+                int x_fd = ConnectionNumber(app->display);
+                if (x_fd >= 0) close(x_fd);
                 app->display = NULL;
             }
             close(gui_to_tab[1]);
@@ -761,7 +778,9 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
 
     /* Signals: Ctrl+C and Ctrl+Z */
     if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
-        if (tab->is_running_cmd && tab->running_pid > 0) {
+        if (tab->use_process_mode && tab->tab_pid > 0) {
+            kill(-tab->tab_pid, SIGINT);
+        } else if (tab->is_running_cmd && tab->running_pid > 0) {
             pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
             kill(-target, SIGINT);
             kill(tab->running_pid, SIGINT);
@@ -777,7 +796,12 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     }
 
     if (is_ctrl && !is_shift && (keysym == XK_Z || keysym == XK_z)) {
-        if (tab->is_running_cmd && tab->running_pid > 0) {
+        if (tab->use_process_mode && tab->tab_pid > 0) {
+            kill(-tab->tab_pid, SIGTSTP);
+            tab_append_output(tab, "^Z\n", 3);
+            gui_redraw(app);
+            return;
+        } else if (tab->is_running_cmd && tab->running_pid > 0) {
             pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
             kill(-target, SIGTSTP);
             kill(tab->running_pid, SIGTSTP);
@@ -1284,7 +1308,7 @@ void gui_run_loop(GuiApp *app) {
         for (int i = 0; i < app->num_tabs; i++) {
             Tab *t = app->tabs[i];
             if (!t) continue;
-            if (t->is_running_cmd && t->out_pipe_fd >= 0 && num_poll_fds < MAX_POLL_ENTRIES) {
+            if ((t->is_running_cmd || t->use_process_mode) && t->out_pipe_fd >= 0 && num_poll_fds < MAX_POLL_ENTRIES) {
                 fds[num_poll_fds].fd = t->out_pipe_fd;
                 fds[num_poll_fds].events = POLLIN | POLLHUP;
                 fds[num_poll_fds].revents = 0;

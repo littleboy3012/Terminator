@@ -176,7 +176,7 @@ int main(int argc, char *argv[]) {
 
     /* Otherwise, launch the full X11 Graphical User Interface */
     GuiApp app;
-    if (gui_init(&app, 900, 600, "Terminator [Hacker Shell]", use_process_mode) != 0) {
+    if (gui_init(&app, 900, 600, "Terminator", use_process_mode) != 0) {
         fprintf(stderr, "terminator: X11 GUI initialization failed; falling back to CLI mode.\n");
         ShellContext ctx;
         if (shell_init(&ctx) != 0) {
