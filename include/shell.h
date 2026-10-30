@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <limits.h>
+#include "jobs.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -25,6 +26,7 @@ typedef struct {
 typedef struct {
     Command *commands;    /**< Array of Command structures in the pipeline */
     int num_commands;     /**< Total number of commands connected by pipes */
+    int is_background;    /**< Non-zero if pipeline should execute in the background (trailing '&') */
 } Pipeline;
 
 /**
@@ -34,6 +36,9 @@ typedef struct {
     int last_exit_status; /**< Exit status of the most recently executed foreground command ($?) */
     int should_exit;      /**< Non-zero if the shell received an 'exit' command and should shut down */
     char cwd[PATH_MAX];   /**< Current working directory of this shell session */
+    JobTable job_table;   /**< Active background and stopped jobs in this shell session (Task 8) */
+    pid_t foreground_pid; /**< Active foreground process PID (0 if idle) */
+    char foreground_cmd[MAX_CMD_LEN]; /**< Command line string of active foreground process */
 } ShellContext;
 
 /**
@@ -68,5 +73,14 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline);
  * @return Exit status code of the command (0 on success, non-zero on error).
  */
 int shell_execute_command(ShellContext *ctx, const Command *cmd);
+
+/**
+ * @brief Applies I/O redirection for a command process using open() and dup2().
+ *
+ * @param[in] input_file Path to input redirection file ('<'), or NULL.
+ * @param[in] output_file Path to output redirection file ('>'), or NULL.
+ * @return 0 on success, or -1 on error.
+ */
+int setup_redirections(const char *input_file, const char *output_file);
 
 #endif /* SHELL_H */

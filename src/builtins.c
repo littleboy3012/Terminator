@@ -4,6 +4,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
+#include <sys/wait.h>
 #include <errno.h>
 
 /**
@@ -19,7 +21,9 @@ int is_builtin_command(const char *name) {
     }
 
     if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
-        strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0) {
+        strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0 ||
+        strcmp(name, "jobs") == 0 || strcmp(name, "fg") == 0 ||
+        strcmp(name, "bg") == 0) {
         return 1;
     }
 
@@ -50,6 +54,12 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
         return builtin_clear(ctx, cmd->argv);
     } else if (strcasecmp(cmd->argv[0], "multiWatch") == 0) {
         return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
+    } else if (strcmp(cmd->argv[0], "jobs") == 0) {
+        return builtin_jobs(ctx, cmd->argv);
+    } else if (strcmp(cmd->argv[0], "bg") == 0) {
+        return builtin_bg(ctx, cmd->argv);
+    } else if (strcmp(cmd->argv[0], "fg") == 0) {
+        return builtin_fg(ctx, cmd->argv);
     }
 
     return 1;
@@ -156,4 +166,81 @@ int builtin_clear(ShellContext *ctx, char **argv) {
     printf("\033[H\033[2J");
     fflush(stdout);
     return 0;
+}
+
+/**
+ * @brief Lists active background and stopped jobs in CLI mode.
+ */
+int builtin_jobs(ShellContext *ctx, char **argv) {
+    if (!ctx) return 1;
+    char out_buf[4096];
+    jobs_builtin_jobs(&ctx->job_table, argv, out_buf, sizeof(out_buf));
+    if (out_buf[0] != '\0') {
+        printf("%s", out_buf);
+        fflush(stdout);
+    }
+    return 0;
+}
+
+/**
+ * @brief Resumes a stopped job in the background in CLI mode.
+ */
+int builtin_bg(ShellContext *ctx, char **argv) {
+    if (!ctx) return 1;
+    char out_buf[512];
+    int ret = jobs_builtin_bg(&ctx->job_table, argv, out_buf, sizeof(out_buf));
+    if (out_buf[0] != '\0') {
+        printf("%s", out_buf);
+        fflush(stdout);
+    }
+    return ret;
+}
+
+/**
+ * @brief Brings a job to the foreground in CLI mode.
+ */
+int builtin_fg(ShellContext *ctx, char **argv) {
+    if (!ctx) return 1;
+    char out_buf[512];
+    Job res_job;
+    int ret = jobs_builtin_fg(&ctx->job_table, argv, out_buf, sizeof(out_buf), &res_job);
+    if (ret != 0) {
+        if (out_buf[0] != '\0') {
+            fprintf(stderr, "%s", out_buf);
+        }
+        return ret;
+    }
+
+    /* Print command name being foregrounded */
+    printf("%s\n", res_job.command);
+    fflush(stdout);
+
+    /* Send SIGCONT to resume if stopped */
+    if (res_job.pgid > 0) {
+        kill(-res_job.pgid, SIGCONT);
+        kill(res_job.pid, SIGCONT);
+    }
+
+    ctx->foreground_pid = res_job.pid;
+    snprintf(ctx->foreground_cmd, sizeof(ctx->foreground_cmd), "%s", res_job.command);
+
+    int status = 0;
+    waitpid(res_job.pid, &status, WUNTRACED);
+    ctx->foreground_pid = 0;
+    ctx->foreground_cmd[0] = '\0';
+
+    if (WIFSTOPPED(status)) {
+        Job *j = jobs_add(&ctx->job_table, res_job.pgid, res_job.pid, res_job.command, JOB_STATE_STOPPED, -1);
+        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, res_job.command);
+        fflush(stdout);
+        ctx->last_exit_status = 128 + WSTOPSIG(status);
+        return ctx->last_exit_status;
+    }
+
+    if (WIFEXITED(status)) {
+        ctx->last_exit_status = WEXITSTATUS(status);
+    } else if (WIFSIGNALED(status)) {
+        ctx->last_exit_status = 128 + WTERMSIG(status);
+    }
+    return ctx->last_exit_status;
 }

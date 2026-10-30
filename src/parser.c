@@ -527,6 +527,62 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
 }
 
 /**
+ * @brief Checks if a command line ends with an unquoted background operator '&'.
+ *
+ * If found, strips the '&' from the buffer and returns 1.
+ * Ignores '&&' or '&' inside quotes or command substitutions.
+ *
+ * @param[in,out] line_buf Buffer containing the command string.
+ * @return 1 if background operator '&' was stripped, 0 otherwise.
+ */
+static int check_and_strip_background(char *line_buf) {
+    if (!line_buf) return 0;
+    int in_sq = 0, in_dq = 0, in_bt = 0, sub_depth = 0;
+    int last_amp_idx = -1;
+    int len = (int)strlen(line_buf);
+
+    for (int i = 0; i < len; i++) {
+        char c = line_buf[i];
+        if (c == '\\' && i + 1 < len) {
+            i++;
+            continue;
+        }
+        if (c == '\'' && !in_dq) {
+            in_sq = !in_sq;
+        } else if (c == '"' && !in_sq) {
+            in_dq = !in_dq;
+        } else if (c == '`' && !in_sq) {
+            in_bt = !in_bt;
+        } else if (c == '$' && i + 1 < len && line_buf[i + 1] == '(' && !in_sq) {
+            sub_depth++;
+            i++;
+        } else if (c == ')' && sub_depth > 0 && !in_sq) {
+            sub_depth--;
+        } else if (c == '&' && !in_sq && !in_dq && !in_bt && sub_depth == 0) {
+            /* Check if not part of '&&' */
+            if ((i == 0 || line_buf[i - 1] != '&') && (i + 1 >= len || line_buf[i + 1] != '&')) {
+                last_amp_idx = i;
+            }
+        }
+    }
+
+    if (last_amp_idx >= 0) {
+        int only_spaces = 1;
+        for (int i = last_amp_idx + 1; i < len; i++) {
+            if (!isspace((unsigned char)line_buf[i])) {
+                only_spaces = 0;
+                break;
+            }
+        }
+        if (only_spaces) {
+            line_buf[last_amp_idx] = '\0';
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/**
  * @brief Parses an entire command line string into a Pipeline of one or more commands.
  *
  * Inspects the input line for pipe ('|') characters that are not inside quotes,
@@ -544,6 +600,14 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
 
     pipeline->commands = NULL;
     pipeline->num_commands = 0;
+    pipeline->is_background = 0;
+
+    char line_copy[MAX_TOKEN_LEN];
+    snprintf(line_copy, sizeof(line_copy), "%s", line);
+
+    if (check_and_strip_background(line_copy)) {
+        pipeline->is_background = 1;
+    }
 
     /* First pass: split line into command segments on unquoted '|' */
     int capacity = 8;
@@ -553,8 +617,8 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
     }
 
     int seg_count = 0;
-    const char *start = line;
-    const char *p = line;
+    const char *start = line_copy;
+    const char *p = line_copy;
     int in_single_quote = 0;
     int in_double_quote = 0;
     int in_backtick = 0;

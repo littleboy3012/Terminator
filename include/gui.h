@@ -52,8 +52,10 @@ typedef struct {
     int input_len;                          /**< Number of characters in input_buffer */
     int cursor_pos;                         /**< Current cursor position within input_buffer */
     ShellContext shell_ctx;                 /**< Shell context specific to this tab */
-    int is_running_cmd;                     /**< Flag indicating whether a background command is currently running */
+    int is_running_cmd;                     /**< Flag indicating whether a foreground command is currently running */
     pid_t running_pid;                      /**< PID of the running child command (or 0 if idle) */
+    pid_t running_pgid;                     /**< Process group ID of the running foreground command */
+    char running_cmd[MAX_LINE_CHARS];       /**< Command line string of active foreground command */
     int out_pipe_fd;                        /**< Read end of the pipe capturing stdout/stderr from child process */
     int is_multiline;                       /**< Non-zero if currently reading multiline continuation input ('> ') */
     char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */

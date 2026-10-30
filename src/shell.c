@@ -25,6 +25,9 @@ int shell_init(ShellContext *ctx) {
 
     ctx->last_exit_status = 0;
     ctx->should_exit = 0;
+    jobs_init(&ctx->job_table);
+    ctx->foreground_pid = 0;
+    ctx->foreground_cmd[0] = '\0';
 
     if (getcwd(ctx->cwd, sizeof(ctx->cwd)) == NULL) {
         perror("terminator: shell_init: getcwd failed");
@@ -43,8 +46,7 @@ void shell_cleanup(ShellContext *ctx) {
     if (!ctx) {
         return;
     }
-    /* In Phase 1, context holds statically sized buffers.
-       Future phases will deallocate history or job lists here. */
+    jobs_kill_all(&ctx->job_table);
     ctx->should_exit = 1;
 }
 
@@ -59,7 +61,7 @@ void shell_cleanup(ShellContext *ctx) {
  * @param[in] output_file Path to output redirection file (e.g. "> outfile.txt"), or NULL.
  * @return 0 on success, or -1 if opening either redirection file failed.
  */
-static int setup_redirections(const char *input_file, const char *output_file) {
+int setup_redirections(const char *input_file, const char *output_file) {
     if (input_file) {
         int in_fd = open(input_file, O_RDONLY);
         if (in_fd < 0) {
@@ -153,6 +155,7 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
     }
 
     if (pid == 0) {
+        setpgid(0, 0);
         /* Child process */
         if (setup_redirections(cmd->input_file, cmd->output_file) != 0) {
             _exit(1);
@@ -165,12 +168,42 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
         _exit(127);
     }
 
-    /* Parent process: wait for child to finish */
+    setpgid(pid, pid);
+    ctx->foreground_pid = pid;
+
+    char full_cmd[MAX_CMD_LEN] = "";
+    for (int a = 0; a < cmd->argc; a++) {
+        if (a > 0) strncat(full_cmd, " ", sizeof(full_cmd) - strlen(full_cmd) - 1);
+        strncat(full_cmd, cmd->argv[a], sizeof(full_cmd) - strlen(full_cmd) - 1);
+    }
+    snprintf(ctx->foreground_cmd, sizeof(ctx->foreground_cmd), "%s", full_cmd);
+
+    /* Parent process: wait for child to finish or suspend */
     int status = 0;
-    if (waitpid(pid, &status, 0) < 0) {
+    while (waitpid(pid, &status, WUNTRACED) < 0) {
+        if (errno == EINTR) {
+            int st = 0;
+            if (waitpid(pid, &st, WUNTRACED | WNOHANG) > 0) {
+                status = st;
+                break;
+            }
+            continue;
+        }
         perror("terminator: waitpid failed");
         ctx->last_exit_status = 1;
+        ctx->foreground_pid = 0;
         return 1;
+    }
+
+    ctx->foreground_pid = 0;
+    ctx->foreground_cmd[0] = '\0';
+
+    if (WIFSTOPPED(status)) {
+        Job *j = jobs_add(&ctx->job_table, pid, pid, full_cmd, JOB_STATE_STOPPED, -1);
+        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, full_cmd);
+        fflush(stdout);
+        ctx->last_exit_status = 128 + WSTOPSIG(status);
+        return ctx->last_exit_status;
     }
 
     int exit_code = 0;
@@ -203,6 +236,63 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
  */
 int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
     if (!ctx || !pipeline || pipeline->num_commands <= 0) {
+        return 0;
+    }
+
+    /* Background execution handling in CLI mode */
+    if (pipeline->is_background) {
+        pid_t bg_pid = fork();
+        if (bg_pid < 0) {
+            perror("terminator: fork failed");
+            ctx->last_exit_status = 1;
+            return 1;
+        }
+
+        if (bg_pid == 0) {
+            setpgid(0, 0);
+
+            /* In background, redirect stdin from /dev/null if not already redirected */
+            if (pipeline->commands[0].input_file == NULL) {
+                int devnull = open("/dev/null", O_RDONLY);
+                if (devnull >= 0) {
+                    dup2(devnull, STDIN_FILENO);
+                    close(devnull);
+                }
+            }
+
+            if (pipeline->num_commands == 1) {
+                Command *c = &pipeline->commands[0];
+                if (setup_redirections(c->input_file, c->output_file) != 0) {
+                    _exit(1);
+                }
+                if (is_builtin_command(c->argv[0])) {
+                    int ret = execute_builtin(ctx, c);
+                    _exit(ret);
+                } else {
+                    execvp(c->argv[0], c->argv);
+                    fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
+                    _exit(127);
+                }
+            }
+
+            Pipeline fg_pl = *pipeline;
+            fg_pl.is_background = 0;
+            int ret = shell_execute_pipeline(ctx, &fg_pl);
+            _exit(ret);
+        }
+
+        setpgid(bg_pid, bg_pid);
+        char cmd_str[MAX_CMD_LEN] = "";
+        for (int i = 0; i < pipeline->num_commands; i++) {
+            if (i > 0) strncat(cmd_str, " | ", sizeof(cmd_str) - strlen(cmd_str) - 1);
+            for (int a = 0; a < pipeline->commands[i].argc; a++) {
+                if (a > 0) strncat(cmd_str, " ", sizeof(cmd_str) - strlen(cmd_str) - 1);
+                strncat(cmd_str, pipeline->commands[i].argv[a], sizeof(cmd_str) - strlen(cmd_str) - 1);
+            }
+        }
+        Job *j = jobs_add(&ctx->job_table, bg_pid, bg_pid, cmd_str, JOB_STATE_RUNNING, -1);
+        printf("[%d] %d\n", j ? j->id : 1, (int)bg_pid);
+        fflush(stdout);
         return 0;
     }
 
@@ -250,6 +340,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
         children_spawned++;
 
         if (pids[i] == 0) {
+            pid_t pgid = (i == 0) ? 0 : pids[0];
+            setpgid(0, pgid);
+
             /* Child process i: rewire stdin from previous pipe if not first */
             if (i > 0) {
                 dup2(pipefds[(i - 1) * 2], STDIN_FILENO);
@@ -281,6 +374,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
                         pipeline->commands[i].argv[0]);
                 _exit(127);
             }
+        } else {
+            pid_t pgid = (i == 0) ? pids[0] : pids[0];
+            setpgid(pids[i], pgid);
         }
     }
 
@@ -292,13 +388,27 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
 
     /* Wait for all children to complete */
     int last_status = 0;
+    if (children_spawned > 0) {
+        ctx->foreground_pid = pids[0];
+    }
     for (int i = 0; i < children_spawned; i++) {
         int status = 0;
-        waitpid(pids[i], &status, 0);
+        while (waitpid(pids[i], &status, WUNTRACED) < 0) {
+            if (errno == EINTR) {
+                int st = 0;
+                if (waitpid(pids[i], &st, WUNTRACED | WNOHANG) > 0) {
+                    status = st;
+                    break;
+                }
+                continue;
+            }
+            break;
+        }
         if (i == children_spawned - 1) {
             last_status = status;
         }
     }
+    ctx->foreground_pid = 0;
     free(pids);
 
     int exit_code = 0;

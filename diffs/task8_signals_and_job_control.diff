@@ -1,0 +1,1446 @@
+diff --git a/Makefile b/Makefile
+index d142b50..b3e41d5 100644
+--- a/Makefile
++++ b/Makefile
+@@ -22,7 +22,8 @@ SRCS = $(SRC_DIR)/main.c \
+        $(SRC_DIR)/builtins.c \
+        $(SRC_DIR)/gui.c \
+        $(SRC_DIR)/hotkeys.c \
+-       $(SRC_DIR)/multiwatch.c
++       $(SRC_DIR)/multiwatch.c \
++       $(SRC_DIR)/jobs.c
+ 
+ OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
+ 
+diff --git a/include/builtins.h b/include/builtins.h
+index 94d8604..cba2e6f 100644
+--- a/include/builtins.h
++++ b/include/builtins.h
+@@ -70,4 +70,31 @@ int builtin_clear(ShellContext *ctx, char **argv);
+  */
+ int builtin_multiwatch(ShellContext *ctx, int argc, char **argv);
+ 
++/**
++ * @brief Built-in command: Lists active background and stopped jobs ('jobs').
++ *
++ * @param[in,out] ctx Pointer to active ShellContext.
++ * @param[in] argv Argument array.
++ * @return 0 on success.
++ */
++int builtin_jobs(ShellContext *ctx, char **argv);
++
++/**
++ * @brief Built-in command: Resumes a stopped job in the background ('bg').
++ *
++ * @param[in,out] ctx Pointer to active ShellContext.
++ * @param[in] argv Argument array (e.g. "bg", "%1").
++ * @return 0 on success, non-zero on error.
++ */
++int builtin_bg(ShellContext *ctx, char **argv);
++
++/**
++ * @brief Built-in command: Brings a job to the foreground ('fg').
++ *
++ * @param[in,out] ctx Pointer to active ShellContext.
++ * @param[in] argv Argument array (e.g. "fg", "%1").
++ * @return 0 on success, non-zero on error.
++ */
++int builtin_fg(ShellContext *ctx, char **argv);
++
+ #endif /* BUILTINS_H */
+diff --git a/include/gui.h b/include/gui.h
+index 8ccc580..5aa4da0 100644
+--- a/include/gui.h
++++ b/include/gui.h
+@@ -52,8 +52,10 @@ typedef struct {
+     int input_len;                          /**< Number of characters in input_buffer */
+     int cursor_pos;                         /**< Current cursor position within input_buffer */
+     ShellContext shell_ctx;                 /**< Shell context specific to this tab */
+-    int is_running_cmd;                     /**< Flag indicating whether a background command is currently running */
++    int is_running_cmd;                     /**< Flag indicating whether a foreground command is currently running */
+     pid_t running_pid;                      /**< PID of the running child command (or 0 if idle) */
++    pid_t running_pgid;                     /**< Process group ID of the running foreground command */
++    char running_cmd[MAX_LINE_CHARS];       /**< Command line string of active foreground command */
+     int out_pipe_fd;                        /**< Read end of the pipe capturing stdout/stderr from child process */
+     int is_multiline;                       /**< Non-zero if currently reading multiline continuation input ('> ') */
+     char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */
+diff --git a/include/jobs.h b/include/jobs.h
+new file mode 100644
+index 0000000..a69b0d7
+--- /dev/null
++++ b/include/jobs.h
+@@ -0,0 +1,176 @@
++#ifndef JOBS_H
++#define JOBS_H
++
++#include <sys/types.h>
++#include <stddef.h>
++
++#define MAX_JOBS 32
++#define MAX_CMD_LEN 512
++
++/**
++ * @brief Represents the lifecycle execution state of a background or suspended job.
++ */
++typedef enum {
++    JOB_STATE_RUNNING,  /**< Actively executing in the background */
++    JOB_STATE_STOPPED,  /**< Suspended via SIGTSTP (Ctrl+Z) */
++    JOB_STATE_DONE      /**< Terminated and waiting to be reported to user */
++} JobState;
++
++/**
++ * @brief Represents an individual tracked job.
++ */
++typedef struct {
++    int id;                     /**< Sequential job identifier (1, 2, 3...) */
++    pid_t pgid;                 /**< Process group ID (for group signaling with kill(-pgid, ...)) */
++    pid_t pid;                  /**< Process ID of the group leader */
++    JobState state;             /**< Current state: RUNNING, STOPPED, or DONE */
++    char command[MAX_CMD_LEN];  /**< Command line string as typed by the user */
++    int out_pipe_fd;            /**< Read-end of pipe capturing stdout/stderr (-1 if closed) */
++    int exit_status;            /**< Exit code or terminating signal number when DONE */
++} Job;
++
++/**
++ * @brief Table maintaining all active background and stopped jobs in a shell session or tab.
++ */
++typedef struct {
++    Job jobs[MAX_JOBS];         /**< Array of active tracked jobs */
++    int num_jobs;               /**< Current count of active tracked jobs */
++    int current_job_id;         /**< ID of the most recent active job (marked with '+') */
++    int previous_job_id;        /**< ID of the second most recent active job (marked with '-') */
++} JobTable;
++
++/**
++ * @brief Initializes a JobTable structure.
++ *
++ * @param[out] table Pointer to JobTable to initialize.
++ */
++void jobs_init(JobTable *table);
++
++/**
++ * @brief Adds a new job to the table.
++ *
++ * Automatically assigns the lowest available positive integer ID and updates
++ * current_job_id and previous_job_id.
++ *
++ * @param[in,out] table Pointer to JobTable.
++ * @param[in] pgid Process group ID.
++ * @param[in] pid Leader process ID.
++ * @param[in] cmd Command string.
++ * @param[in] state Initial state (JOB_STATE_RUNNING or JOB_STATE_STOPPED).
++ * @param[in] pipe_fd Non-blocking pipe read-end (-1 if none).
++ * @return Pointer to newly created Job, or NULL if table is full.
++ */
++Job *jobs_add(JobTable *table, pid_t pgid, pid_t pid, const char *cmd, JobState state, int pipe_fd);
++
++/**
++ * @brief Searches for a job by its numeric identifier.
++ *
++ * @param[in] table Pointer to JobTable.
++ * @param[in] id Job ID (e.g. 1).
++ * @return Pointer to matching Job, or NULL if not found.
++ */
++Job *jobs_find_by_id(JobTable *table, int id);
++
++/**
++ * @brief Searches for a job by its process group ID or leader PID.
++ *
++ * @param[in] table Pointer to JobTable.
++ * @param[in] pid Process ID or PGID.
++ * @return Pointer to matching Job, or NULL if not found.
++ */
++Job *jobs_find_by_pid(JobTable *table, pid_t pid);
++
++/**
++ * @brief Retrieves the current job (marked with '+').
++ *
++ * @param[in] table Pointer to JobTable.
++ * @return Pointer to current Job, or NULL if table is empty.
++ */
++Job *jobs_get_current(JobTable *table);
++
++/**
++ * @brief Removes a job from the table by its ID.
++ *
++ * Re-evaluates current_job_id and previous_job_id accordingly.
++ *
++ * @param[in,out] table Pointer to JobTable.
++ * @param[in] id Job ID to remove.
++ * @return 0 on success, -1 if job was not found.
++ */
++int jobs_remove(JobTable *table, int id);
++
++/**
++ * @brief Terminates all active jobs in the table (e.g. on shell exit or tab close).
++ *
++ * Sends SIGTERM then SIGKILL to each job's process group and reaps child processes.
++ *
++ * @param[in,out] table Pointer to JobTable.
++ */
++void jobs_kill_all(JobTable *table);
++
++/**
++ * @brief Generates formatted output for the built-in 'jobs' command.
++ *
++ * Output format matches course specifications:
++ * [1]+  Stopped                 sleep 100
++ * [2]-  Running                 python3 app.py &
++ *
++ * @param[in] table Pointer to JobTable.
++ * @param[out] out_buf Destination buffer for formatted text.
++ * @param[in] max_len Capacity of out_buf.
++ */
++void jobs_print(const JobTable *table, char *out_buf, size_t max_len);
++
++/**
++ * @brief Non-blocking check of all jobs in the table using waitpid(..., WNOHANG | WUNTRACED | WCONTINUED).
++ *
++ * Updates job states, closes finished pipes, and formats notifications (e.g. "[1]+  Done  sleep 3\n")
++ * into notification_buf for display to the user.
++ *
++ * @param[in,out] table Pointer to JobTable.
++ * @param[out] notification_buf Destination buffer for termination notifications.
++ * @param[in] max_len Capacity of notification_buf.
++ */
++void jobs_check_status(JobTable *table, char *notification_buf, size_t max_len);
++
++/**
++ * @brief Implements the 'jobs' built-in command.
++ *
++ * @param[in] table Pointer to active JobTable.
++ * @param[in] argv Argument vector (argv[0]="jobs").
++ * @param[out] out_buf Destination buffer for printed output.
++ * @param[in] max_len Capacity of out_buf.
++ * @return 0 on success.
++ */
++int jobs_builtin_jobs(JobTable *table, char **argv, char *out_buf, size_t max_len);
++
++/**
++ * @brief Implements the 'bg' built-in command to resume stopped jobs in the background.
++ *
++ * Sends SIGCONT to the specified job's process group, marks it as RUNNING,
++ * and formats the output (e.g. "[1]+ sleep 100 &").
++ *
++ * @param[in,out] table Pointer to active JobTable.
++ * @param[in] argv Argument vector (e.g. "bg", "%1").
++ * @param[out] out_buf Destination buffer for output text.
++ * @param[in] max_len Capacity of out_buf.
++ * @return 0 on success, 1 on error (no such job).
++ */
++int jobs_builtin_bg(JobTable *table, char **argv, char *out_buf, size_t max_len);
++
++/**
++ * @brief Implements the 'fg' built-in command to bring a job to the foreground.
++ *
++ * Resumes the job with SIGCONT if stopped, copies its metadata into res_job,
++ * and removes it from the background table.
++ *
++ * @param[in,out] table Pointer to active JobTable.
++ * @param[in] argv Argument vector (e.g. "fg", "%1").
++ * @param[out] out_buf Destination buffer for output text (e.g. error message).
++ * @param[in] max_len Capacity of out_buf.
++ * @param[out] res_job Pointer to receive the Job metadata for foreground execution.
++ * @return 0 on success, 1 on error.
++ */
++int jobs_builtin_fg(JobTable *table, char **argv, char *out_buf, size_t max_len, Job *res_job);
++
++#endif /* JOBS_H */
+diff --git a/include/shell.h b/include/shell.h
+index 010e0f5..9fc1173 100644
+--- a/include/shell.h
++++ b/include/shell.h
+@@ -3,6 +3,7 @@
+ 
+ #include <stddef.h>
+ #include <limits.h>
++#include "jobs.h"
+ 
+ #ifndef PATH_MAX
+ #define PATH_MAX 4096
+@@ -25,6 +26,7 @@ typedef struct {
+ typedef struct {
+     Command *commands;    /**< Array of Command structures in the pipeline */
+     int num_commands;     /**< Total number of commands connected by pipes */
++    int is_background;    /**< Non-zero if pipeline should execute in the background (trailing '&') */
+ } Pipeline;
+ 
+ /**
+@@ -34,6 +36,9 @@ typedef struct {
+     int last_exit_status; /**< Exit status of the most recently executed foreground command ($?) */
+     int should_exit;      /**< Non-zero if the shell received an 'exit' command and should shut down */
+     char cwd[PATH_MAX];   /**< Current working directory of this shell session */
++    JobTable job_table;   /**< Active background and stopped jobs in this shell session (Task 8) */
++    pid_t foreground_pid; /**< Active foreground process PID (0 if idle) */
++    char foreground_cmd[MAX_CMD_LEN]; /**< Command line string of active foreground process */
+ } ShellContext;
+ 
+ /**
+@@ -69,4 +74,13 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline);
+  */
+ int shell_execute_command(ShellContext *ctx, const Command *cmd);
+ 
++/**
++ * @brief Applies I/O redirection for a command process using open() and dup2().
++ *
++ * @param[in] input_file Path to input redirection file ('<'), or NULL.
++ * @param[in] output_file Path to output redirection file ('>'), or NULL.
++ * @return 0 on success, or -1 on error.
++ */
++int setup_redirections(const char *input_file, const char *output_file);
++
+ #endif /* SHELL_H */
+diff --git a/src/builtins.c b/src/builtins.c
+index 3a10975..94d5ef7 100644
+--- a/src/builtins.c
++++ b/src/builtins.c
+@@ -4,6 +4,8 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <signal.h>
++#include <sys/wait.h>
+ #include <errno.h>
+ 
+ /**
+@@ -19,7 +21,9 @@ int is_builtin_command(const char *name) {
+     }
+ 
+     if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
+-        strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0) {
++        strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0 ||
++        strcmp(name, "jobs") == 0 || strcmp(name, "fg") == 0 ||
++        strcmp(name, "bg") == 0) {
+         return 1;
+     }
+ 
+@@ -50,6 +54,12 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
+         return builtin_clear(ctx, cmd->argv);
+     } else if (strcasecmp(cmd->argv[0], "multiWatch") == 0) {
+         return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
++    } else if (strcmp(cmd->argv[0], "jobs") == 0) {
++        return builtin_jobs(ctx, cmd->argv);
++    } else if (strcmp(cmd->argv[0], "bg") == 0) {
++        return builtin_bg(ctx, cmd->argv);
++    } else if (strcmp(cmd->argv[0], "fg") == 0) {
++        return builtin_fg(ctx, cmd->argv);
+     }
+ 
+     return 1;
+@@ -157,3 +167,80 @@ int builtin_clear(ShellContext *ctx, char **argv) {
+     fflush(stdout);
+     return 0;
+ }
++
++/**
++ * @brief Lists active background and stopped jobs in CLI mode.
++ */
++int builtin_jobs(ShellContext *ctx, char **argv) {
++    if (!ctx) return 1;
++    char out_buf[4096];
++    jobs_builtin_jobs(&ctx->job_table, argv, out_buf, sizeof(out_buf));
++    if (out_buf[0] != '\0') {
++        printf("%s", out_buf);
++        fflush(stdout);
++    }
++    return 0;
++}
++
++/**
++ * @brief Resumes a stopped job in the background in CLI mode.
++ */
++int builtin_bg(ShellContext *ctx, char **argv) {
++    if (!ctx) return 1;
++    char out_buf[512];
++    int ret = jobs_builtin_bg(&ctx->job_table, argv, out_buf, sizeof(out_buf));
++    if (out_buf[0] != '\0') {
++        printf("%s", out_buf);
++        fflush(stdout);
++    }
++    return ret;
++}
++
++/**
++ * @brief Brings a job to the foreground in CLI mode.
++ */
++int builtin_fg(ShellContext *ctx, char **argv) {
++    if (!ctx) return 1;
++    char out_buf[512];
++    Job res_job;
++    int ret = jobs_builtin_fg(&ctx->job_table, argv, out_buf, sizeof(out_buf), &res_job);
++    if (ret != 0) {
++        if (out_buf[0] != '\0') {
++            fprintf(stderr, "%s", out_buf);
++        }
++        return ret;
++    }
++
++    /* Print command name being foregrounded */
++    printf("%s\n", res_job.command);
++    fflush(stdout);
++
++    /* Send SIGCONT to resume if stopped */
++    if (res_job.pgid > 0) {
++        kill(-res_job.pgid, SIGCONT);
++        kill(res_job.pid, SIGCONT);
++    }
++
++    ctx->foreground_pid = res_job.pid;
++    snprintf(ctx->foreground_cmd, sizeof(ctx->foreground_cmd), "%s", res_job.command);
++
++    int status = 0;
++    waitpid(res_job.pid, &status, WUNTRACED);
++    ctx->foreground_pid = 0;
++    ctx->foreground_cmd[0] = '\0';
++
++    if (WIFSTOPPED(status)) {
++        Job *j = jobs_add(&ctx->job_table, res_job.pgid, res_job.pid, res_job.command, JOB_STATE_STOPPED, -1);
++        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, res_job.command);
++        fflush(stdout);
++        ctx->last_exit_status = 128 + WSTOPSIG(status);
++        return ctx->last_exit_status;
++    }
++
++    if (WIFEXITED(status)) {
++        ctx->last_exit_status = WEXITSTATUS(status);
++    } else if (WIFSIGNALED(status)) {
++        ctx->last_exit_status = 128 + WTERMSIG(status);
++    }
++    return ctx->last_exit_status;
++}
+diff --git a/src/gui.c b/src/gui.c
+index 95f938b..a62d17d 100644
+--- a/src/gui.c
++++ b/src/gui.c
+@@ -330,7 +330,12 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
+ 
+     Tab *tab = app->tabs[tab_idx];
+     if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
+-    if (tab->running_pid > 0) kill(tab->running_pid, SIGTERM);
++    if (tab->running_pid > 0) {
++        pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
++        kill(-pg, SIGTERM);
++        kill(tab->running_pid, SIGTERM);
++    }
++    jobs_kill_all(&tab->shell_ctx.job_table);
+     free(tab);
+ 
+     /* Shift remaining tabs in array left */
+@@ -592,6 +597,60 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
+             /* Clear visual scrollback buffer and reset vertical scroll position */
+             tab->num_lines = 0;
+             tab->scroll_offset = 0;
++            free_pipeline(&pipeline);
++            gui_redraw(app);
++            return;
++        } else if (strcmp(cmd->argv[0], "jobs") == 0) {
++            char out_buf[4096];
++            jobs_print(&tab->shell_ctx.job_table, out_buf, sizeof(out_buf));
++            if (out_buf[0] != '\0') {
++                tab_append_output(tab, out_buf, (int)strlen(out_buf));
++            }
++            free_pipeline(&pipeline);
++            gui_redraw(app);
++            return;
++        } else if (strcmp(cmd->argv[0], "bg") == 0) {
++            char out_buf[512];
++            int ret = jobs_builtin_bg(&tab->shell_ctx.job_table, cmd->argv, out_buf, sizeof(out_buf));
++            if (out_buf[0] != '\0') {
++                tab_append_output(tab, out_buf, (int)strlen(out_buf));
++            }
++            tab->shell_ctx.last_exit_status = ret;
++            free_pipeline(&pipeline);
++            gui_redraw(app);
++            return;
++        } else if (strcmp(cmd->argv[0], "fg") == 0) {
++            char out_buf[512];
++            Job res_job;
++            int ret = jobs_builtin_fg(&tab->shell_ctx.job_table, cmd->argv, out_buf, sizeof(out_buf), &res_job);
++            if (ret != 0) {
++                if (out_buf[0] != '\0') {
++                    tab_append_output(tab, out_buf, (int)strlen(out_buf));
++                }
++                tab->shell_ctx.last_exit_status = ret;
++                free_pipeline(&pipeline);
++                gui_redraw(app);
++                return;
++            }
++
++            /* Print command being foregrounded */
++            char fg_msg[600];
++            snprintf(fg_msg, sizeof(fg_msg), "%s\n", res_job.command);
++            tab_append_output(tab, fg_msg, (int)strlen(fg_msg));
++
++            /* Resume process group with SIGCONT */
++            if (res_job.pgid > 0) {
++                kill(-res_job.pgid, SIGCONT);
++                kill(res_job.pid, SIGCONT);
++            }
++
++            /* Attach to foreground */
++            tab->running_pid = res_job.pid;
++            tab->running_pgid = res_job.pgid;
++            snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", res_job.command);
++            tab->out_pipe_fd = res_job.out_pipe_fd;
++            tab->is_running_cmd = 1;
++
+             free_pipeline(&pipeline);
+             gui_redraw(app);
+             return;
+@@ -624,7 +683,7 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
+     }
+ 
+     if (pid == 0) {
+-        /* Child process: become process group leader so Ctrl+C signals target it */
++        /* Child process: become process group leader so Ctrl+C / Ctrl+Z target it */
+         setpgid(0, 0);
+ 
+         /* Change to tab's current working directory */
+@@ -638,16 +697,57 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
+         close(pipefds[0]);
+         close(pipefds[1]);
+ 
+-        /* Execute the parsed pipeline */
+-        int ret = shell_execute_pipeline(&tab->shell_ctx, &pipeline);
++        /* In background, redirect stdin from /dev/null if not already redirected */
++        if (pipeline.commands[0].input_file == NULL && pipeline.is_background) {
++            int devnull = open("/dev/null", O_RDONLY);
++            if (devnull >= 0) {
++                dup2(devnull, STDIN_FILENO);
++                close(devnull);
++            }
++        }
++
++        /* For single command, directly setup redirections and execvp */
++        if (pipeline.num_commands == 1) {
++            Command *c = &pipeline.commands[0];
++            if (setup_redirections(c->input_file, c->output_file) != 0) {
++                _exit(1);
++            }
++            if (is_builtin_command(c->argv[0])) {
++                int ret = execute_builtin(&tab->shell_ctx, c);
++                _exit(ret);
++            } else {
++                execvp(c->argv[0], c->argv);
++                fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
++                _exit(127);
++            }
++        }
++
++        /* For pipelines, execute via shell pipeline engine */
++        Pipeline exec_pl = pipeline;
++        exec_pl.is_background = 0;
++        int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
+         _exit(ret);
+     }
+ 
+-    /* Parent process: close write-end, store read-end for poll() loop */
++    /* Parent process: close write-end */
+     close(pipefds[1]);
+-    tab->out_pipe_fd = pipefds[0];
+-    tab->running_pid = pid;
+-    tab->is_running_cmd = 1;
++    setpgid(pid, pid);
++
++    if (pipeline.is_background) {
++        /* Background execution ('cmd &'): record into job_table and keep prompt active */
++        Job *j = jobs_add(&tab->shell_ctx.job_table, pid, pid, cmd_str, JOB_STATE_RUNNING, pipefds[0]);
++        char launch_msg[256];
++        snprintf(launch_msg, sizeof(launch_msg), "[%d] %d\n", j ? j->id : 1, (int)pid);
++        tab_append_output(tab, launch_msg, (int)strlen(launch_msg));
++        gui_redraw(app);
++    } else {
++        /* Foreground execution: tab waits for command to complete or suspend */
++        tab->out_pipe_fd = pipefds[0];
++        tab->running_pid = pid;
++        tab->running_pgid = pid;
++        snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", cmd_str);
++        tab->is_running_cmd = 1;
++    }
+ 
+     free_pipeline(&pipeline);
+ }
+@@ -689,7 +789,8 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
+     /* Keyboard shortcut: Ctrl+C stops running command (Task 6 & Task 8) */
+     if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
+         if (tab->is_running_cmd && tab->running_pid > 0) {
+-            kill(-tab->running_pid, SIGINT);
++            pid_t target_pgid = (tab->running_pgid > 0) ? tab->running_pgid : tab->running_pid;
++            kill(-target_pgid, SIGINT);
+             kill(tab->running_pid, SIGINT);
+             tab_append_output(tab, "^C\n", 3);
+             gui_redraw(app);
+@@ -705,6 +806,34 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
+         }
+     }
+ 
++    /* Keyboard shortcut: Ctrl+Z suspends running command (Task 8) */
++    if (is_ctrl && !is_shift && (keysym == XK_Z || keysym == XK_z)) {
++        if (tab->is_running_cmd && tab->running_pid > 0) {
++            pid_t target_pgid = (tab->running_pgid > 0) ? tab->running_pgid : tab->running_pid;
++            kill(-target_pgid, SIGTSTP);
++            kill(tab->running_pid, SIGTSTP);
++
++            /* Record stopped job in tab job table */
++            Job *j = jobs_add(&tab->shell_ctx.job_table, target_pgid, tab->running_pid,
++                              tab->running_cmd, JOB_STATE_STOPPED, tab->out_pipe_fd);
++
++            char stop_msg[MAX_LINE_CHARS + 128];
++            snprintf(stop_msg, sizeof(stop_msg), "^Z\n[%d]+  Stopped                 %s\n",
++                     j ? j->id : 1, tab->running_cmd);
++            tab_append_output(tab, stop_msg, (int)strlen(stop_msg));
++
++            /* Clear foreground state so prompt returns immediately */
++            tab->is_running_cmd = 0;
++            tab->running_pid = 0;
++            tab->running_pgid = 0;
++            tab->out_pipe_fd = -1;
++            tab->running_cmd[0] = '\0';
++
++            gui_redraw(app);
++            return;
++        }
++    }
++
+     /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */
+     if (is_shift && keysym == XK_Left) {
+         if (app->active_tab_idx > 0) {
+@@ -1442,26 +1571,53 @@ void gui_run_loop(GuiApp *app) {
+ 
+         /* Set up pollfd array:
+          * fds[0] = X11 connection descriptor (x_fd)
+-         * fds[1..N] = Read ends of active command pipes across all tabs
++         * fds[1..N] = Read ends of active command pipes across all tabs (foreground and background)
+          */
+-        struct pollfd fds[1 + MAX_TABS];
++        #define MAX_POLL_ENTRIES (1 + MAX_TABS * (1 + MAX_JOBS))
++        struct pollfd fds[MAX_POLL_ENTRIES];
++        int poll_tab_idx[MAX_POLL_ENTRIES];
++        int poll_is_bg[MAX_POLL_ENTRIES];
++        int poll_job_id[MAX_POLL_ENTRIES];
+         int num_poll_fds = 1;
+ 
+         fds[0].fd = x_fd;
+         fds[0].events = POLLIN;
+         fds[0].revents = 0;
+-
+-        int tab_indices[1 + MAX_TABS];
+-        tab_indices[0] = -1;
++        poll_tab_idx[0] = -1;
++        poll_is_bg[0] = 0;
++        poll_job_id[0] = -1;
+ 
+         for (int i = 0; i < app->num_tabs; i++) {
+             Tab *t = app->tabs[i];
+-            if (t && t->is_running_cmd && t->out_pipe_fd >= 0) {
+-                fds[num_poll_fds].fd = t->out_pipe_fd;
+-                fds[num_poll_fds].events = POLLIN | POLLHUP;
+-                fds[num_poll_fds].revents = 0;
+-                tab_indices[num_poll_fds] = i;
+-                num_poll_fds++;
++            if (!t) continue;
++
++            /* Foreground command pipe */
++            if (t->is_running_cmd && t->out_pipe_fd >= 0) {
++                if (num_poll_fds < MAX_POLL_ENTRIES) {
++                    fds[num_poll_fds].fd = t->out_pipe_fd;
++                    fds[num_poll_fds].events = POLLIN | POLLHUP;
++                    fds[num_poll_fds].revents = 0;
++                    poll_tab_idx[num_poll_fds] = i;
++                    poll_is_bg[num_poll_fds] = 0;
++                    poll_job_id[num_poll_fds] = -1;
++                    num_poll_fds++;
++                }
++            }
++
++            /* Background job pipes */
++            for (int j = 0; j < t->shell_ctx.job_table.num_jobs; j++) {
++                Job *job = &t->shell_ctx.job_table.jobs[j];
++                if (job->state == JOB_STATE_RUNNING && job->out_pipe_fd >= 0) {
++                    if (num_poll_fds < MAX_POLL_ENTRIES) {
++                        fds[num_poll_fds].fd = job->out_pipe_fd;
++                        fds[num_poll_fds].events = POLLIN | POLLHUP;
++                        fds[num_poll_fds].revents = 0;
++                        poll_tab_idx[num_poll_fds] = i;
++                        poll_is_bg[num_poll_fds] = 1;
++                        poll_job_id[num_poll_fds] = job->id;
++                        num_poll_fds++;
++                    }
++                }
+             }
+         }
+ 
+@@ -1478,10 +1634,10 @@ void gui_run_loop(GuiApp *app) {
+         /* Check active child pipes for output */
+         for (int i = 1; i < num_poll_fds; i++) {
+             if (fds[i].revents & (POLLIN | POLLHUP)) {
+-                int t_idx = tab_indices[i];
++                int t_idx = poll_tab_idx[i];
+                 Tab *t = app->tabs[t_idx];
+                 char buf[512];
+-                ssize_t n = read(t->out_pipe_fd, buf, sizeof(buf));
++                ssize_t n = read(fds[i].fd, buf, sizeof(buf));
+ 
+                 if (n > 0) {
+                     tab_append_output(t, buf, (int)n);
+@@ -1489,28 +1645,54 @@ void gui_run_loop(GuiApp *app) {
+                         needs_redraw = 1;
+                     }
+                 } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
+-                    /* Pipe closed / child finished */
+-                    close(t->out_pipe_fd);
+-                    t->out_pipe_fd = -1;
+-
+-                    int status = 0;
+-                    waitpid(t->running_pid, &status, WNOHANG);
+-                    if (WIFEXITED(status)) {
+-                        t->shell_ctx.last_exit_status = WEXITSTATUS(status);
+-                    } else if (WIFSIGNALED(status)) {
+-                        t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
+-                    }
++                    if (poll_is_bg[i]) {
++                        /* Background job pipe finished */
++                        close(fds[i].fd);
++                        Job *bj = jobs_find_by_id(&t->shell_ctx.job_table, poll_job_id[i]);
++                        if (bj) {
++                            bj->out_pipe_fd = -1;
++                        }
++                    } else {
++                        /* Foreground pipe closed / child finished */
++                        close(t->out_pipe_fd);
++                        t->out_pipe_fd = -1;
++
++                        int status = 0;
++                        waitpid(t->running_pid, &status, WNOHANG);
++                        if (WIFEXITED(status)) {
++                            t->shell_ctx.last_exit_status = WEXITSTATUS(status);
++                        } else if (WIFSIGNALED(status)) {
++                            t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
++                        }
+ 
+-                    t->is_running_cmd = 0;
+-                    t->running_pid = 0;
++                        t->is_running_cmd = 0;
++                        t->running_pid = 0;
++                        t->running_pgid = 0;
++                        t->running_cmd[0] = '\0';
+ 
+-                    if (t_idx == app->active_tab_idx) {
+-                        needs_redraw = 1;
++                        if (t_idx == app->active_tab_idx) {
++                            needs_redraw = 1;
++                        }
+                     }
+                 }
+             }
+         }
+ 
++        /* Check status of background jobs in each tab and collect completion notifications */
++        for (int i = 0; i < app->num_tabs; i++) {
++            Tab *t = app->tabs[i];
++            if (!t) continue;
++            char notif_buf[1024];
++            notif_buf[0] = '\0';
++            jobs_check_status(&t->shell_ctx.job_table, notif_buf, sizeof(notif_buf));
++            if (notif_buf[0] != '\0') {
++                tab_append_output(t, notif_buf, (int)strlen(notif_buf));
++                if (i == app->active_tab_idx) {
++                    needs_redraw = 1;
++                }
++            }
++        }
++
+         if (needs_redraw) {
+             gui_redraw(app);
+         }
+diff --git a/src/jobs.c b/src/jobs.c
+new file mode 100644
+index 0000000..9123a4c
+--- /dev/null
++++ b/src/jobs.c
+@@ -0,0 +1,337 @@
++#include "jobs.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <signal.h>
++#include <ctype.h>
++#include <errno.h>
++#include <sys/wait.h>
++
++void jobs_init(JobTable *table) {
++    if (!table) return;
++    memset(table, 0, sizeof(JobTable));
++    for (int i = 0; i < MAX_JOBS; i++) {
++        table->jobs[i].out_pipe_fd = -1;
++    }
++    table->num_jobs = 0;
++    table->current_job_id = 0;
++    table->previous_job_id = 0;
++}
++
++Job *jobs_add(JobTable *table, pid_t pgid, pid_t pid, const char *cmd, JobState state, int pipe_fd) {
++    if (!table || table->num_jobs >= MAX_JOBS) {
++        return NULL;
++    }
++
++    /* Assign lowest available positive integer ID >= 1 */
++    int assigned_id = 1;
++    while (1) {
++        int taken = 0;
++        for (int i = 0; i < table->num_jobs; i++) {
++            if (table->jobs[i].id == assigned_id) {
++                taken = 1;
++                break;
++            }
++        }
++        if (!taken) break;
++        assigned_id++;
++    }
++
++    int idx = table->num_jobs;
++    Job *j = &table->jobs[idx];
++    memset(j, 0, sizeof(Job));
++    j->id = assigned_id;
++    j->pgid = pgid;
++    j->pid = pid;
++    j->state = state;
++    j->out_pipe_fd = pipe_fd;
++    j->exit_status = 0;
++
++    if (cmd) {
++        snprintf(j->command, sizeof(j->command), "%s", cmd);
++        /* Trim trailing '&' and spaces from recorded command text */
++        int len = (int)strlen(j->command);
++        while (len > 0 && (isspace((unsigned char)j->command[len - 1]) || j->command[len - 1] == '&')) {
++            j->command[len - 1] = '\0';
++            len--;
++        }
++    } else {
++        j->command[0] = '\0';
++    }
++
++    table->num_jobs++;
++
++    /* Update current and previous job references */
++    table->previous_job_id = table->current_job_id;
++    table->current_job_id = assigned_id;
++
++    return j;
++}
++
++Job *jobs_find_by_id(JobTable *table, int id) {
++    if (!table || id <= 0) return NULL;
++    for (int i = 0; i < table->num_jobs; i++) {
++        if (table->jobs[i].id == id) {
++            return &table->jobs[i];
++        }
++    }
++    return NULL;
++}
++
++Job *jobs_find_by_pid(JobTable *table, pid_t pid) {
++    if (!table || pid <= 0) return NULL;
++    for (int i = 0; i < table->num_jobs; i++) {
++        if (table->jobs[i].pid == pid || table->jobs[i].pgid == pid) {
++            return &table->jobs[i];
++        }
++    }
++    return NULL;
++}
++
++Job *jobs_get_current(JobTable *table) {
++    if (!table || table->num_jobs == 0) return NULL;
++    Job *j = jobs_find_by_id(table, table->current_job_id);
++    if (j) return j;
++    return &table->jobs[table->num_jobs - 1];
++}
++
++int jobs_remove(JobTable *table, int id) {
++    if (!table || id <= 0) return -1;
++
++    int found_idx = -1;
++    for (int i = 0; i < table->num_jobs; i++) {
++        if (table->jobs[i].id == id) {
++            found_idx = i;
++            break;
++        }
++    }
++
++    if (found_idx < 0) return -1;
++
++    /* Shift remaining jobs down */
++    for (int i = found_idx; i < table->num_jobs - 1; i++) {
++        table->jobs[i] = table->jobs[i + 1];
++    }
++    table->num_jobs--;
++    memset(&table->jobs[table->num_jobs], 0, sizeof(Job));
++    table->jobs[table->num_jobs].out_pipe_fd = -1;
++
++    /* Re-evaluate current and previous jobs */
++    if (table->current_job_id == id) {
++        table->current_job_id = table->previous_job_id;
++        table->previous_job_id = 0;
++        /* Pick any other active job for previous_job_id */
++        for (int i = table->num_jobs - 1; i >= 0; i--) {
++            if (table->jobs[i].id != table->current_job_id) {
++                table->previous_job_id = table->jobs[i].id;
++                break;
++            }
++        }
++    } else if (table->previous_job_id == id) {
++        table->previous_job_id = 0;
++        for (int i = table->num_jobs - 1; i >= 0; i--) {
++            if (table->jobs[i].id != table->current_job_id) {
++                table->previous_job_id = table->jobs[i].id;
++                break;
++            }
++        }
++    }
++
++    return 0;
++}
++
++void jobs_kill_all(JobTable *table) {
++    if (!table) return;
++
++    for (int i = 0; i < table->num_jobs; i++) {
++        Job *j = &table->jobs[i];
++        if (j->pgid > 0) {
++            kill(-j->pgid, SIGTERM);
++            kill(j->pid, SIGTERM);
++            kill(-j->pgid, SIGCONT); /* Resume stopped jobs so they terminate */
++        }
++        if (j->out_pipe_fd >= 0) {
++            close(j->out_pipe_fd);
++            j->out_pipe_fd = -1;
++        }
++    }
++
++    for (int i = 0; i < table->num_jobs; i++) {
++        Job *j = &table->jobs[i];
++        if (j->pid > 0) {
++            int status = 0;
++            pid_t p = waitpid(j->pid, &status, WNOHANG);
++            if (p == 0) {
++                kill(-j->pgid, SIGKILL);
++                kill(j->pid, SIGKILL);
++                waitpid(j->pid, &status, 0);
++            }
++        }
++    }
++
++    table->num_jobs = 0;
++    table->current_job_id = 0;
++    table->previous_job_id = 0;
++}
++
++void jobs_print(const JobTable *table, char *out_buf, size_t max_len) {
++    if (!table || !out_buf || max_len == 0) return;
++    out_buf[0] = '\0';
++
++    for (int i = 0; i < table->num_jobs; i++) {
++        const Job *j = &table->jobs[i];
++
++        char sign = ' ';
++        if (j->id == table->current_job_id) {
++            sign = '+';
++        } else if (j->id == table->previous_job_id) {
++            sign = '-';
++        }
++
++        const char *state_str = "Running";
++        if (j->state == JOB_STATE_STOPPED) {
++            state_str = "Stopped";
++        } else if (j->state == JOB_STATE_DONE) {
++            state_str = "Done";
++        }
++
++        char line[256];
++        if (j->state == JOB_STATE_RUNNING) {
++            snprintf(line, sizeof(line), "[%d]%c  %-24s%s &\n", j->id, sign, state_str, j->command);
++        } else {
++            snprintf(line, sizeof(line), "[%d]%c  %-24s%s\n", j->id, sign, state_str, j->command);
++        }
++
++        size_t cur_len = strlen(out_buf);
++        if (cur_len + strlen(line) < max_len) {
++            strncat(out_buf, line, max_len - cur_len - 1);
++        }
++    }
++}
++
++void jobs_check_status(JobTable *table, char *notification_buf, size_t max_len) {
++    if (!table || !notification_buf || max_len == 0) return;
++
++    for (int i = 0; i < table->num_jobs; i++) {
++        Job *j = &table->jobs[i];
++        int status = 0;
++        pid_t w = waitpid(j->pid, &status, WNOHANG | WUNTRACED | WCONTINUED);
++
++        if (w > 0) {
++            char sign = (j->id == table->current_job_id) ? '+' :
++                        (j->id == table->previous_job_id) ? '-' : ' ';
++
++            if (WIFEXITED(status) || WIFSIGNALED(status)) {
++                /* Job terminated */
++                char notif[256];
++                snprintf(notif, sizeof(notif), "[%d]%c  Done                    %s\n",
++                         j->id, sign, j->command);
++
++                size_t cur_len = strlen(notification_buf);
++                if (cur_len + strlen(notif) < max_len) {
++                    strncat(notification_buf, notif, max_len - cur_len - 1);
++                }
++
++                if (j->out_pipe_fd >= 0) {
++                    close(j->out_pipe_fd);
++                    j->out_pipe_fd = -1;
++                }
++
++                int rem_id = j->id;
++                jobs_remove(table, rem_id);
++                i--; /* Re-examine current index since elements shifted */
++            } else if (WIFSTOPPED(status)) {
++                if (j->state != JOB_STATE_STOPPED) {
++                    j->state = JOB_STATE_STOPPED;
++                    char notif[256];
++                    snprintf(notif, sizeof(notif), "[%d]%c  Stopped                 %s\n",
++                             j->id, sign, j->command);
++                    size_t cur_len = strlen(notification_buf);
++                    if (cur_len + strlen(notif) < max_len) {
++                        strncat(notification_buf, notif, max_len - cur_len - 1);
++                    }
++                }
++            } else if (WIFCONTINUED(status)) {
++                j->state = JOB_STATE_RUNNING;
++            }
++        }
++    }
++}
++
++/**
++ * @brief Helper to parse job ID from argument like "%1", "1", "%+", "%-".
++ */
++static int parse_job_arg(JobTable *table, const char *arg) {
++    if (!arg) {
++        return table->current_job_id;
++    }
++
++    if (arg[0] == '%') {
++        arg++;
++    }
++
++    if (*arg == '\0' || strcmp(arg, "+") == 0) {
++        return table->current_job_id;
++    } else if (strcmp(arg, "-") == 0) {
++        return table->previous_job_id;
++    }
++
++    return atoi(arg);
++}
++
++int jobs_builtin_jobs(JobTable *table, char **argv, char *out_buf, size_t max_len) {
++    (void)argv;
++    jobs_print(table, out_buf, max_len);
++    return 0;
++}
++
++int jobs_builtin_bg(JobTable *table, char **argv, char *out_buf, size_t max_len) {
++    if (!table || !out_buf || max_len == 0) return 1;
++    out_buf[0] = '\0';
++
++    const char *arg = (argv && argv[1]) ? argv[1] : NULL;
++    int job_id = parse_job_arg(table, arg);
++
++    Job *j = jobs_find_by_id(table, job_id);
++    if (!j) {
++        snprintf(out_buf, max_len, "terminator: bg: %s: no such job\n", arg ? arg : "current");
++        return 1;
++    }
++
++    /* Send SIGCONT to the process group */
++    if (j->pgid > 0) {
++        kill(-j->pgid, SIGCONT);
++        kill(j->pid, SIGCONT);
++    }
++    j->state = JOB_STATE_RUNNING;
++
++    /* Update current job */
++    table->previous_job_id = table->current_job_id;
++    table->current_job_id = j->id;
++
++    snprintf(out_buf, max_len, "[%d]+ %s &\n", j->id, j->command);
++    return 0;
++}
++
++int jobs_builtin_fg(JobTable *table, char **argv, char *out_buf, size_t max_len, Job *res_job) {
++    if (!table || !out_buf || max_len == 0 || !res_job) return 1;
++    out_buf[0] = '\0';
++
++    const char *arg = (argv && argv[1]) ? argv[1] : NULL;
++    int job_id = parse_job_arg(table, arg);
++
++    Job *j = jobs_find_by_id(table, job_id);
++    if (!j) {
++        snprintf(out_buf, max_len, "terminator: fg: %s: no such job\n", arg ? arg : "current");
++        return 1;
++    }
++
++    /* Copy job details to caller */
++    *res_job = *j;
++
++    /* Remove from background table */
++    jobs_remove(table, job_id);
++
++    return 0;
++}
+diff --git a/src/main.c b/src/main.c
+index e8fd0b4..4d716fd 100644
+--- a/src/main.c
++++ b/src/main.c
+@@ -2,13 +2,24 @@
+ #include <stdlib.h>
+ #include <string.h>
+ #include <unistd.h>
++#include <signal.h>
+ #include "shell.h"
+ #include "parser.h"
+ #include "gui.h"
+ #include "hotkeys.h"
++#include "jobs.h"
+ 
+ #define MAX_LINE_LEN 4096
+ 
++static ShellContext *g_cli_ctx = NULL;
++
++static void cli_sig_handler(int sig) {
++    if (g_cli_ctx && g_cli_ctx->foreground_pid > 0) {
++        kill(-g_cli_ctx->foreground_pid, sig);
++        kill(g_cli_ctx->foreground_pid, sig);
++    }
++}
++
+ /**
+  * @brief Prints the interactive Terminator shell prompt to standard output.
+  *
+@@ -33,7 +44,24 @@ static int run_cli_mode(ShellContext *ctx) {
+     char accum[MAX_LINE_LEN * 4] = "";
+     int is_multiline = 0;
+ 
++    g_cli_ctx = ctx;
++    struct sigaction sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_handler = cli_sig_handler;
++    sa.sa_flags = SA_RESTART;
++    sigaction(SIGINT, &sa, NULL);
++    sigaction(SIGTSTP, &sa, NULL);
++
+     while (!ctx->should_exit) {
++        /* Check status of active background jobs before displaying prompt */
++        char notif_buf[1024];
++        notif_buf[0] = '\0';
++        jobs_check_status(&ctx->job_table, notif_buf, sizeof(notif_buf));
++        if (notif_buf[0] != '\0') {
++            printf("%s", notif_buf);
++            fflush(stdout);
++        }
++
+         if (is_multiline) {
+             printf("> ");
+         } else {
+diff --git a/src/parser.c b/src/parser.c
+index 7963491..7460df2 100644
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -526,6 +526,62 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
+     return 0;
+ }
+ 
++/**
++ * @brief Checks if a command line ends with an unquoted background operator '&'.
++ *
++ * If found, strips the '&' from the buffer and returns 1.
++ * Ignores '&&' or '&' inside quotes or command substitutions.
++ *
++ * @param[in,out] line_buf Buffer containing the command string.
++ * @return 1 if background operator '&' was stripped, 0 otherwise.
++ */
++static int check_and_strip_background(char *line_buf) {
++    if (!line_buf) return 0;
++    int in_sq = 0, in_dq = 0, in_bt = 0, sub_depth = 0;
++    int last_amp_idx = -1;
++    int len = (int)strlen(line_buf);
++
++    for (int i = 0; i < len; i++) {
++        char c = line_buf[i];
++        if (c == '\\' && i + 1 < len) {
++            i++;
++            continue;
++        }
++        if (c == '\'' && !in_dq) {
++            in_sq = !in_sq;
++        } else if (c == '"' && !in_sq) {
++            in_dq = !in_dq;
++        } else if (c == '`' && !in_sq) {
++            in_bt = !in_bt;
++        } else if (c == '$' && i + 1 < len && line_buf[i + 1] == '(' && !in_sq) {
++            sub_depth++;
++            i++;
++        } else if (c == ')' && sub_depth > 0 && !in_sq) {
++            sub_depth--;
++        } else if (c == '&' && !in_sq && !in_dq && !in_bt && sub_depth == 0) {
++            /* Check if not part of '&&' */
++            if ((i == 0 || line_buf[i - 1] != '&') && (i + 1 >= len || line_buf[i + 1] != '&')) {
++                last_amp_idx = i;
++            }
++        }
++    }
++
++    if (last_amp_idx >= 0) {
++        int only_spaces = 1;
++        for (int i = last_amp_idx + 1; i < len; i++) {
++            if (!isspace((unsigned char)line_buf[i])) {
++                only_spaces = 0;
++                break;
++            }
++        }
++        if (only_spaces) {
++            line_buf[last_amp_idx] = '\0';
++            return 1;
++        }
++    }
++    return 0;
++}
++
+ /**
+  * @brief Parses an entire command line string into a Pipeline of one or more commands.
+  *
+@@ -544,6 +600,14 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
+ 
+     pipeline->commands = NULL;
+     pipeline->num_commands = 0;
++    pipeline->is_background = 0;
++
++    char line_copy[MAX_TOKEN_LEN];
++    snprintf(line_copy, sizeof(line_copy), "%s", line);
++
++    if (check_and_strip_background(line_copy)) {
++        pipeline->is_background = 1;
++    }
+ 
+     /* First pass: split line into command segments on unquoted '|' */
+     int capacity = 8;
+@@ -553,8 +617,8 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline) {
+     }
+ 
+     int seg_count = 0;
+-    const char *start = line;
+-    const char *p = line;
++    const char *start = line_copy;
++    const char *p = line_copy;
+     int in_single_quote = 0;
+     int in_double_quote = 0;
+     int in_backtick = 0;
+diff --git a/src/shell.c b/src/shell.c
+index 37b90c0..8ef34ac 100644
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -25,6 +25,9 @@ int shell_init(ShellContext *ctx) {
+ 
+     ctx->last_exit_status = 0;
+     ctx->should_exit = 0;
++    jobs_init(&ctx->job_table);
++    ctx->foreground_pid = 0;
++    ctx->foreground_cmd[0] = '\0';
+ 
+     if (getcwd(ctx->cwd, sizeof(ctx->cwd)) == NULL) {
+         perror("terminator: shell_init: getcwd failed");
+@@ -43,8 +46,7 @@ void shell_cleanup(ShellContext *ctx) {
+     if (!ctx) {
+         return;
+     }
+-    /* In Phase 1, context holds statically sized buffers.
+-       Future phases will deallocate history or job lists here. */
++    jobs_kill_all(&ctx->job_table);
+     ctx->should_exit = 1;
+ }
+ 
+@@ -59,7 +61,7 @@ void shell_cleanup(ShellContext *ctx) {
+  * @param[in] output_file Path to output redirection file (e.g. "> outfile.txt"), or NULL.
+  * @return 0 on success, or -1 if opening either redirection file failed.
+  */
+-static int setup_redirections(const char *input_file, const char *output_file) {
++int setup_redirections(const char *input_file, const char *output_file) {
+     if (input_file) {
+         int in_fd = open(input_file, O_RDONLY);
+         if (in_fd < 0) {
+@@ -153,6 +155,7 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+     }
+ 
+     if (pid == 0) {
++        setpgid(0, 0);
+         /* Child process */
+         if (setup_redirections(cmd->input_file, cmd->output_file) != 0) {
+             _exit(1);
+@@ -165,14 +168,44 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+         _exit(127);
+     }
+ 
+-    /* Parent process: wait for child to finish */
++    setpgid(pid, pid);
++    ctx->foreground_pid = pid;
++
++    char full_cmd[MAX_CMD_LEN] = "";
++    for (int a = 0; a < cmd->argc; a++) {
++        if (a > 0) strncat(full_cmd, " ", sizeof(full_cmd) - strlen(full_cmd) - 1);
++        strncat(full_cmd, cmd->argv[a], sizeof(full_cmd) - strlen(full_cmd) - 1);
++    }
++    snprintf(ctx->foreground_cmd, sizeof(ctx->foreground_cmd), "%s", full_cmd);
++
++    /* Parent process: wait for child to finish or suspend */
+     int status = 0;
+-    if (waitpid(pid, &status, 0) < 0) {
++    while (waitpid(pid, &status, WUNTRACED) < 0) {
++        if (errno == EINTR) {
++            int st = 0;
++            if (waitpid(pid, &st, WUNTRACED | WNOHANG) > 0) {
++                status = st;
++                break;
++            }
++            continue;
++        }
+         perror("terminator: waitpid failed");
+         ctx->last_exit_status = 1;
++        ctx->foreground_pid = 0;
+         return 1;
+     }
+ 
++    ctx->foreground_pid = 0;
++    ctx->foreground_cmd[0] = '\0';
++
++    if (WIFSTOPPED(status)) {
++        Job *j = jobs_add(&ctx->job_table, pid, pid, full_cmd, JOB_STATE_STOPPED, -1);
++        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, full_cmd);
++        fflush(stdout);
++        ctx->last_exit_status = 128 + WSTOPSIG(status);
++        return ctx->last_exit_status;
++    }
++
+     int exit_code = 0;
+     if (WIFEXITED(status)) {
+         exit_code = WEXITSTATUS(status);
+@@ -206,6 +239,63 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+         return 0;
+     }
+ 
++    /* Background execution handling in CLI mode */
++    if (pipeline->is_background) {
++        pid_t bg_pid = fork();
++        if (bg_pid < 0) {
++            perror("terminator: fork failed");
++            ctx->last_exit_status = 1;
++            return 1;
++        }
++
++        if (bg_pid == 0) {
++            setpgid(0, 0);
++
++            /* In background, redirect stdin from /dev/null if not already redirected */
++            if (pipeline->commands[0].input_file == NULL) {
++                int devnull = open("/dev/null", O_RDONLY);
++                if (devnull >= 0) {
++                    dup2(devnull, STDIN_FILENO);
++                    close(devnull);
++                }
++            }
++
++            if (pipeline->num_commands == 1) {
++                Command *c = &pipeline->commands[0];
++                if (setup_redirections(c->input_file, c->output_file) != 0) {
++                    _exit(1);
++                }
++                if (is_builtin_command(c->argv[0])) {
++                    int ret = execute_builtin(ctx, c);
++                    _exit(ret);
++                } else {
++                    execvp(c->argv[0], c->argv);
++                    fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
++                    _exit(127);
++                }
++            }
++
++            Pipeline fg_pl = *pipeline;
++            fg_pl.is_background = 0;
++            int ret = shell_execute_pipeline(ctx, &fg_pl);
++            _exit(ret);
++        }
++
++        setpgid(bg_pid, bg_pid);
++        char cmd_str[MAX_CMD_LEN] = "";
++        for (int i = 0; i < pipeline->num_commands; i++) {
++            if (i > 0) strncat(cmd_str, " | ", sizeof(cmd_str) - strlen(cmd_str) - 1);
++            for (int a = 0; a < pipeline->commands[i].argc; a++) {
++                if (a > 0) strncat(cmd_str, " ", sizeof(cmd_str) - strlen(cmd_str) - 1);
++                strncat(cmd_str, pipeline->commands[i].argv[a], sizeof(cmd_str) - strlen(cmd_str) - 1);
++            }
++        }
++        Job *j = jobs_add(&ctx->job_table, bg_pid, bg_pid, cmd_str, JOB_STATE_RUNNING, -1);
++        printf("[%d] %d\n", j ? j->id : 1, (int)bg_pid);
++        fflush(stdout);
++        return 0;
++    }
++
+     /* Single command optimization */
+     if (pipeline->num_commands == 1) {
+         return shell_execute_command(ctx, &pipeline->commands[0]);
+@@ -250,6 +340,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+         children_spawned++;
+ 
+         if (pids[i] == 0) {
++            pid_t pgid = (i == 0) ? 0 : pids[0];
++            setpgid(0, pgid);
++
+             /* Child process i: rewire stdin from previous pipe if not first */
+             if (i > 0) {
+                 dup2(pipefds[(i - 1) * 2], STDIN_FILENO);
+@@ -281,6 +374,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+                         pipeline->commands[i].argv[0]);
+                 _exit(127);
+             }
++        } else {
++            pid_t pgid = (i == 0) ? pids[0] : pids[0];
++            setpgid(pids[i], pgid);
+         }
+     }
+ 
+@@ -292,13 +388,27 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+ 
+     /* Wait for all children to complete */
+     int last_status = 0;
++    if (children_spawned > 0) {
++        ctx->foreground_pid = pids[0];
++    }
+     for (int i = 0; i < children_spawned; i++) {
+         int status = 0;
+-        waitpid(pids[i], &status, 0);
++        while (waitpid(pids[i], &status, WUNTRACED) < 0) {
++            if (errno == EINTR) {
++                int st = 0;
++                if (waitpid(pids[i], &st, WUNTRACED | WNOHANG) > 0) {
++                    status = st;
++                    break;
++                }
++                continue;
++            }
++            break;
++        }
+         if (i == children_spawned - 1) {
+             last_status = status;
+         }
+     }
++    ctx->foreground_pid = 0;
+     free(pids);
+ 
+     int exit_code = 0;

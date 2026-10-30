@@ -70,4 +70,31 @@ int builtin_clear(ShellContext *ctx, char **argv);
  */
 int builtin_multiwatch(ShellContext *ctx, int argc, char **argv);
 
+/**
+ * @brief Built-in command: Lists active background and stopped jobs ('jobs').
+ *
+ * @param[in,out] ctx Pointer to active ShellContext.
+ * @param[in] argv Argument array.
+ * @return 0 on success.
+ */
+int builtin_jobs(ShellContext *ctx, char **argv);
+
+/**
+ * @brief Built-in command: Resumes a stopped job in the background ('bg').
+ *
+ * @param[in,out] ctx Pointer to active ShellContext.
+ * @param[in] argv Argument array (e.g. "bg", "%1").
+ * @return 0 on success, non-zero on error.
+ */
+int builtin_bg(ShellContext *ctx, char **argv);
+
+/**
+ * @brief Built-in command: Brings a job to the foreground ('fg').
+ *
+ * @param[in,out] ctx Pointer to active ShellContext.
+ * @param[in] argv Argument array (e.g. "fg", "%1").
+ * @return 0 on success, non-zero on error.
+ */
+int builtin_fg(ShellContext *ctx, char **argv);
+
 #endif /* BUILTINS_H */

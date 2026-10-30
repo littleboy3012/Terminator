@@ -330,7 +330,12 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
 
     Tab *tab = app->tabs[tab_idx];
     if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
-    if (tab->running_pid > 0) kill(tab->running_pid, SIGTERM);
+    if (tab->running_pid > 0) {
+        pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+        kill(-pg, SIGTERM);
+        kill(tab->running_pid, SIGTERM);
+    }
+    jobs_kill_all(&tab->shell_ctx.job_table);
     free(tab);
 
     /* Shift remaining tabs in array left */
@@ -595,6 +600,60 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
+        } else if (strcmp(cmd->argv[0], "jobs") == 0) {
+            char out_buf[4096];
+            jobs_print(&tab->shell_ctx.job_table, out_buf, sizeof(out_buf));
+            if (out_buf[0] != '\0') {
+                tab_append_output(tab, out_buf, (int)strlen(out_buf));
+            }
+            free_pipeline(&pipeline);
+            gui_redraw(app);
+            return;
+        } else if (strcmp(cmd->argv[0], "bg") == 0) {
+            char out_buf[512];
+            int ret = jobs_builtin_bg(&tab->shell_ctx.job_table, cmd->argv, out_buf, sizeof(out_buf));
+            if (out_buf[0] != '\0') {
+                tab_append_output(tab, out_buf, (int)strlen(out_buf));
+            }
+            tab->shell_ctx.last_exit_status = ret;
+            free_pipeline(&pipeline);
+            gui_redraw(app);
+            return;
+        } else if (strcmp(cmd->argv[0], "fg") == 0) {
+            char out_buf[512];
+            Job res_job;
+            int ret = jobs_builtin_fg(&tab->shell_ctx.job_table, cmd->argv, out_buf, sizeof(out_buf), &res_job);
+            if (ret != 0) {
+                if (out_buf[0] != '\0') {
+                    tab_append_output(tab, out_buf, (int)strlen(out_buf));
+                }
+                tab->shell_ctx.last_exit_status = ret;
+                free_pipeline(&pipeline);
+                gui_redraw(app);
+                return;
+            }
+
+            /* Print command being foregrounded */
+            char fg_msg[600];
+            snprintf(fg_msg, sizeof(fg_msg), "%s\n", res_job.command);
+            tab_append_output(tab, fg_msg, (int)strlen(fg_msg));
+
+            /* Resume process group with SIGCONT */
+            if (res_job.pgid > 0) {
+                kill(-res_job.pgid, SIGCONT);
+                kill(res_job.pid, SIGCONT);
+            }
+
+            /* Attach to foreground */
+            tab->running_pid = res_job.pid;
+            tab->running_pgid = res_job.pgid;
+            snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", res_job.command);
+            tab->out_pipe_fd = res_job.out_pipe_fd;
+            tab->is_running_cmd = 1;
+
+            free_pipeline(&pipeline);
+            gui_redraw(app);
+            return;
         }
     }
 
@@ -624,7 +683,7 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     }
 
     if (pid == 0) {
-        /* Child process: become process group leader so Ctrl+C signals target it */
+        /* Child process: become process group leader so Ctrl+C / Ctrl+Z target it */
         setpgid(0, 0);
 
         /* Change to tab's current working directory */
@@ -638,16 +697,57 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         close(pipefds[0]);
         close(pipefds[1]);
 
-        /* Execute the parsed pipeline */
-        int ret = shell_execute_pipeline(&tab->shell_ctx, &pipeline);
+        /* In background, redirect stdin from /dev/null if not already redirected */
+        if (pipeline.commands[0].input_file == NULL && pipeline.is_background) {
+            int devnull = open("/dev/null", O_RDONLY);
+            if (devnull >= 0) {
+                dup2(devnull, STDIN_FILENO);
+                close(devnull);
+            }
+        }
+
+        /* For single command, directly setup redirections and execvp */
+        if (pipeline.num_commands == 1) {
+            Command *c = &pipeline.commands[0];
+            if (setup_redirections(c->input_file, c->output_file) != 0) {
+                _exit(1);
+            }
+            if (is_builtin_command(c->argv[0])) {
+                int ret = execute_builtin(&tab->shell_ctx, c);
+                _exit(ret);
+            } else {
+                execvp(c->argv[0], c->argv);
+                fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
+                _exit(127);
+            }
+        }
+
+        /* For pipelines, execute via shell pipeline engine */
+        Pipeline exec_pl = pipeline;
+        exec_pl.is_background = 0;
+        int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
         _exit(ret);
     }
 
-    /* Parent process: close write-end, store read-end for poll() loop */
+    /* Parent process: close write-end */
     close(pipefds[1]);
-    tab->out_pipe_fd = pipefds[0];
-    tab->running_pid = pid;
-    tab->is_running_cmd = 1;
+    setpgid(pid, pid);
+
+    if (pipeline.is_background) {
+        /* Background execution ('cmd &'): record into job_table and keep prompt active */
+        Job *j = jobs_add(&tab->shell_ctx.job_table, pid, pid, cmd_str, JOB_STATE_RUNNING, pipefds[0]);
+        char launch_msg[256];
+        snprintf(launch_msg, sizeof(launch_msg), "[%d] %d\n", j ? j->id : 1, (int)pid);
+        tab_append_output(tab, launch_msg, (int)strlen(launch_msg));
+        gui_redraw(app);
+    } else {
+        /* Foreground execution: tab waits for command to complete or suspend */
+        tab->out_pipe_fd = pipefds[0];
+        tab->running_pid = pid;
+        tab->running_pgid = pid;
+        snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", cmd_str);
+        tab->is_running_cmd = 1;
+    }
 
     free_pipeline(&pipeline);
 }
@@ -689,7 +789,8 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     /* Keyboard shortcut: Ctrl+C stops running command (Task 6 & Task 8) */
     if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
         if (tab->is_running_cmd && tab->running_pid > 0) {
-            kill(-tab->running_pid, SIGINT);
+            pid_t target_pgid = (tab->running_pgid > 0) ? tab->running_pgid : tab->running_pid;
+            kill(-target_pgid, SIGINT);
             kill(tab->running_pid, SIGINT);
             tab_append_output(tab, "^C\n", 3);
             gui_redraw(app);
@@ -700,6 +801,34 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
             tab->cursor_pos = 0;
             tab->history_pos = -1;
             tab_append_output(tab, "^C\n", 3);
+            gui_redraw(app);
+            return;
+        }
+    }
+
+    /* Keyboard shortcut: Ctrl+Z suspends running command (Task 8) */
+    if (is_ctrl && !is_shift && (keysym == XK_Z || keysym == XK_z)) {
+        if (tab->is_running_cmd && tab->running_pid > 0) {
+            pid_t target_pgid = (tab->running_pgid > 0) ? tab->running_pgid : tab->running_pid;
+            kill(-target_pgid, SIGTSTP);
+            kill(tab->running_pid, SIGTSTP);
+
+            /* Record stopped job in tab job table */
+            Job *j = jobs_add(&tab->shell_ctx.job_table, target_pgid, tab->running_pid,
+                              tab->running_cmd, JOB_STATE_STOPPED, tab->out_pipe_fd);
+
+            char stop_msg[MAX_LINE_CHARS + 128];
+            snprintf(stop_msg, sizeof(stop_msg), "^Z\n[%d]+  Stopped                 %s\n",
+                     j ? j->id : 1, tab->running_cmd);
+            tab_append_output(tab, stop_msg, (int)strlen(stop_msg));
+
+            /* Clear foreground state so prompt returns immediately */
+            tab->is_running_cmd = 0;
+            tab->running_pid = 0;
+            tab->running_pgid = 0;
+            tab->out_pipe_fd = -1;
+            tab->running_cmd[0] = '\0';
+
             gui_redraw(app);
             return;
         }
@@ -1442,26 +1571,53 @@ void gui_run_loop(GuiApp *app) {
 
         /* Set up pollfd array:
          * fds[0] = X11 connection descriptor (x_fd)
-         * fds[1..N] = Read ends of active command pipes across all tabs
+         * fds[1..N] = Read ends of active command pipes across all tabs (foreground and background)
          */
-        struct pollfd fds[1 + MAX_TABS];
+        #define MAX_POLL_ENTRIES (1 + MAX_TABS * (1 + MAX_JOBS))
+        struct pollfd fds[MAX_POLL_ENTRIES];
+        int poll_tab_idx[MAX_POLL_ENTRIES];
+        int poll_is_bg[MAX_POLL_ENTRIES];
+        int poll_job_id[MAX_POLL_ENTRIES];
         int num_poll_fds = 1;
 
         fds[0].fd = x_fd;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
-
-        int tab_indices[1 + MAX_TABS];
-        tab_indices[0] = -1;
+        poll_tab_idx[0] = -1;
+        poll_is_bg[0] = 0;
+        poll_job_id[0] = -1;
 
         for (int i = 0; i < app->num_tabs; i++) {
             Tab *t = app->tabs[i];
-            if (t && t->is_running_cmd && t->out_pipe_fd >= 0) {
-                fds[num_poll_fds].fd = t->out_pipe_fd;
-                fds[num_poll_fds].events = POLLIN | POLLHUP;
-                fds[num_poll_fds].revents = 0;
-                tab_indices[num_poll_fds] = i;
-                num_poll_fds++;
+            if (!t) continue;
+
+            /* Foreground command pipe */
+            if (t->is_running_cmd && t->out_pipe_fd >= 0) {
+                if (num_poll_fds < MAX_POLL_ENTRIES) {
+                    fds[num_poll_fds].fd = t->out_pipe_fd;
+                    fds[num_poll_fds].events = POLLIN | POLLHUP;
+                    fds[num_poll_fds].revents = 0;
+                    poll_tab_idx[num_poll_fds] = i;
+                    poll_is_bg[num_poll_fds] = 0;
+                    poll_job_id[num_poll_fds] = -1;
+                    num_poll_fds++;
+                }
+            }
+
+            /* Background job pipes */
+            for (int j = 0; j < t->shell_ctx.job_table.num_jobs; j++) {
+                Job *job = &t->shell_ctx.job_table.jobs[j];
+                if (job->state == JOB_STATE_RUNNING && job->out_pipe_fd >= 0) {
+                    if (num_poll_fds < MAX_POLL_ENTRIES) {
+                        fds[num_poll_fds].fd = job->out_pipe_fd;
+                        fds[num_poll_fds].events = POLLIN | POLLHUP;
+                        fds[num_poll_fds].revents = 0;
+                        poll_tab_idx[num_poll_fds] = i;
+                        poll_is_bg[num_poll_fds] = 1;
+                        poll_job_id[num_poll_fds] = job->id;
+                        num_poll_fds++;
+                    }
+                }
             }
         }
 
@@ -1478,10 +1634,10 @@ void gui_run_loop(GuiApp *app) {
         /* Check active child pipes for output */
         for (int i = 1; i < num_poll_fds; i++) {
             if (fds[i].revents & (POLLIN | POLLHUP)) {
-                int t_idx = tab_indices[i];
+                int t_idx = poll_tab_idx[i];
                 Tab *t = app->tabs[t_idx];
                 char buf[512];
-                ssize_t n = read(t->out_pipe_fd, buf, sizeof(buf));
+                ssize_t n = read(fds[i].fd, buf, sizeof(buf));
 
                 if (n > 0) {
                     tab_append_output(t, buf, (int)n);
@@ -1489,24 +1645,50 @@ void gui_run_loop(GuiApp *app) {
                         needs_redraw = 1;
                     }
                 } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
-                    /* Pipe closed / child finished */
-                    close(t->out_pipe_fd);
-                    t->out_pipe_fd = -1;
+                    if (poll_is_bg[i]) {
+                        /* Background job pipe finished */
+                        close(fds[i].fd);
+                        Job *bj = jobs_find_by_id(&t->shell_ctx.job_table, poll_job_id[i]);
+                        if (bj) {
+                            bj->out_pipe_fd = -1;
+                        }
+                    } else {
+                        /* Foreground pipe closed / child finished */
+                        close(t->out_pipe_fd);
+                        t->out_pipe_fd = -1;
 
-                    int status = 0;
-                    waitpid(t->running_pid, &status, WNOHANG);
-                    if (WIFEXITED(status)) {
-                        t->shell_ctx.last_exit_status = WEXITSTATUS(status);
-                    } else if (WIFSIGNALED(status)) {
-                        t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
+                        int status = 0;
+                        waitpid(t->running_pid, &status, WNOHANG);
+                        if (WIFEXITED(status)) {
+                            t->shell_ctx.last_exit_status = WEXITSTATUS(status);
+                        } else if (WIFSIGNALED(status)) {
+                            t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
+                        }
+
+                        t->is_running_cmd = 0;
+                        t->running_pid = 0;
+                        t->running_pgid = 0;
+                        t->running_cmd[0] = '\0';
+
+                        if (t_idx == app->active_tab_idx) {
+                            needs_redraw = 1;
+                        }
                     }
+                }
+            }
+        }
 
-                    t->is_running_cmd = 0;
-                    t->running_pid = 0;
-
-                    if (t_idx == app->active_tab_idx) {
-                        needs_redraw = 1;
-                    }
+        /* Check status of background jobs in each tab and collect completion notifications */
+        for (int i = 0; i < app->num_tabs; i++) {
+            Tab *t = app->tabs[i];
+            if (!t) continue;
+            char notif_buf[1024];
+            notif_buf[0] = '\0';
+            jobs_check_status(&t->shell_ctx.job_table, notif_buf, sizeof(notif_buf));
+            if (notif_buf[0] != '\0') {
+                tab_append_output(t, notif_buf, (int)strlen(notif_buf));
+                if (i == app->active_tab_idx) {
+                    needs_redraw = 1;
                 }
             }
         }

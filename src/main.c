@@ -2,12 +2,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include "shell.h"
 #include "parser.h"
 #include "gui.h"
 #include "hotkeys.h"
+#include "jobs.h"
 
 #define MAX_LINE_LEN 4096
+
+static ShellContext *g_cli_ctx = NULL;
+
+static void cli_sig_handler(int sig) {
+    if (g_cli_ctx && g_cli_ctx->foreground_pid > 0) {
+        kill(-g_cli_ctx->foreground_pid, sig);
+        kill(g_cli_ctx->foreground_pid, sig);
+    }
+}
 
 /**
  * @brief Prints the interactive Terminator shell prompt to standard output.
@@ -33,7 +44,24 @@ static int run_cli_mode(ShellContext *ctx) {
     char accum[MAX_LINE_LEN * 4] = "";
     int is_multiline = 0;
 
+    g_cli_ctx = ctx;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = cli_sig_handler;
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTSTP, &sa, NULL);
+
     while (!ctx->should_exit) {
+        /* Check status of active background jobs before displaying prompt */
+        char notif_buf[1024];
+        notif_buf[0] = '\0';
+        jobs_check_status(&ctx->job_table, notif_buf, sizeof(notif_buf));
+        if (notif_buf[0] != '\0') {
+            printf("%s", notif_buf);
+            fflush(stdout);
+        }
+
         if (is_multiline) {
             printf("> ");
         } else {
