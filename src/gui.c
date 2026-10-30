@@ -725,7 +725,7 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     int is_shift = (event->state & ShiftMask);
 
     /* Tab Creation / Closure shortcuts */
-    if (is_ctrl && is_shift && (keysym == XK_T || keysym == XK_t)) {
+    if (is_ctrl && (keysym == XK_T || keysym == XK_t)) {
         gui_create_tab(app, tab->cwd);
         gui_redraw(app);
         return;
