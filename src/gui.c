@@ -318,6 +318,14 @@ void gui_switch_tab(GuiApp *app, int tab_idx) {
 void tab_append_output(Tab *tab, const char *text, int len) {
     if (!tab || !text || len <= 0) return;
 
+    /* Auto-scroll to bottom on new output */
+    tab->scroll_offset = 0;
+
+    /* Ensure output begins on the line below the command prompt, never on the same line */
+    if (tab->num_lines > 0 && tab->lines[tab->num_lines - 1].type == LINE_TYPE_PROMPT_INPUT) {
+        tab_new_line(tab, LINE_TYPE_OUTPUT, 0);
+    }
+
     for (int i = 0; i < len; i++) {
         char c = text[i];
         if (c == '\r') continue;
