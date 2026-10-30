@@ -6,64 +6,144 @@
 #include <string.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <errno.h>
 #include <poll.h>
-#include <sys/wait.h>
-#include <sys/types.h>
 #include <signal.h>
+#include <errno.h>
 #include <ctype.h>
+#include <sys/wait.h>
 #include <X11/Xatom.h>
 
-#define DEFAULT_FONT_NAME "fixed"
 #define PROMPT_STRING "user@terminator> "
 
-/**
- * @brief Helper function to allocate a color in X11 using 16-bit RGB values.
- *
- * @param[in] display Connection to the X server.
- * @param[in] colormap Colormap of the screen.
- * @param[in] red 16-bit red intensity (0x0000 - 0xFFFF).
- * @param[in] green 16-bit green intensity (0x0000 - 0xFFFF).
- * @param[in] blue 16-bit blue intensity (0x0000 - 0xFFFF).
- * @return Pixel value representing the allocated color.
- */
-static unsigned long allocate_color(Display *display, Colormap colormap,
-                                   unsigned short red, unsigned short green, unsigned short blue) {
-    XColor color;
-    color.red = red;
-    color.green = green;
-    color.blue = blue;
-    color.flags = DoRed | DoGreen | DoBlue;
+/* ========================================================================= */
+/*                         Static Helper Functions                           */
+/* ========================================================================= */
 
-    if (XAllocColor(display, colormap, &color)) {
-        return color.pixel;
-    }
-
-    /* Fallback to WhitePixel if color allocation fails */
-    return WhitePixel(display, DefaultScreen(display));
+static unsigned long allocate_color(Display *d, Colormap cm,
+                                    unsigned short r, unsigned short g, unsigned short b) {
+    XColor col;
+    col.red = r;
+    col.green = g;
+    col.blue = b;
+    col.flags = DoRed | DoGreen | DoBlue;
+    if (XAllocColor(d, cm, &col)) return col.pixel;
+    return BlackPixel(d, DefaultScreen(d));
 }
 
-/**
- * @brief Initializes the graphical user interface, creates window, sets up double buffering,
- *        and prepares graphics contexts with custom hacker color schemes.
- *
- * @param[out] app Pointer to the GuiApp structure to initialize.
- * @param[in] width Desired starting window width in pixels.
- * @param[in] height Desired starting window height in pixels.
- * @param[in] title Window title string to display on the desktop window manager bar.
- * @return 0 on success, -1 on failure (e.g. Cannot open X display).
- */
-int gui_init(GuiApp *app, int width, int height, const char *title) {
-    if (!app) {
-        return -1;
+static GC create_gc(Display *d, Window w, unsigned long fg, XFontStruct *font) {
+    XGCValues gcv;
+    gcv.foreground = fg;
+    if (font) gcv.font = font->fid;
+    return XCreateGC(d, w, GCForeground | (font ? GCFont : 0), &gcv);
+}
+
+static int get_term_cols(const GuiApp *app) {
+    int cols = (app->win_width - 25) / app->font_width;
+    return cols < 20 ? 20 : cols;
+}
+
+static int get_first_line_capacity(const GuiApp *app, int prompt_len) {
+    int cap = get_term_cols(app) - prompt_len;
+    return cap < 1 ? 1 : cap;
+}
+
+static int get_max_scroll(const GuiApp *app, const Tab *tab) {
+    int content_top = TAB_BAR_HEIGHT + 10;
+    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
+    if (visible_rows <= 0) visible_rows = 1;
+    return tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
+}
+
+static void get_tab_bar_layout(const GuiApp *app, int *plus_x, int *plus_w, int *tab_w, int *spacing) {
+    const char *plus_label = " [ + ] ";
+    *plus_w = (int)strlen(plus_label) * app->font_width + 8;
+    *plus_x = app->win_width - *plus_w - 6;
+    *spacing = 4;
+    *tab_w = 180;
+    if (app->num_tabs > 0) {
+        int max_w = (*plus_x - 14 - ((app->num_tabs - 1) * *spacing)) / app->num_tabs;
+        if (max_w < *tab_w) *tab_w = max_w;
+        if (*tab_w < 45) *tab_w = 45;
     }
+}
+
+static TermLine *tab_new_line(Tab *tab, LineType type, int prompt_len) {
+    if (tab->num_lines < MAX_BUFFER_LINES) {
+        tab->num_lines++;
+    } else {
+        memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+    }
+    TermLine *l = &tab->lines[tab->num_lines - 1];
+    memset(l, 0, sizeof(TermLine));
+    l->type = type;
+    l->prompt_len = prompt_len;
+    return l;
+}
+
+static void tab_record_prompt_input(GuiApp *app, Tab *tab, const char *prompt, int p_len) {
+    int cols = get_term_cols(app);
+    int first_cap = get_first_line_capacity(app, p_len);
+
+    if (tab->input_len <= first_cap) {
+        TermLine *l = tab_new_line(tab, LINE_TYPE_PROMPT_INPUT, p_len);
+        snprintf(l->text, sizeof(l->text), "%s%.*s", prompt,
+                 (int)(sizeof(l->text) - p_len - 1), tab->input_buffer);
+    } else {
+        TermLine *l0 = tab_new_line(tab, LINE_TYPE_PROMPT_INPUT, p_len);
+        snprintf(l0->text, sizeof(l0->text), "%s%.*s", prompt, first_cap, tab->input_buffer);
+
+        for (int off = first_cap; off < tab->input_len; off += cols) {
+            int chunk = tab->input_len - off > cols ? cols : tab->input_len - off;
+            TermLine *wl = tab_new_line(tab, LINE_TYPE_PROMPT_INPUT, 0);
+            snprintf(wl->text, sizeof(wl->text), "%.*s", chunk, tab->input_buffer + off);
+        }
+    }
+}
+
+static void tab_add_history(Tab *tab, const char *cmd) {
+    if (!cmd || cmd[0] == '\0') return;
+    if (tab->history_count > 0 && strcmp(tab->history[tab->history_count - 1], cmd) == 0) return;
+    if (tab->history_count < MAX_TAB_HISTORY) {
+        snprintf(tab->history[tab->history_count++], sizeof(tab->history[0]), "%s", cmd);
+    } else {
+        memmove(&tab->history[0], &tab->history[1], sizeof(tab->history[0]) * (MAX_TAB_HISTORY - 1));
+        snprintf(tab->history[MAX_TAB_HISTORY - 1], sizeof(tab->history[0]), "%s", cmd);
+    }
+}
+
+static void tab_insert_char(Tab *tab, char c) {
+    if (tab->input_len < MAX_LINE_CHARS - 2) {
+        memmove(&tab->input_buffer[tab->cursor_pos + 1],
+                &tab->input_buffer[tab->cursor_pos],
+                tab->input_len - tab->cursor_pos + 1);
+        tab->input_buffer[tab->cursor_pos] = c;
+        tab->cursor_pos++;
+        tab->input_len++;
+    }
+}
+
+static void tab_delete_range(Tab *tab, int start, int end) {
+    if (start < 0) start = 0;
+    if (end > tab->input_len) end = tab->input_len;
+    if (start >= end) return;
+    int len = end - start;
+    memmove(&tab->input_buffer[start],
+            &tab->input_buffer[end],
+            tab->input_len - end + 1);
+    tab->input_len -= len;
+    tab->cursor_pos = start;
+}
+
+/* ========================================================================= */
+/*                         Core GUI Lifecycle                                */
+/* ========================================================================= */
+
+int gui_init(GuiApp *app, int width, int height, const char *title) {
+    if (!app) return -1;
     memset(app, 0, sizeof(GuiApp));
 
-    /* Connect to the X server (uses $DISPLAY environment variable, or falls back to :0) */
     app->display = XOpenDisplay(NULL);
-    if (!app->display) {
-        app->display = XOpenDisplay(":0");
-    }
+    if (!app->display) app->display = XOpenDisplay(":0");
     if (!app->display) {
         fprintf(stderr, "terminator: cannot open X display. Is an X server or WSLg running?\n");
         return -1;
@@ -72,261 +152,139 @@ int gui_init(GuiApp *app, int width, int height, const char *title) {
     app->screen = DefaultScreen(app->display);
     app->win_width = width;
     app->win_height = height;
-    Colormap colormap = DefaultColormap(app->display, app->screen);
+    Colormap cm = DefaultColormap(app->display, app->screen);
 
-    /* Allocate custom hacker colors:
-     * - Background: Pitch Black (#000000)
-     * - Prompt: Vivid Red (#FF3333) for "user@terminator>"
-     * - Input: Neon Hacker Green (#33FF33) for typed commands
-     * - Output: Crisp Matrix Light-Green / Gray (#CCEECC) for clean readability
-     * - Cursor: Bright Green block (#33FF33)
-     */
-    unsigned long col_black     = BlackPixel(app->display, app->screen);
-    unsigned long col_red       = allocate_color(app->display, colormap, 0xFFFF, 0x3333, 0x3333);
-    unsigned long col_green     = allocate_color(app->display, colormap, 0x3333, 0xFFFF, 0x3333);
-    unsigned long col_output    = allocate_color(app->display, colormap, 0xCCCC, 0xEEEE, 0xCCCC);
-    unsigned long col_tab_bg    = allocate_color(app->display, colormap, 0x1818, 0x1818, 0x1818);
-    unsigned long col_tab_act   = allocate_color(app->display, colormap, 0x2A2A, 0x4444, 0x2A2A);
-    unsigned long col_tab_text  = allocate_color(app->display, colormap, 0x8888, 0xAAAA, 0x8888);
-    unsigned long col_scroll    = allocate_color(app->display, colormap, 0x5555, 0x7777, 0x5555);
+    unsigned long col_black    = BlackPixel(app->display, app->screen);
+    unsigned long col_red      = allocate_color(app->display, cm, 0xFFFF, 0x3333, 0x3333);
+    unsigned long col_green    = allocate_color(app->display, cm, 0x3333, 0xFFFF, 0x3333);
+    unsigned long col_output   = allocate_color(app->display, cm, 0xCCCC, 0xEEEE, 0xCCCC);
+    unsigned long col_tab_bg   = allocate_color(app->display, cm, 0x1818, 0x1818, 0x1818);
+    unsigned long col_tab_act  = allocate_color(app->display, cm, 0x2A2A, 0x4444, 0x2A2A);
+    unsigned long col_tab_text = allocate_color(app->display, cm, 0x8888, 0xAAAA, 0x8888);
+    unsigned long col_scroll   = allocate_color(app->display, cm, 0x5555, 0x7777, 0x5555);
 
-    /* Create the top-level window */
-    app->window = XCreateSimpleWindow(
-        app->display,
-        RootWindow(app->display, app->screen),
-        100, 100,
-        app->win_width, app->win_height,
-        1,
-        col_green, /* Border color: neon green */
-        col_black  /* Background: pure black */
-    );
+    app->window = XCreateSimpleWindow(app->display, RootWindow(app->display, app->screen),
+                                      100, 100, app->win_width, app->win_height, 1,
+                                      col_green, col_black);
 
-    /* Set window title and class name for window managers */
     XStoreName(app->display, app->window, title);
     XSetIconName(app->display, app->window, title);
+    XSelectInput(app->display, app->window, KeyPressMask | ButtonPressMask | ExposureMask | StructureNotifyMask);
 
-    /* Select events we want to receive from X11:
-     * - KeyPressMask: Keyboard input
-     * - ButtonPressMask: Mouse clicks (tabs, + button)
-     * - ExposureMask: Window exposed and needs redrawing
-     * - StructureNotifyMask: Window resized or moved
-     */
-    XSelectInput(app->display, app->window,
-                 KeyPressMask | ButtonPressMask | ExposureMask | StructureNotifyMask);
-
-    /* Load larger, crisp monospace terminal font */
     const char *font_candidates[] = {
-        "-misc-fixed-medium-r-normal--20-*-*-*-*-*-iso8859-1",
-        "10x20",
-        "-misc-fixed-medium-r-normal--18-*-*-*-*-*-iso8859-1",
-        "9x18",
-        "-misc-fixed-medium-r-normal--15-*-*-*-*-*-iso8859-1",
-        "9x15",
-        "fixed",
-        NULL
+        "-misc-fixed-medium-r-normal--20-*-*-*-*-*-iso8859-1", "10x20",
+        "-misc-fixed-medium-r-normal--18-*-*-*-*-*-iso8859-1", "9x18",
+        "-misc-fixed-medium-r-normal--15-*-*-*-*-*-iso8859-1", "9x15",
+        "fixed", NULL
     };
     app->font = NULL;
     for (int i = 0; font_candidates[i]; i++) {
         app->font = XLoadQueryFont(app->display, font_candidates[i]);
-        if (app->font) {
-            break;
-        }
+        if (app->font) break;
     }
-    if (!app->font) {
-        app->font = XQueryFont(app->display, XGContextFromGC(DefaultGC(app->display, app->screen)));
-    }
+    if (!app->font) app->font = XQueryFont(app->display, XGContextFromGC(DefaultGC(app->display, app->screen)));
 
     if (app->font) {
-        app->font_width = app->font->max_bounds.width;
-        if (app->font_width <= 0) app->font_width = 8;
+        app->font_width = app->font->max_bounds.width > 0 ? app->font->max_bounds.width : 8;
         app->font_ascent = app->font->ascent;
-        app->font_height = app->font->ascent + app->font->descent;
-        if (app->font_height <= 0) app->font_height = 16;
+        app->font_height = (app->font->ascent + app->font->descent) > 0 ? (app->font->ascent + app->font->descent) : 16;
     } else {
-        app->font_width = 8;
-        app->font_height = 16;
-        app->font_ascent = 12;
+        app->font_width = 8; app->font_height = 16; app->font_ascent = 12;
     }
 
-    /* Create Graphics Contexts (GC) for each text element */
-    XGCValues gcv;
-    memset(&gcv, 0, sizeof(gcv));
-    if (app->font) gcv.font = app->font->fid;
+    app->gc_bg             = create_gc(app->display, app->window, col_black, app->font);
+    app->gc_prompt         = create_gc(app->display, app->window, col_red, app->font);
+    app->gc_input          = create_gc(app->display, app->window, col_green, app->font);
+    app->gc_output         = create_gc(app->display, app->window, col_output, app->font);
+    app->gc_cursor         = create_gc(app->display, app->window, col_green, app->font);
+    app->gc_tab_bar_bg     = create_gc(app->display, app->window, col_tab_bg, app->font);
+    app->gc_tab_active_bg  = create_gc(app->display, app->window, col_tab_act, app->font);
+    app->gc_tab_text       = create_gc(app->display, app->window, col_tab_text, app->font);
+    app->gc_tab_active_text= create_gc(app->display, app->window, col_green, app->font);
+    app->gc_scrollbar      = create_gc(app->display, app->window, col_scroll, NULL);
 
-    /* Background GC */
-    gcv.foreground = col_black;
-    app->gc_bg = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    /* Prompt GC (Vivid Red) */
-    gcv.foreground = col_red;
-    app->gc_prompt = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    /* Input GC (Neon Hacker Green) */
-    gcv.foreground = col_green;
-    app->gc_input = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    /* Output GC (Crisp Light Text) */
-    gcv.foreground = col_output;
-    app->gc_output = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    /* Cursor GC (Neon Green) */
-    gcv.foreground = col_green;
-    app->gc_cursor = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    /* Tab bar GCs */
-    gcv.foreground = col_tab_bg;
-    app->gc_tab_bar_bg = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    gcv.foreground = col_tab_act;
-    app->gc_tab_active_bg = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    gcv.foreground = col_tab_text;
-    app->gc_tab_text = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    gcv.foreground = col_green;
-    app->gc_tab_active_text = XCreateGC(app->display, app->window, GCForeground | (app->font ? GCFont : 0), &gcv);
-
-    /* Scrollbar GC */
-    gcv.foreground = col_scroll;
-    app->gc_scrollbar = XCreateGC(app->display, app->window, GCForeground, &gcv);
-
-    /* Create off-screen back buffer for double-buffered flicker-free rendering */
-    app->back_buffer = XCreatePixmap(app->display, app->window,
-                                     app->win_width, app->win_height,
+    app->back_buffer = XCreatePixmap(app->display, app->window, app->win_width, app->win_height,
                                      DefaultDepth(app->display, app->screen));
 
-    /* Register window manager delete protocol so clicking 'X' exits gracefully */
     app->wm_delete_window = XInternAtom(app->display, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(app->display, app->window, &app->wm_delete_window, 1);
 
-    /* Initialize X11 selection clipboard atoms */
-    app->atom_clipboard = XInternAtom(app->display, "CLIPBOARD", False);
-    app->atom_utf8_string = XInternAtom(app->display, "UTF8_STRING", False);
-    app->atom_targets = XInternAtom(app->display, "TARGETS", False);
+    app->atom_clipboard      = XInternAtom(app->display, "CLIPBOARD", False);
+    app->atom_utf8_string    = XInternAtom(app->display, "UTF8_STRING", False);
+    app->atom_targets        = XInternAtom(app->display, "TARGETS", False);
     app->atom_terminator_sel = XInternAtom(app->display, "TERMINATOR_SELECTION", False);
-    app->clipboard_data[0] = '\0';
-    app->clipboard_len = 0;
 
-    /* Initialize Task 7 Hotkeys from ~/.terminatorrc */
     hotkeys_init(&app->hotkeys);
-
-    /* Map (show) the window on the desktop screen */
     XMapWindow(app->display, app->window);
     XFlush(app->display);
-
     app->is_running = 1;
 
-    /* Create initial Tab 1 starting in the current working directory */
     gui_create_tab(app, NULL);
-
     return 0;
 }
 
-/**
- * @brief Releases all allocated X11 resources, closes pipes, and frees memory.
- *
- * @param[in,out] app Pointer to GuiApp structure.
- */
 void gui_cleanup(GuiApp *app) {
-    if (!app || !app->display) {
-        return;
-    }
-
-    /* Close and free all tabs */
+    if (!app || !app->display) return;
     for (int i = 0; i < app->num_tabs; i++) {
-        if (app->tabs[i]) {
-            if (app->tabs[i]->out_pipe_fd >= 0) {
-                close(app->tabs[i]->out_pipe_fd);
+        Tab *tab = app->tabs[i];
+        if (tab) {
+            if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
+            if (tab->running_pid > 0) {
+                pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+                kill(-pg, SIGTERM);
+                kill(tab->running_pid, SIGTERM);
             }
-            if (app->tabs[i]->running_pid > 0) {
-                kill(app->tabs[i]->running_pid, SIGTERM);
-            }
-            free(app->tabs[i]);
-            app->tabs[i] = NULL;
+            jobs_kill_all(&tab->shell_ctx.job_table);
+            free(tab);
         }
     }
     app->num_tabs = 0;
 
-    /* Free X11 Graphics Contexts and off-screen pixmap */
-    if (app->back_buffer) XFreePixmap(app->display, app->back_buffer);
-    if (app->gc_bg) XFreeGC(app->display, app->gc_bg);
-    if (app->gc_prompt) XFreeGC(app->display, app->gc_prompt);
-    if (app->gc_input) XFreeGC(app->display, app->gc_input);
-    if (app->gc_output) XFreeGC(app->display, app->gc_output);
-    if (app->gc_cursor) XFreeGC(app->display, app->gc_cursor);
-    if (app->gc_tab_bar_bg) XFreeGC(app->display, app->gc_tab_bar_bg);
-    if (app->gc_tab_text) XFreeGC(app->display, app->gc_tab_text);
-    if (app->gc_tab_active_bg) XFreeGC(app->display, app->gc_tab_active_bg);
-    if (app->gc_tab_active_text) XFreeGC(app->display, app->gc_tab_active_text);
-    if (app->gc_scrollbar) XFreeGC(app->display, app->gc_scrollbar);
-
+    GC gcs[] = { app->gc_bg, app->gc_prompt, app->gc_input, app->gc_output, app->gc_cursor,
+                 app->gc_tab_bar_bg, app->gc_tab_active_bg, app->gc_tab_text,
+                 app->gc_tab_active_text, app->gc_scrollbar };
+    for (size_t i = 0; i < sizeof(gcs)/sizeof(gcs[0]); i++) {
+        if (gcs[i]) XFreeGC(app->display, gcs[i]);
+    }
     if (app->font) XFreeFont(app->display, app->font);
+    if (app->back_buffer) XFreePixmap(app->display, app->back_buffer);
     if (app->window) XDestroyWindow(app->display, app->window);
-
     XCloseDisplay(app->display);
     app->display = NULL;
 }
 
-/**
- * @brief Creates a new terminal tab and initializes its shell context and buffers.
- *
- * @param[in,out] app Pointer to GuiApp.
- * @param[in] initial_cwd Starting path for this tab, or NULL for current directory.
- * @return Index of the created tab (0-indexed), or -1 if maximum tabs limit reached.
- */
+/* ========================================================================= */
+/*                         Tab Management                                    */
+/* ========================================================================= */
+
 int gui_create_tab(GuiApp *app, const char *initial_cwd) {
-    if (!app || app->num_tabs >= MAX_TABS) {
-        return -1;
-    }
+    if (!app || app->num_tabs >= MAX_TABS) return -1;
 
     Tab *tab = malloc(sizeof(Tab));
-    if (!tab) {
-        return -1;
-    }
+    if (!tab) return -1;
     memset(tab, 0, sizeof(Tab));
 
     tab->tab_id = app->num_tabs + 1;
     tab->out_pipe_fd = -1;
-    tab->running_pid = 0;
-    tab->is_running_cmd = 0;
-    tab->num_lines = 0;
-    tab->scroll_offset = 0;
-    tab->input_len = 0;
-    tab->cursor_pos = 0;
     tab->history_pos = -1;
-    tab->history_count = 0;
-
-    /* Initialize tab shell context */
     shell_init(&tab->shell_ctx);
 
     if (initial_cwd) {
         snprintf(tab->cwd, sizeof(tab->cwd), "%s", initial_cwd);
-        snprintf(tab->shell_ctx.cwd, sizeof(tab->shell_ctx.cwd), "%s", initial_cwd);
-    } else {
-        if (!getcwd(tab->cwd, sizeof(tab->cwd))) {
-            strncpy(tab->cwd, "/", sizeof(tab->cwd) - 1);
-        }
-        snprintf(tab->shell_ctx.cwd, sizeof(tab->shell_ctx.cwd), "%s", tab->cwd);
+    } else if (!getcwd(tab->cwd, sizeof(tab->cwd))) {
+        strncpy(tab->cwd, "/", sizeof(tab->cwd) - 1);
     }
+    snprintf(tab->shell_ctx.cwd, sizeof(tab->shell_ctx.cwd), "%s", tab->cwd);
 
     int new_idx = app->num_tabs;
     app->tabs[new_idx] = tab;
     app->num_tabs++;
     app->active_tab_idx = new_idx;
-
     return new_idx;
 }
 
-/**
- * @brief Closes an existing tab by index and frees its memory.
- *
- * @param[in,out] app Pointer to GuiApp.
- * @param[in] tab_idx Index of tab to close.
- */
 void gui_close_tab(GuiApp *app, int tab_idx) {
-    if (!app || tab_idx < 0 || tab_idx >= app->num_tabs) {
-        return;
-    }
+    if (!app || tab_idx < 0 || tab_idx >= app->num_tabs) return;
 
     Tab *tab = app->tabs[tab_idx];
     if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
@@ -338,193 +296,64 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
     jobs_kill_all(&tab->shell_ctx.job_table);
     free(tab);
 
-    /* Shift remaining tabs in array left */
     for (int i = tab_idx; i < app->num_tabs - 1; i++) {
         app->tabs[i] = app->tabs[i + 1];
     }
-    app->tabs[app->num_tabs - 1] = NULL;
     app->num_tabs--;
+    app->tabs[app->num_tabs] = NULL;
 
-    /* If all tabs closed, exit program */
     if (app->num_tabs == 0) {
         app->is_running = 0;
-        return;
-    }
-
-    /* Adjust active tab index */
-    if (app->active_tab_idx >= app->num_tabs) {
+    } else if (app->active_tab_idx >= app->num_tabs) {
         app->active_tab_idx = app->num_tabs - 1;
     }
 }
 
-/**
- * @brief Switches the active view to another tab.
- *
- * @param[in,out] app Pointer to GuiApp.
- * @param[in] tab_idx Index of the target tab.
- */
 void gui_switch_tab(GuiApp *app, int tab_idx) {
-    if (!app || tab_idx < 0 || tab_idx >= app->num_tabs) {
-        return;
-    }
+    if (!app || tab_idx < 0 || tab_idx >= app->num_tabs) return;
     app->active_tab_idx = tab_idx;
+    app->tabs[tab_idx]->scroll_offset = 0;
 }
 
-/**
- * @brief Appends raw incoming character bytes from command output into the tab's buffer.
- *
- * Handles newlines ('\n') and line wrapping so text stays formatted cleanly.
- *
- * @param[in,out] tab Pointer to target Tab.
- * @param[in] text Character buffer read from child pipe.
- * @param[in] len Number of bytes read.
- */
 void tab_append_output(Tab *tab, const char *text, int len) {
-    if (!tab || !text || len <= 0) {
-        return;
-    }
-
-    /* Auto-snap view to bottom when new command output arrives */
-    tab->scroll_offset = 0;
-
-    /* Ensure output begins on the line below the command prompt, never overwriting it */
-    if (tab->num_lines > 0 && tab->lines[tab->num_lines - 1].type == LINE_TYPE_PROMPT_INPUT) {
-        if (tab->num_lines < MAX_BUFFER_LINES) {
-            tab->num_lines++;
-        } else {
-            memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
-        }
-        TermLine *first_out = &tab->lines[tab->num_lines - 1];
-        memset(first_out, 0, sizeof(TermLine));
-        first_out->type = LINE_TYPE_OUTPUT;
-    }
+    if (!tab || !text || len <= 0) return;
 
     for (int i = 0; i < len; i++) {
         char c = text[i];
-
-        if (c == '\r') {
-            continue; /* Ignore carriage returns */
-        }
-
+        if (c == '\r') continue;
         if (c == '\n') {
-            /* Start a new output line */
-            if (tab->num_lines < MAX_BUFFER_LINES) {
-                tab->num_lines++;
-            } else {
-                /* Scroll buffer up by one line */
-                memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
-            }
-            TermLine *cur = &tab->lines[tab->num_lines - 1];
-            memset(cur, 0, sizeof(TermLine));
-            cur->type = LINE_TYPE_OUTPUT;
+            tab_new_line(tab, LINE_TYPE_OUTPUT, 0);
             continue;
         }
 
-        /* If we have no lines yet, initialize line 0 */
-        if (tab->num_lines == 0) {
-            tab->num_lines = 1;
-            memset(&tab->lines[0], 0, sizeof(TermLine));
-            tab->lines[0].type = LINE_TYPE_OUTPUT;
-        }
-
+        if (tab->num_lines == 0) tab_new_line(tab, LINE_TYPE_OUTPUT, 0);
         TermLine *cur = &tab->lines[tab->num_lines - 1];
         size_t cur_len = strlen(cur->text);
 
-        /* Wrap line if exceeding buffer line capacity */
         if (cur_len >= MAX_LINE_CHARS - 2) {
-            if (tab->num_lines < MAX_BUFFER_LINES) {
-                tab->num_lines++;
-            } else {
-                memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
-            }
-            cur = &tab->lines[tab->num_lines - 1];
-            memset(cur, 0, sizeof(TermLine));
-            cur->type = LINE_TYPE_OUTPUT;
+            cur = tab_new_line(tab, LINE_TYPE_OUTPUT, 0);
             cur_len = 0;
         }
-
         cur->text[cur_len] = c;
         cur->text[cur_len + 1] = '\0';
     }
 }
 
-/**
- * @brief Submits the current typed input in the tab for asynchronous execution.
- *
- * Creates a pipe to capture stdout/stderr from the command, forks the execution child,
- * records the input into the scrollback buffer with prompt styling, and clears the input line.
- *
- * @param[in,out] app Pointer to GuiApp.
- * @param[in,out] tab Pointer to Tab where Enter was pressed.
- */
+/* ========================================================================= */
+/*                         Command Execution                                 */
+/* ========================================================================= */
+
 void tab_submit_command(GuiApp *app, Tab *tab) {
-    if (!app || !tab) {
-        return;
-    }
+    if (!app || !tab) return;
 
-    /* Snap view to bottom on submission */
     tab->scroll_offset = 0;
-
-    /* Select active prompt prefix: primary "user@terminator> " or continuation "> " */
     const char *prompt_used = tab->is_multiline ? "> " : PROMPT_STRING;
     int p_len = (int)strlen(prompt_used);
 
-    /* Record prompt + typed input into tab scrollback buffer with visual line wrapping */
-    int text_area_w = app->win_width - 25;
-    int cols = text_area_w / app->font_width;
-    if (cols < 20) cols = 20;
-    int first_line_capacity = cols - p_len;
-    if (first_line_capacity < 1) first_line_capacity = 1;
+    tab_record_prompt_input(app, tab, prompt_used, p_len);
 
-    if (tab->input_len <= first_line_capacity) {
-        if (tab->num_lines < MAX_BUFFER_LINES) {
-            tab->num_lines++;
-        } else {
-            memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
-        }
-        TermLine *prompt_line = &tab->lines[tab->num_lines - 1];
-        prompt_line->type = LINE_TYPE_PROMPT_INPUT;
-        prompt_line->prompt_len = p_len;
-        snprintf(prompt_line->text, sizeof(prompt_line->text), "%s%.*s",
-                 prompt_used, (int)(sizeof(prompt_line->text) - p_len - 1), tab->input_buffer);
-    } else {
-        /* Record Row 0 with prompt */
-        if (tab->num_lines < MAX_BUFFER_LINES) {
-            tab->num_lines++;
-        } else {
-            memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
-        }
-        TermLine *first_line = &tab->lines[tab->num_lines - 1];
-        first_line->type = LINE_TYPE_PROMPT_INPUT;
-        first_line->prompt_len = p_len;
-        snprintf(first_line->text, sizeof(first_line->text), "%s%.*s",
-                 prompt_used, first_line_capacity, tab->input_buffer);
+    if (tab->input_len == 0 && !tab->is_multiline) return;
 
-        /* Record subsequent wrapped rows cleanly */
-        int remaining = tab->input_len - first_line_capacity;
-        int buf_offset = first_line_capacity;
-        while (remaining > 0) {
-            int chunk = remaining > cols ? cols : remaining;
-            if (tab->num_lines < MAX_BUFFER_LINES) {
-                tab->num_lines++;
-            } else {
-                memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
-            }
-            TermLine *wrap_line = &tab->lines[tab->num_lines - 1];
-            wrap_line->type = LINE_TYPE_PROMPT_INPUT;
-            wrap_line->prompt_len = 0;
-            snprintf(wrap_line->text, sizeof(wrap_line->text), "%.*s", chunk, tab->input_buffer + buf_offset);
-            buf_offset += chunk;
-            remaining -= chunk;
-        }
-    }
-
-    /* If user pressed Enter on an empty line and not in multiline, nothing to execute */
-    if (tab->input_len == 0 && !tab->is_multiline) {
-        return;
-    }
-
-    /* Accumulate into multiline buffer */
     if (!tab->is_multiline) {
         snprintf(tab->multiline_accum, sizeof(tab->multiline_accum), "%s", tab->input_buffer);
     } else {
@@ -532,144 +361,105 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         snprintf(tab->multiline_accum + acc_len, sizeof(tab->multiline_accum) - acc_len, "\n%s", tab->input_buffer);
     }
 
-    /* Record command into history (avoiding consecutive duplicates) */
-    if (tab->input_len > 0) {
-        if (tab->history_count == 0 || strcmp(tab->history[tab->history_count - 1], tab->input_buffer) != 0) {
-            if (tab->history_count < MAX_TAB_HISTORY) {
-                snprintf(tab->history[tab->history_count], sizeof(tab->history[0]), "%s", tab->input_buffer);
-                tab->history_count++;
-            } else {
-                memmove(&tab->history[0], &tab->history[1], sizeof(tab->history[0]) * (MAX_TAB_HISTORY - 1));
-                snprintf(tab->history[MAX_TAB_HISTORY - 1], sizeof(tab->history[0]), "%s", tab->input_buffer);
-            }
-        }
-        tab->history_pos = -1;
-        tab->saved_input[0] = '\0';
-    }
-
-    /* Clear the active typed input buffer */
+    tab_add_history(tab, tab->input_buffer);
     tab->input_buffer[0] = '\0';
     tab->input_len = 0;
     tab->cursor_pos = 0;
+    tab->history_pos = -1;
+    tab->saved_input[0] = '\0';
 
-    /* Check if the command is incomplete (unclosed quotes, trailing '\', etc.) */
     if (is_command_incomplete(tab->multiline_accum)) {
         tab->is_multiline = 1;
-        return; /* Keep reading with continuation prompt '> ' */
+        return;
     }
 
-    /* Command is complete; reset multiline flag and copy accumulated command */
     tab->is_multiline = 0;
-    char cmd_str[MAX_LINE_CHARS];
-    strncpy(cmd_str, tab->multiline_accum, sizeof(cmd_str) - 1);
-    cmd_str[sizeof(cmd_str) - 1] = '\0';
+    char cmd_str[sizeof(tab->multiline_accum)];
+    snprintf(cmd_str, sizeof(cmd_str), "%s", tab->multiline_accum);
     tab->multiline_accum[0] = '\0';
 
-    /* Parse command into pipeline */
     Pipeline pipeline;
     if (parse_line(cmd_str, &tab->shell_ctx, &pipeline) != 0) {
         tab_append_output(tab, "terminator: syntax error\n", 25);
         return;
     }
 
-    /* Check for built-ins that only modify shell state and don't need piping (e.g. exit, cd) */
     if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
         Command *cmd = &pipeline.commands[0];
         if (strcmp(cmd->argv[0], "exit") == 0) {
             free_pipeline(&pipeline);
-            /* Close tab on exit */
             gui_close_tab(app, app->active_tab_idx);
             return;
         } else if (strcmp(cmd->argv[0], "cd") == 0) {
-            /* Execute cd directly in tab context so cwd changes */
             int status = execute_builtin(&tab->shell_ctx, cmd);
             if (status != 0) {
-                char err_buf[256];
-                snprintf(err_buf, sizeof(err_buf), "terminator: cd: %s: No such file or directory\n",
+                char err[256];
+                snprintf(err, sizeof(err), "terminator: cd: %s: No such file or directory\n",
                          cmd->argv[1] ? cmd->argv[1] : "");
-                tab_append_output(tab, err_buf, strlen(err_buf));
+                tab_append_output(tab, err, (int)strlen(err));
             } else {
                 snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
             }
             free_pipeline(&pipeline);
             return;
         } else if (strcmp(cmd->argv[0], "clear") == 0) {
-            /* Clear visual scrollback buffer and reset vertical scroll position */
             tab->num_lines = 0;
             tab->scroll_offset = 0;
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
         } else if (strcmp(cmd->argv[0], "jobs") == 0) {
-            char out_buf[4096];
-            jobs_print(&tab->shell_ctx.job_table, out_buf, sizeof(out_buf));
-            if (out_buf[0] != '\0') {
-                tab_append_output(tab, out_buf, (int)strlen(out_buf));
-            }
+            char out[4096];
+            jobs_print(&tab->shell_ctx.job_table, out, sizeof(out));
+            if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
         } else if (strcmp(cmd->argv[0], "bg") == 0) {
-            char out_buf[512];
-            int ret = jobs_builtin_bg(&tab->shell_ctx.job_table, cmd->argv, out_buf, sizeof(out_buf));
-            if (out_buf[0] != '\0') {
-                tab_append_output(tab, out_buf, (int)strlen(out_buf));
-            }
+            char out[512];
+            int ret = jobs_builtin_bg(&tab->shell_ctx.job_table, cmd->argv, out, sizeof(out));
+            if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
             tab->shell_ctx.last_exit_status = ret;
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
         } else if (strcmp(cmd->argv[0], "fg") == 0) {
-            char out_buf[512];
+            char out[512];
             Job res_job;
-            int ret = jobs_builtin_fg(&tab->shell_ctx.job_table, cmd->argv, out_buf, sizeof(out_buf), &res_job);
+            int ret = jobs_builtin_fg(&tab->shell_ctx.job_table, cmd->argv, out, sizeof(out), &res_job);
             if (ret != 0) {
-                if (out_buf[0] != '\0') {
-                    tab_append_output(tab, out_buf, (int)strlen(out_buf));
-                }
+                if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
                 tab->shell_ctx.last_exit_status = ret;
                 free_pipeline(&pipeline);
                 gui_redraw(app);
                 return;
             }
-
-            /* Print command being foregrounded */
             char fg_msg[600];
             snprintf(fg_msg, sizeof(fg_msg), "%s\n", res_job.command);
             tab_append_output(tab, fg_msg, (int)strlen(fg_msg));
 
-            /* Resume process group with SIGCONT */
             if (res_job.pgid > 0) {
                 kill(-res_job.pgid, SIGCONT);
                 kill(res_job.pid, SIGCONT);
             }
 
-            /* Attach to foreground */
             tab->running_pid = res_job.pid;
             tab->running_pgid = res_job.pgid;
             snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", res_job.command);
             tab->out_pipe_fd = res_job.out_pipe_fd;
             tab->is_running_cmd = 1;
-
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
         }
     }
 
-    /* Asynchronous command execution using a pipe:
-     * 1. pipe() creates a channel [0]=read, [1]=write.
-     * 2. fork() child: redirects stdout & stderr to write-end using dup2().
-     * 3. Parent: sets read-end to non-blocking and registers it with poll() loop.
-     */
     int pipefds[2];
     if (pipe(pipefds) < 0) {
         perror("terminator: pipe failed");
         free_pipeline(&pipeline);
         return;
     }
-
-    /* Make read-end non-blocking so read() won't hang the GUI */
     int flags = fcntl(pipefds[0], F_GETFL, 0);
     fcntl(pipefds[0], F_SETFL, flags | O_NONBLOCK);
 
@@ -683,21 +473,14 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     }
 
     if (pid == 0) {
-        /* Child process: become process group leader so Ctrl+C / Ctrl+Z target it */
         setpgid(0, 0);
+        if (chdir(tab->cwd) != 0) {}
 
-        /* Change to tab's current working directory */
-        if (chdir(tab->cwd) != 0) {
-            /* If cwd changed or deleted, ignore */
-        }
-
-        /* Redirect stdout and stderr to the write end of the pipe */
         dup2(pipefds[1], STDOUT_FILENO);
         dup2(pipefds[1], STDERR_FILENO);
         close(pipefds[0]);
         close(pipefds[1]);
 
-        /* In background, redirect stdin from /dev/null if not already redirected */
         if (pipeline.commands[0].input_file == NULL && pipeline.is_background) {
             int devnull = open("/dev/null", O_RDONLY);
             if (devnull >= 0) {
@@ -706,12 +489,9 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             }
         }
 
-        /* For single command, directly setup redirections and execvp */
         if (pipeline.num_commands == 1) {
             Command *c = &pipeline.commands[0];
-            if (setup_redirections(c->input_file, c->output_file) != 0) {
-                _exit(1);
-            }
+            if (setup_redirections(c->input_file, c->output_file) != 0) _exit(1);
             if (is_builtin_command(c->argv[0])) {
                 int ret = execute_builtin(&tab->shell_ctx, c);
                 _exit(ret);
@@ -722,46 +502,39 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             }
         }
 
-        /* For pipelines, execute via shell pipeline engine */
         Pipeline exec_pl = pipeline;
         exec_pl.is_background = 0;
         int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
         _exit(ret);
     }
 
-    /* Parent process: close write-end */
     close(pipefds[1]);
     setpgid(pid, pid);
 
     if (pipeline.is_background) {
-        /* Background execution ('cmd &'): record into job_table and keep prompt active */
         Job *j = jobs_add(&tab->shell_ctx.job_table, pid, pid, cmd_str, JOB_STATE_RUNNING, pipefds[0]);
         char launch_msg[256];
         snprintf(launch_msg, sizeof(launch_msg), "[%d] %d\n", j ? j->id : 1, (int)pid);
         tab_append_output(tab, launch_msg, (int)strlen(launch_msg));
         gui_redraw(app);
     } else {
-        /* Foreground execution: tab waits for command to complete or suspend */
         tab->out_pipe_fd = pipefds[0];
         tab->running_pid = pid;
         tab->running_pgid = pid;
-        snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", cmd_str);
+        strncpy(tab->running_cmd, cmd_str, sizeof(tab->running_cmd) - 1);
+        tab->running_cmd[sizeof(tab->running_cmd) - 1] = '\0';
         tab->is_running_cmd = 1;
     }
 
     free_pipeline(&pipeline);
 }
 
-/**
- * @brief Handles keyboard input: typing, Backspace, Enter, arrows, and tab management shortcuts.
- *
- * @param[in,out] app Pointer to GuiApp.
- * @param[in] event Pointer to XKeyEvent.
- */
+/* ========================================================================= */
+/*                         Input Event Handling                              */
+/* ========================================================================= */
+
 void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
-    if (!app || app->num_tabs == 0) {
-        return;
-    }
+    if (!app || app->num_tabs == 0) return;
     Tab *tab = app->tabs[app->active_tab_idx];
 
     KeySym keysym;
@@ -772,140 +545,106 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     int is_ctrl = (event->state & ControlMask);
     int is_shift = (event->state & ShiftMask);
 
-    /* Keyboard shortcut: Ctrl+Shift+T creates a new tab */
+    /* Tab Creation / Closure shortcuts */
     if (is_ctrl && is_shift && (keysym == XK_T || keysym == XK_t)) {
         gui_create_tab(app, tab->cwd);
         gui_redraw(app);
         return;
     }
-
-    /* Keyboard shortcut: Ctrl+Shift+W closes the active tab */
     if (is_ctrl && is_shift && (keysym == XK_W || keysym == XK_w)) {
         gui_close_tab(app, app->active_tab_idx);
         gui_redraw(app);
         return;
     }
 
-    /* Keyboard shortcut: Ctrl+C stops running command (Task 6 & Task 8) */
+    /* Signals: Ctrl+C and Ctrl+Z */
     if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
         if (tab->is_running_cmd && tab->running_pid > 0) {
-            pid_t target_pgid = (tab->running_pgid > 0) ? tab->running_pgid : tab->running_pid;
-            kill(-target_pgid, SIGINT);
+            pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+            kill(-target, SIGINT);
             kill(tab->running_pid, SIGINT);
-            tab_append_output(tab, "^C\n", 3);
-            gui_redraw(app);
-            return;
         } else {
             tab->input_buffer[0] = '\0';
             tab->input_len = 0;
             tab->cursor_pos = 0;
             tab->history_pos = -1;
-            tab_append_output(tab, "^C\n", 3);
-            gui_redraw(app);
-            return;
         }
+        tab_append_output(tab, "^C\n", 3);
+        gui_redraw(app);
+        return;
     }
 
-    /* Keyboard shortcut: Ctrl+Z suspends running command (Task 8) */
     if (is_ctrl && !is_shift && (keysym == XK_Z || keysym == XK_z)) {
         if (tab->is_running_cmd && tab->running_pid > 0) {
-            pid_t target_pgid = (tab->running_pgid > 0) ? tab->running_pgid : tab->running_pid;
-            kill(-target_pgid, SIGTSTP);
+            pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+            kill(-target, SIGTSTP);
             kill(tab->running_pid, SIGTSTP);
 
-            /* Record stopped job in tab job table */
-            Job *j = jobs_add(&tab->shell_ctx.job_table, target_pgid, tab->running_pid,
+            Job *j = jobs_add(&tab->shell_ctx.job_table, target, tab->running_pid,
                               tab->running_cmd, JOB_STATE_STOPPED, tab->out_pipe_fd);
-
             char stop_msg[MAX_LINE_CHARS + 128];
             snprintf(stop_msg, sizeof(stop_msg), "^Z\n[%d]+  Stopped                 %s\n",
                      j ? j->id : 1, tab->running_cmd);
             tab_append_output(tab, stop_msg, (int)strlen(stop_msg));
 
-            /* Clear foreground state so prompt returns immediately */
             tab->is_running_cmd = 0;
             tab->running_pid = 0;
             tab->running_pgid = 0;
             tab->out_pipe_fd = -1;
             tab->running_cmd[0] = '\0';
-
             gui_redraw(app);
             return;
         }
     }
 
-    /* Keyboard shortcut: Shift+Left / Shift+Right to cycle through tabs */
-    if (is_shift && keysym == XK_Left) {
-        if (app->active_tab_idx > 0) {
-            gui_switch_tab(app, app->active_tab_idx - 1);
-            gui_redraw(app);
-        }
-        return;
-    }
-    if (is_shift && keysym == XK_Right) {
-        if (app->active_tab_idx < app->num_tabs - 1) {
-            gui_switch_tab(app, app->active_tab_idx + 1);
-            gui_redraw(app);
-        }
-        return;
-    }
-
-    /* Handle Home / End keys for rapid line navigation */
-    if (keysym == XK_Home) {
-        tab->cursor_pos = 0;
+    /* Tab navigation via keyboard */
+    if (is_shift && keysym == XK_Left && app->active_tab_idx > 0) {
+        gui_switch_tab(app, app->active_tab_idx - 1);
         gui_redraw(app);
         return;
     }
-    if (keysym == XK_End) {
-        tab->cursor_pos = tab->input_len;
+    if (is_shift && keysym == XK_Right && app->active_tab_idx < app->num_tabs - 1) {
+        gui_switch_tab(app, app->active_tab_idx + 1);
         gui_redraw(app);
         return;
     }
 
-    /* Handle Return / Enter key */
+    /* Basic cursor movement & submission */
+    if (keysym == XK_Home) { tab->cursor_pos = 0; gui_redraw(app); return; }
+    if (keysym == XK_End)  { tab->cursor_pos = tab->input_len; gui_redraw(app); return; }
     if (keysym == XK_Return || keysym == XK_KP_Enter) {
         tab_submit_command(app, tab);
         gui_redraw(app);
         return;
     }
-
-    /* Handle Backspace key */
     if (keysym == XK_BackSpace) {
         if (tab->cursor_pos > 0) {
-            memmove(&tab->input_buffer[tab->cursor_pos - 1],
-                    &tab->input_buffer[tab->cursor_pos],
-                    tab->input_len - tab->cursor_pos + 1);
-            tab->cursor_pos--;
-            tab->input_len--;
+            tab_delete_range(tab, tab->cursor_pos - 1, tab->cursor_pos);
             gui_redraw(app);
         }
         return;
     }
-
-    /* Handle Left / Right arrow navigation within the input buffer */
-    if (keysym == XK_Left && !is_ctrl && !is_shift) {
-        if (tab->cursor_pos > 0) {
-            tab->cursor_pos--;
+    if (keysym == XK_Delete) {
+        if (tab->cursor_pos < tab->input_len) {
+            tab_delete_range(tab, tab->cursor_pos, tab->cursor_pos + 1);
             gui_redraw(app);
         }
+        return;
+    }
+    if (keysym == XK_Left && !is_ctrl && !is_shift) {
+        if (tab->cursor_pos > 0) { tab->cursor_pos--; gui_redraw(app); }
         return;
     }
     if (keysym == XK_Right && !is_ctrl && !is_shift) {
-        if (tab->cursor_pos < tab->input_len) {
-            tab->cursor_pos++;
-            gui_redraw(app);
-        }
+        if (tab->cursor_pos < tab->input_len) { tab->cursor_pos++; gui_redraw(app); }
         return;
     }
 
-    /* Check Task 7 configurable hotkeys table (Ctrl+A, Ctrl+E, Ctrl+U, Ctrl+K, Ctrl+W, Ctrl+L, Ctrl+D, Ctrl+Shift+C, Ctrl+Shift+V, Up, Down) */
-    int text_area_w = app->win_width - 25;
-    int cols = text_area_w / app->font_width;
-    if (cols < 20) cols = 20;
-    const char *active_prompt = tab->is_multiline ? "> " : PROMPT_STRING;
-    int prompt_len = (int)strlen(active_prompt);
-    int first_line_capacity = cols - prompt_len;
-    if (first_line_capacity < 1) first_line_capacity = 1;
+    /* Task 7 Configurable Hotkeys */
+    int cols = get_term_cols(app);
+    const char *active_p = tab->is_multiline ? "> " : PROMPT_STRING;
+    int p_len = (int)strlen(active_p);
+    int first_cap = get_first_line_capacity(app, p_len);
 
     int action = hotkeys_match(&app->hotkeys, event, keysym);
     if (action >= 0) {
@@ -914,57 +653,31 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                 tab->cursor_pos = 0;
                 gui_redraw(app);
                 return;
-
             case HOTKEY_MOVE_END:
                 tab->cursor_pos = tab->input_len;
                 gui_redraw(app);
                 return;
-
             case HOTKEY_DELETE_TO_START:
-                if (tab->cursor_pos > 0) {
-                    memmove(&tab->input_buffer[0],
-                            &tab->input_buffer[tab->cursor_pos],
-                            tab->input_len - tab->cursor_pos + 1);
-                    tab->input_len -= tab->cursor_pos;
-                    tab->cursor_pos = 0;
-                    gui_redraw(app);
-                }
+                tab_delete_range(tab, 0, tab->cursor_pos);
+                gui_redraw(app);
                 return;
-
             case HOTKEY_DELETE_TO_END:
-                if (tab->cursor_pos < tab->input_len) {
-                    tab->input_buffer[tab->cursor_pos] = '\0';
-                    tab->input_len = tab->cursor_pos;
-                    gui_redraw(app);
-                }
+                tab_delete_range(tab, tab->cursor_pos, tab->input_len);
+                gui_redraw(app);
                 return;
-
-            case HOTKEY_DELETE_WORD:
-                if (tab->cursor_pos > 0) {
-                    int end = tab->cursor_pos;
-                    int start = end;
-                    while (start > 0 && isspace((unsigned char)tab->input_buffer[start - 1])) {
-                        start--;
-                    }
-                    while (start > 0 && !isspace((unsigned char)tab->input_buffer[start - 1])) {
-                        start--;
-                    }
-                    int del_len = end - start;
-                    memmove(&tab->input_buffer[start],
-                            &tab->input_buffer[end],
-                            tab->input_len - end + 1);
-                    tab->input_len -= del_len;
-                    tab->cursor_pos = start;
-                    gui_redraw(app);
-                }
+            case HOTKEY_DELETE_WORD: {
+                int end = tab->cursor_pos, start = end;
+                while (start > 0 && isspace((unsigned char)tab->input_buffer[start - 1])) start--;
+                while (start > 0 && !isspace((unsigned char)tab->input_buffer[start - 1])) start--;
+                tab_delete_range(tab, start, end);
+                gui_redraw(app);
                 return;
-
+            }
             case HOTKEY_CLEAR_SCREEN:
                 tab->num_lines = 0;
                 tab->scroll_offset = 0;
                 gui_redraw(app);
                 return;
-
             case HOTKEY_EXIT_SHELL:
                 if (tab->input_len == 0) {
                     gui_close_tab(app, app->active_tab_idx);
@@ -972,7 +685,6 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                     return;
                 }
                 break;
-
             case HOTKEY_COPY:
                 if (tab->input_len > 0) {
                     snprintf(app->clipboard_data, sizeof(app->clipboard_data), "%s", tab->input_buffer);
@@ -981,22 +693,19 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                     XSetSelectionOwner(app->display, XA_PRIMARY, app->window, CurrentTime);
                 }
                 return;
-
             case HOTKEY_PASTE:
                 XConvertSelection(app->display, app->atom_clipboard, app->atom_utf8_string,
                                   app->atom_terminator_sel, app->window, CurrentTime);
                 return;
-
             case HOTKEY_HISTORY_PREV:
-                /* If command is multi-line wrapped and cursor is on line 2+, navigate up inside command */
-                if (tab->input_len > first_line_capacity && tab->cursor_pos > first_line_capacity) {
-                    int rel = tab->cursor_pos - first_line_capacity;
+                if (tab->input_len > first_cap && tab->cursor_pos > first_cap) {
+                    int rel = tab->cursor_pos - first_cap;
                     int row = 1 + (rel / cols);
                     if (row == 1) {
                         int col = rel % cols;
-                        int target = col - prompt_len;
+                        int target = col - p_len;
                         if (target < 0) target = 0;
-                        if (target > first_line_capacity) target = first_line_capacity;
+                        if (target > first_cap) target = first_cap;
                         tab->cursor_pos = target;
                     } else {
                         tab->cursor_pos -= cols;
@@ -1004,7 +713,6 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                     gui_redraw(app);
                     return;
                 }
-                /* Otherwise browse command history backwards */
                 if (tab->history_count > 0) {
                     if (tab->history_pos == -1) {
                         snprintf(tab->saved_input, sizeof(tab->saved_input), "%s", tab->input_buffer);
@@ -1019,251 +727,120 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                     return;
                 }
                 break;
-
             case HOTKEY_HISTORY_NEXT:
-                /* If command is multi-line wrapped and cursor is not on last line, navigate down inside command */
-                if (tab->input_len > first_line_capacity) {
-                    int total_rows = 1 + (tab->input_len - first_line_capacity + cols - 1) / cols;
-                    int cur_row = (tab->cursor_pos <= first_line_capacity) ? 0 : 1 + ((tab->cursor_pos - first_line_capacity) / cols);
+                if (tab->input_len > first_cap) {
+                    int total_rows = 1 + (tab->input_len - first_cap + cols - 1) / cols;
+                    int cur_row = (tab->cursor_pos <= first_cap) ? 0 : 1 + ((tab->cursor_pos - first_cap) / cols);
                     if (cur_row < total_rows - 1) {
-                        int target;
-                        if (cur_row == 0) target = first_line_capacity + tab->cursor_pos;
-                        else target = tab->cursor_pos + cols;
+                        int target = (cur_row == 0) ? (first_cap + tab->cursor_pos) : (tab->cursor_pos + cols);
                         if (target > tab->input_len) target = tab->input_len;
                         tab->cursor_pos = target;
                         gui_redraw(app);
                         return;
                     }
                 }
-                /* Otherwise browse command history forwards */
                 if (tab->history_pos >= 0) {
                     if (tab->history_pos < tab->history_count - 1) {
                         tab->history_pos++;
                         snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->history[tab->history_pos]);
-                        tab->input_len = (int)strlen(tab->input_buffer);
-                        tab->cursor_pos = tab->input_len;
                     } else {
-                        /* Restores active draft */
                         tab->history_pos = -1;
                         snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->saved_input);
-                        tab->input_len = (int)strlen(tab->input_buffer);
-                        tab->cursor_pos = tab->input_len;
                     }
+                    tab->input_len = (int)strlen(tab->input_buffer);
+                    tab->cursor_pos = tab->input_len;
                     gui_redraw(app);
                     return;
                 }
                 break;
-
             default:
                 break;
         }
     }
 
-    /* Keyboard scrolling: Page_Up / Page_Down or Shift+Up / Shift+Down */
-    int content_top = TAB_BAR_HEIGHT + 10;
-    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
-    if (visible_rows <= 0) visible_rows = 1;
-    int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
-
+    /* Scroll navigation via PageUp/PageDown or Shift+Up/Shift+Down */
+    int max_scroll = get_max_scroll(app, tab);
     if (keysym == XK_Page_Up || (is_shift && keysym == XK_Up)) {
-        int step = (keysym == XK_Page_Up) ? (visible_rows / 2 > 0 ? visible_rows / 2 : 1) : 1;
-        tab->scroll_offset += step;
-        if (tab->scroll_offset > max_scroll) {
-            tab->scroll_offset = max_scroll;
-        }
+        tab->scroll_offset += (keysym == XK_Page_Up ? 10 : 1);
+        if (tab->scroll_offset > max_scroll) tab->scroll_offset = max_scroll;
         gui_redraw(app);
         return;
     }
     if (keysym == XK_Page_Down || (is_shift && keysym == XK_Down)) {
-        int step = (keysym == XK_Page_Down) ? (visible_rows / 2 > 0 ? visible_rows / 2 : 1) : 1;
-        tab->scroll_offset -= step;
-        if (tab->scroll_offset < 0) {
-            tab->scroll_offset = 0;
-        }
+        tab->scroll_offset -= (keysym == XK_Page_Down ? 10 : 1);
+        if (tab->scroll_offset < 0) tab->scroll_offset = 0;
         gui_redraw(app);
         return;
     }
 
-    /* Handle Return / Enter key */
-    if (keysym == XK_Return || keysym == XK_KP_Enter) {
-        tab_submit_command(app, tab);
-        gui_redraw(app);
-        return;
-    }
-
-    /* Handle Backspace key */
-    if (keysym == XK_BackSpace) {
-        if (tab->cursor_pos > 0) {
-            memmove(&tab->input_buffer[tab->cursor_pos - 1],
-                    &tab->input_buffer[tab->cursor_pos],
-                    tab->input_len - tab->cursor_pos + 1);
-            tab->cursor_pos--;
-            tab->input_len--;
-            gui_redraw(app);
-        }
-        return;
-    }
-
-    /* Handle Left / Right arrow navigation within the input buffer */
-    if (keysym == XK_Left) {
-        if (tab->cursor_pos > 0) {
-            tab->cursor_pos--;
-            gui_redraw(app);
-        }
-        return;
-    }
-    if (keysym == XK_Right) {
-        if (tab->cursor_pos < tab->input_len) {
-            tab->cursor_pos++;
-            gui_redraw(app);
-        }
-        return;
-    }
-
-    /* Handle printable character input */
+    /* Printable ASCII character entry */
     if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
-        if (tab->input_len < MAX_LINE_CHARS - 2) {
-            memmove(&tab->input_buffer[tab->cursor_pos + 1],
-                    &tab->input_buffer[tab->cursor_pos],
-                    tab->input_len - tab->cursor_pos + 1);
-            tab->input_buffer[tab->cursor_pos] = buffer[0];
-            tab->cursor_pos++;
-            tab->input_len++;
-            gui_redraw(app);
-        }
-        return;
+        tab_insert_char(tab, buffer[0]);
+        gui_redraw(app);
     }
 }
 
-/**
- * @brief Handles mouse clicks on the tab bar: tab selection, '+' button to add tabs.
- *
- * @param[in,out] app Pointer to GuiApp.
- * @param[in] event Pointer to XButtonEvent.
- */
 void gui_handle_button_press(GuiApp *app, XButtonEvent *event) {
-    if (!app || app->num_tabs == 0) {
-        return;
-    }
+    if (!app || app->num_tabs == 0) return;
     Tab *tab = app->tabs[app->active_tab_idx];
 
-    /* Mouse wheel scrolling: Button4 = Wheel Up, Button5 = Wheel Down */
-    int content_top = TAB_BAR_HEIGHT + 10;
-    int visible_rows = (app->win_height - content_top - app->font_height) / app->font_height;
-    if (visible_rows <= 0) visible_rows = 1;
-    int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
-
+    int max_scroll = get_max_scroll(app, tab);
     if (event->button == 4) {
-        /* Wheel up -> scroll into past history */
         tab->scroll_offset += 3;
-        if (tab->scroll_offset > max_scroll) {
-            tab->scroll_offset = max_scroll;
-        }
+        if (tab->scroll_offset > max_scroll) tab->scroll_offset = max_scroll;
         gui_redraw(app);
         return;
     }
     if (event->button == 5) {
-        /* Wheel down -> scroll down towards active prompt */
         tab->scroll_offset -= 3;
-        if (tab->scroll_offset < 0) {
-            tab->scroll_offset = 0;
-        }
+        if (tab->scroll_offset < 0) tab->scroll_offset = 0;
         gui_redraw(app);
         return;
     }
 
-    if (event->y > TAB_BAR_HEIGHT) {
-        return; /* Regular click outside tab bar */
-    }
+    if (event->y > TAB_BAR_HEIGHT) return;
 
-    /* Pinned '+' new tab button at top-right corner */
-    const char *plus_label = " [ + ] ";
-    int plus_width = (int)strlen(plus_label) * app->font_width + 8;
-    int plus_x = app->win_width - plus_width - 6;
+    int plus_x, plus_w, tab_w, spacing;
+    get_tab_bar_layout(app, &plus_x, &plus_w, &tab_w, &spacing);
 
-    if (event->x >= plus_x && event->x <= plus_x + plus_width) {
-        gui_create_tab(app, app->tabs[app->active_tab_idx]->cwd);
+    if (event->x >= plus_x && event->x <= plus_x + plus_w) {
+        gui_create_tab(app, tab->cwd);
         gui_redraw(app);
         return;
     }
 
-    /* Compute tab positions matching gui_redraw */
-    int avail_tabs_width = plus_x - 14;
-    int tab_spacing = 4;
-    int tab_width = 180;
-    if (app->num_tabs > 0) {
-        int max_allowed_w = (avail_tabs_width - ((app->num_tabs - 1) * tab_spacing)) / app->num_tabs;
-        if (max_allowed_w < tab_width) {
-            tab_width = max_allowed_w;
-        }
-        if (tab_width < 45) {
-            tab_width = 45;
-        }
-    }
-
-    int current_x = 10;
+    int cur_x = 10;
     for (int i = 0; i < app->num_tabs; i++) {
-        if (event->x >= current_x && event->x < current_x + tab_width) {
+        if (event->x >= cur_x && event->x < cur_x + tab_w) {
             gui_switch_tab(app, i);
             gui_redraw(app);
             return;
         }
-        current_x += tab_width + tab_spacing;
+        cur_x += tab_w + spacing;
     }
 }
 
-/**
- * @brief Redraws the terminal window:
- *        1. Tab bar at the top with tabs and '+' button.
- *        2. Terminal scrollback lines.
- *        3. Red prompt string ("user@terminator> ").
- *        4. Neon green typed user command and cursor block.
- *
- * Uses double-buffering via back_buffer to prevent screen flickering.
- *
- * @param[in,out] app Pointer to GuiApp.
- */
-void gui_redraw(GuiApp *app) {
-    if (!app || !app->display || app->num_tabs == 0) {
-        return;
-    }
+/* ========================================================================= */
+/*                         Window Redraw (Double-Buffered)                   */
+/* ========================================================================= */
 
+void gui_redraw(GuiApp *app) {
+    if (!app || !app->display || app->num_tabs == 0) return;
     Tab *tab = app->tabs[app->active_tab_idx];
 
-    /* 1. Clear off-screen back buffer to pitch black */
-    XFillRectangle(app->display, app->back_buffer, app->gc_bg,
-                   0, 0, app->win_width, app->win_height);
+    XFillRectangle(app->display, app->back_buffer, app->gc_bg, 0, 0, app->win_width, app->win_height);
+    XFillRectangle(app->display, app->back_buffer, app->gc_tab_bar_bg, 0, 0, app->win_width, TAB_BAR_HEIGHT);
 
-    /* 2. Draw Tab Bar strip at top */
-    XFillRectangle(app->display, app->back_buffer, app->gc_tab_bar_bg,
-                   0, 0, app->win_width, TAB_BAR_HEIGHT);
-
-    /* Render docked '[ + ]' button pinned at the far-right corner */
-    const char *plus_label = " [ + ] ";
-    int plus_width = (int)strlen(plus_label) * app->font_width + 8;
-    int plus_x = app->win_width - plus_width - 6;
+    int plus_x, plus_w, tab_w, spacing;
+    get_tab_bar_layout(app, &plus_x, &plus_w, &tab_w, &spacing);
     int tab_text_y = TAB_BAR_HEIGHT - 8;
 
-    /* Draw distinct clickable background box for the '+' button */
-    XFillRectangle(app->display, app->back_buffer, app->gc_tab_active_bg,
-                   plus_x, 3, plus_width, TAB_BAR_HEIGHT - 6);
-    XDrawString(app->display, app->back_buffer, app->gc_tab_active_text,
-                plus_x + 4, tab_text_y, plus_label, (int)strlen(plus_label));
+    /* Render docked '+' button */
+    const char *plus_label = " [ + ] ";
+    XFillRectangle(app->display, app->back_buffer, app->gc_tab_active_bg, plus_x, 3, plus_w, TAB_BAR_HEIGHT - 6);
+    XDrawString(app->display, app->back_buffer, app->gc_tab_active_text, plus_x + 4, tab_text_y, plus_label, (int)strlen(plus_label));
 
-    /* Compute available horizontal space for tabs */
-    int avail_tabs_width = plus_x - 14;
-    int tab_spacing = 4;
-    int tab_width = 180;
-    if (app->num_tabs > 0) {
-        int max_allowed_w = (avail_tabs_width - ((app->num_tabs - 1) * tab_spacing)) / app->num_tabs;
-        if (max_allowed_w < tab_width) {
-            tab_width = max_allowed_w;
-        }
-        if (tab_width < 45) {
-            tab_width = 45;
-        }
-    }
-
+    /* Render Tab buttons */
     int cur_x = 10;
     for (int i = 0; i < app->num_tabs; i++) {
         char label[128];
@@ -1272,16 +849,13 @@ void gui_redraw(GuiApp *app) {
         const char *short_name = last_slash ? (last_slash + 1) : cwd;
         if (!short_name || short_name[0] == '\0') short_name = "/";
 
-        /* Determine how many characters fit into the tab width */
-        int max_label_chars = (tab_width - 10) / app->font_width;
-        if (max_label_chars <= 4) {
+        int max_chars = (tab_w - 10) / app->font_width;
+        if (max_chars <= 4) {
             snprintf(label, sizeof(label), " %d ", i + 1);
         } else {
-            /* Format label with truncation if name is too long */
-            int name_chars_avail = max_label_chars - 7;
-            if (name_chars_avail > 0 && (int)strlen(short_name) > name_chars_avail) {
-                snprintf(label, sizeof(label), " [ %d: %.*s.. ] ", i + 1,
-                         name_chars_avail > 2 ? name_chars_avail - 2 : 1, short_name);
+            int avail = max_chars - 7;
+            if (avail > 0 && (int)strlen(short_name) > avail) {
+                snprintf(label, sizeof(label), " [ %d: %.*s.. ] ", i + 1, avail > 2 ? avail - 2 : 1, short_name);
             } else {
                 snprintf(label, sizeof(label), " [ %d: %.30s ] ", i + 1, short_name);
             }
@@ -1289,172 +863,113 @@ void gui_redraw(GuiApp *app) {
         int label_len = (int)strlen(label);
 
         if (i == app->active_tab_idx) {
-            /* Highlight active tab */
-            XFillRectangle(app->display, app->back_buffer, app->gc_tab_active_bg,
-                           cur_x, 3, tab_width, TAB_BAR_HEIGHT - 6);
-            XDrawString(app->display, app->back_buffer, app->gc_tab_active_text,
-                        cur_x + 5, tab_text_y, label, label_len);
+            XFillRectangle(app->display, app->back_buffer, app->gc_tab_active_bg, cur_x, 3, tab_w, TAB_BAR_HEIGHT - 6);
+            XDrawString(app->display, app->back_buffer, app->gc_tab_active_text, cur_x + 5, tab_text_y, label, label_len);
         } else {
-            XDrawString(app->display, app->back_buffer, app->gc_tab_text,
-                        cur_x + 5, tab_text_y, label, label_len);
+            XDrawString(app->display, app->back_buffer, app->gc_tab_text, cur_x + 5, tab_text_y, label, label_len);
         }
-
-        cur_x += tab_width + tab_spacing;
+        cur_x += tab_w + spacing;
     }
 
-    /* 3. Calculate terminal text area dimensions & visual line wrapping */
-    int text_area_w = app->win_width - 25;
-    int cols = text_area_w / app->font_width;
-    if (cols < 20) cols = 20;
+    /* Content Area & Dimensions */
+    int cols = get_term_cols(app);
+    const char *active_p = tab->is_multiline ? "> " : PROMPT_STRING;
+    int p_len = (int)strlen(active_p);
+    int first_cap = get_first_line_capacity(app, p_len);
 
-    const char *active_prompt = tab->is_multiline ? "> " : PROMPT_STRING;
-    int prompt_len = (int)strlen(active_prompt);
-    int first_line_capacity = cols - prompt_len;
-    if (first_line_capacity < 1) first_line_capacity = 1;
-
-    /* Calculate how many visual rows the active wrapped input will occupy */
-    int active_input_rows = 1;
-    if (tab->input_len > first_line_capacity) {
-        active_input_rows = 1 + (tab->input_len - first_line_capacity + cols - 1) / cols;
+    int active_rows = 1;
+    if (tab->input_len > first_cap) {
+        active_rows = 1 + (tab->input_len - first_cap + cols - 1) / cols;
     }
 
     int content_top = TAB_BAR_HEIGHT + 10;
-    int available_content_height = app->win_height - content_top - (active_input_rows * app->font_height);
-    int visible_rows = available_content_height / app->font_height;
+    int visible_rows = (app->win_height - content_top - (active_rows * app->font_height)) / app->font_height;
     if (visible_rows <= 0) visible_rows = 1;
 
-    /* Calculate scroll limits and determine starting/ending lines to render */
     int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
     if (tab->scroll_offset > max_scroll) tab->scroll_offset = max_scroll;
     if (tab->scroll_offset < 0) tab->scroll_offset = 0;
 
-    int start_line = max_scroll - tab->scroll_offset;
-    int end_line = start_line + visible_rows;
-    if (end_line > tab->num_lines) end_line = tab->num_lines;
+    int start_l = max_scroll - tab->scroll_offset;
+    int end_l = start_l + visible_rows;
+    if (end_l > tab->num_lines) end_l = tab->num_lines;
 
-    int current_y = content_top + app->font_ascent;
-
-    /* Render scrollback lines within visible window */
-    for (int i = start_line; i < end_line; i++) {
+    int cur_y = content_top + app->font_ascent;
+    for (int i = start_l; i < end_l; i++) {
         TermLine *line = &tab->lines[i];
-
         if (line->type == LINE_TYPE_PROMPT_INPUT) {
-            /* Render Prompt prefix in RED */
-            int p_len = line->prompt_len;
-            if (p_len > 0) {
-                XDrawString(app->display, app->back_buffer, app->gc_prompt,
-                            10, current_y, line->text, p_len);
+            if (line->prompt_len > 0) {
+                XDrawString(app->display, app->back_buffer, app->gc_prompt, 10, cur_y, line->text, line->prompt_len);
             }
-            /* Render the typed command in NEON GREEN */
-            int cmd_len = (int)strlen(line->text) - p_len;
+            int cmd_len = (int)strlen(line->text) - line->prompt_len;
             if (cmd_len > 0) {
                 XDrawString(app->display, app->back_buffer, app->gc_input,
-                            10 + (p_len * app->font_width), current_y,
-                            line->text + p_len, cmd_len);
+                            10 + (line->prompt_len * app->font_width), cur_y,
+                            line->text + line->prompt_len, cmd_len);
             }
         } else {
-            /* Render program output in crisp Light Text */
-            XDrawString(app->display, app->back_buffer, app->gc_output,
-                        10, current_y, line->text, (int)strlen(line->text));
+            XDrawString(app->display, app->back_buffer, app->gc_output, 10, cur_y, line->text, (int)strlen(line->text));
         }
-
-        current_y += app->font_height;
+        cur_y += app->font_height;
     }
 
-    /* 4. Render Active Input Line with Visual Line Wrapping:
-     * - Primary "user@terminator> " or continuation "> " in Vivid Red on Line 1.
-     * - User's typed input drawn in Neon Hacker Green.
-     * - If input exceeds line width, wraps cleanly onto subsequent visual lines.
-     * - Block cursor rendered at exact wrapped (row, col) position.
-     */
-    XDrawString(app->display, app->back_buffer, app->gc_prompt,
-                10, current_y, active_prompt, prompt_len);
-
-    if (tab->input_len <= first_line_capacity) {
-        if (tab->input_len > 0) {
-            XDrawString(app->display, app->back_buffer, app->gc_input,
-                        10 + (prompt_len * app->font_width), current_y,
-                        tab->input_buffer, tab->input_len);
-        }
-        int cursor_x = 10 + ((prompt_len + tab->cursor_pos) * app->font_width);
-        int cursor_y = current_y - app->font_ascent;
-        XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
-                       cursor_x, cursor_y, app->font_width, app->font_height);
-    } else {
-        /* Line 0: draw first_line_capacity characters */
+    /* Active Input & Wrapped Lines */
+    XDrawString(app->display, app->back_buffer, app->gc_prompt, 10, cur_y, active_p, p_len);
+    int line0_chars = tab->input_len < first_cap ? tab->input_len : first_cap;
+    if (line0_chars > 0) {
         XDrawString(app->display, app->back_buffer, app->gc_input,
-                    10 + (prompt_len * app->font_width), current_y,
-                    tab->input_buffer, first_line_capacity);
+                    10 + (p_len * app->font_width), cur_y, tab->input_buffer, line0_chars);
+    }
 
-        /* Lines 1, 2, ...: draw remaining characters in wrapped lines */
-        int remaining = tab->input_len - first_line_capacity;
-        int buf_offset = first_line_capacity;
-        int wrap_row = 1;
-        while (remaining > 0) {
-            int chunk = remaining > cols ? cols : remaining;
-            int wrap_y = current_y + (wrap_row * app->font_height);
+    if (tab->input_len > first_cap) {
+        int off = first_cap;
+        int row = 1;
+        while (off < tab->input_len) {
+            int chunk = tab->input_len - off > cols ? cols : tab->input_len - off;
             XDrawString(app->display, app->back_buffer, app->gc_input,
-                        10, wrap_y, tab->input_buffer + buf_offset, chunk);
-            buf_offset += chunk;
-            remaining -= chunk;
-            wrap_row++;
+                        10, cur_y + (row * app->font_height), tab->input_buffer + off, chunk);
+            off += chunk;
+            row++;
         }
-
-        /* Calculate cursor position across wrapped lines */
-        int cur_row = 0;
-        int cur_col = 0;
-        if (tab->cursor_pos <= first_line_capacity) {
-            cur_row = 0;
-            cur_col = prompt_len + tab->cursor_pos;
-        } else {
-            int rel = tab->cursor_pos - first_line_capacity;
-            cur_row = 1 + (rel / cols);
-            cur_col = rel % cols;
-        }
-        int cursor_x = 10 + (cur_col * app->font_width);
-        int cursor_y = current_y + (cur_row * app->font_height) - app->font_ascent;
-        XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
-                       cursor_x, cursor_y, app->font_width, app->font_height);
     }
 
-    /* 5. Draw right-side scrollbar thumb if buffer exceeds screen height */
+    /* Unified Block Cursor Calculation */
+    int c_row = 0, c_col = 0;
+    if (tab->cursor_pos <= first_cap) {
+        c_row = 0;
+        c_col = p_len + tab->cursor_pos;
+    } else {
+        int rel = tab->cursor_pos - first_cap;
+        c_row = 1 + (rel / cols);
+        c_col = rel % cols;
+    }
+    XFillRectangle(app->display, app->back_buffer, app->gc_cursor,
+                   10 + (c_col * app->font_width),
+                   cur_y + (c_row * app->font_height) - app->font_ascent,
+                   app->font_width, app->font_height);
+
+    /* Scrollbar */
     if (tab->num_lines > visible_rows) {
-        int bar_x = app->win_width - 8;
-        int bar_y_start = content_top;
-        int bar_height_total = app->win_height - content_top - 5;
-        int thumb_height = (visible_rows * bar_height_total) / tab->num_lines;
-        if (thumb_height < 15) thumb_height = 15;
-        int thumb_y = bar_y_start + (int)(((long)start_line * (bar_height_total - thumb_height)) / (tab->num_lines - visible_rows));
-        XFillRectangle(app->display, app->back_buffer, app->gc_scrollbar,
-                       bar_x, thumb_y, 5, thumb_height);
+        int total_bar = app->win_height - content_top - 5;
+        int thumb_h = (visible_rows * total_bar) / tab->num_lines;
+        if (thumb_h < 15) thumb_h = 15;
+        int thumb_y = content_top + (int)(((long)start_l * (total_bar - thumb_h)) / (tab->num_lines - visible_rows));
+        XFillRectangle(app->display, app->back_buffer, app->gc_scrollbar, app->win_width - 8, thumb_y, 5, thumb_h);
     }
 
-    /* 6. Copy off-screen back buffer onto the visible X11 window in one shot */
-    XCopyArea(app->display, app->back_buffer, app->window, app->gc_bg,
-              0, 0, app->win_width, app->win_height, 0, 0);
-
+    XCopyArea(app->display, app->back_buffer, app->window, app->gc_bg, 0, 0, app->win_width, app->win_height, 0, 0);
     XFlush(app->display);
 }
 
-/**
- * @brief Main non-blocking event loop implementing poll() over X11 descriptor and pipes.
- *
- * Implements the architecture from slide 8:
- * - Sleeps via poll() when idle (0% CPU usage).
- * - Wakes up immediately when an X event arrives or when child command output arrives.
- * - Captures output from background tabs simultaneously without freezing the GUI.
- *
- * @param[in,out] app Pointer to GuiApp.
- */
-void gui_run_loop(GuiApp *app) {
-    if (!app || !app->display) {
-        return;
-    }
+/* ========================================================================= */
+/*                         Main Event Loop                                   */
+/* ========================================================================= */
 
+void gui_run_loop(GuiApp *app) {
+    if (!app || !app->display) return;
     int x_fd = ConnectionNumber(app->display);
 
     while (app->is_running) {
-        /* Process all pending X11 events first */
         while (XPending(app->display) > 0) {
             XEvent ev;
             XNextEvent(app->display, &ev);
@@ -1465,16 +980,11 @@ void gui_run_loop(GuiApp *app) {
                     break;
 
                 case ConfigureNotify:
-                    /* Window resized */
-                    if (ev.xconfigure.width != app->win_width ||
-                        ev.xconfigure.height != app->win_height) {
+                    if (ev.xconfigure.width != app->win_width || ev.xconfigure.height != app->win_height) {
                         app->win_width = ev.xconfigure.width;
                         app->win_height = ev.xconfigure.height;
-
-                        /* Recreate back buffer matching new dimensions */
                         if (app->back_buffer) XFreePixmap(app->display, app->back_buffer);
-                        app->back_buffer = XCreatePixmap(app->display, app->window,
-                                                         app->win_width, app->win_height,
+                        app->back_buffer = XCreatePixmap(app->display, app->window, app->win_width, app->win_height,
                                                          DefaultDepth(app->display, app->screen));
                         gui_redraw(app);
                     }
@@ -1489,14 +999,12 @@ void gui_run_loop(GuiApp *app) {
                     break;
 
                 case ClientMessage:
-                    /* Window close button clicked */
                     if ((Atom)ev.xclient.data.l[0] == app->wm_delete_window) {
                         app->is_running = 0;
                     }
                     break;
 
                 case SelectionRequest: {
-                    /* Reply to other applications or Terminator requesting clipboard text */
                     XSelectionRequestEvent *req = &ev.xselectionrequest;
                     XEvent reply;
                     memset(&reply, 0, sizeof(reply));
@@ -1510,13 +1018,11 @@ void gui_run_loop(GuiApp *app) {
 
                     if (req->target == app->atom_targets) {
                         Atom targets[] = { app->atom_targets, app->atom_utf8_string, XA_STRING };
-                        XChangeProperty(req->display, req->requestor, req->property,
-                                        XA_ATOM, 32, PropModeReplace,
+                        XChangeProperty(req->display, req->requestor, req->property, XA_ATOM, 32, PropModeReplace,
                                         (unsigned char *)targets, sizeof(targets) / sizeof(Atom));
                         reply.xselection.property = req->property;
                     } else if (req->target == XA_STRING || req->target == app->atom_utf8_string) {
-                        XChangeProperty(req->display, req->requestor, req->property,
-                                        req->target, 8, PropModeReplace,
+                        XChangeProperty(req->display, req->requestor, req->property, req->target, 8, PropModeReplace,
                                         (unsigned char *)app->clipboard_data, app->clipboard_len);
                         reply.xselection.property = req->property;
                     }
@@ -1526,34 +1032,23 @@ void gui_run_loop(GuiApp *app) {
                 }
 
                 case SelectionNotify: {
-                    /* Receive clipboard text from paste request */
                     XSelectionEvent *sel = &ev.xselection;
                     if (sel->property != None) {
                         Atom type_ret;
                         int format_ret;
-                        unsigned long nitems_ret, bytes_after_ret;
-                        unsigned char *prop_data = NULL;
-                        if (XGetWindowProperty(app->display, app->window, sel->property,
-                                               0, 4096, True, AnyPropertyType,
-                                               &type_ret, &format_ret, &nitems_ret,
-                                               &bytes_after_ret, &prop_data) == Success && prop_data) {
+                        unsigned long nitems, bytes_after;
+                        unsigned char *prop = NULL;
+                        if (XGetWindowProperty(app->display, app->window, sel->property, 0, 4096, True,
+                                               AnyPropertyType, &type_ret, &format_ret, &nitems, &bytes_after, &prop) == Success && prop) {
                             if (app->num_tabs > 0) {
-                                Tab *tab = app->tabs[app->active_tab_idx];
-                                for (unsigned long i = 0; i < nitems_ret; i++) {
-                                    char c = prop_data[i];
-                                    if (c == '\r' || c == '\n') continue;
-                                    if (c >= 32 && c <= 126 && tab->input_len < MAX_LINE_CHARS - 2) {
-                                        memmove(&tab->input_buffer[tab->cursor_pos + 1],
-                                                &tab->input_buffer[tab->cursor_pos],
-                                                tab->input_len - tab->cursor_pos + 1);
-                                        tab->input_buffer[tab->cursor_pos] = c;
-                                        tab->cursor_pos++;
-                                        tab->input_len++;
-                                    }
+                                Tab *t = app->tabs[app->active_tab_idx];
+                                for (unsigned long i = 0; i < nitems; i++) {
+                                    char c = prop[i];
+                                    if (c != '\r' && c != '\n' && c >= 32 && c <= 126) tab_insert_char(t, c);
                                 }
                                 gui_redraw(app);
                             }
-                            XFree(prop_data);
+                            XFree(prop);
                         }
                     }
                     break;
@@ -1564,15 +1059,8 @@ void gui_run_loop(GuiApp *app) {
             }
         }
 
-        /* Check if GUI was closed during event processing */
-        if (!app->is_running) {
-            break;
-        }
+        if (!app->is_running) break;
 
-        /* Set up pollfd array:
-         * fds[0] = X11 connection descriptor (x_fd)
-         * fds[1..N] = Read ends of active command pipes across all tabs (foreground and background)
-         */
         #define MAX_POLL_ENTRIES (1 + MAX_TABS * (1 + MAX_JOBS))
         struct pollfd fds[MAX_POLL_ENTRIES];
         int poll_tab_idx[MAX_POLL_ENTRIES];
@@ -1583,55 +1071,40 @@ void gui_run_loop(GuiApp *app) {
         fds[0].fd = x_fd;
         fds[0].events = POLLIN;
         fds[0].revents = 0;
-        poll_tab_idx[0] = -1;
-        poll_is_bg[0] = 0;
-        poll_job_id[0] = -1;
 
         for (int i = 0; i < app->num_tabs; i++) {
             Tab *t = app->tabs[i];
             if (!t) continue;
-
-            /* Foreground command pipe */
-            if (t->is_running_cmd && t->out_pipe_fd >= 0) {
-                if (num_poll_fds < MAX_POLL_ENTRIES) {
-                    fds[num_poll_fds].fd = t->out_pipe_fd;
+            if (t->is_running_cmd && t->out_pipe_fd >= 0 && num_poll_fds < MAX_POLL_ENTRIES) {
+                fds[num_poll_fds].fd = t->out_pipe_fd;
+                fds[num_poll_fds].events = POLLIN | POLLHUP;
+                fds[num_poll_fds].revents = 0;
+                poll_tab_idx[num_poll_fds] = i;
+                poll_is_bg[num_poll_fds] = 0;
+                poll_job_id[num_poll_fds] = -1;
+                num_poll_fds++;
+            }
+            for (int j = 0; j < t->shell_ctx.job_table.num_jobs; j++) {
+                Job *job = &t->shell_ctx.job_table.jobs[j];
+                if (job->state == JOB_STATE_RUNNING && job->out_pipe_fd >= 0 && num_poll_fds < MAX_POLL_ENTRIES) {
+                    fds[num_poll_fds].fd = job->out_pipe_fd;
                     fds[num_poll_fds].events = POLLIN | POLLHUP;
                     fds[num_poll_fds].revents = 0;
                     poll_tab_idx[num_poll_fds] = i;
-                    poll_is_bg[num_poll_fds] = 0;
-                    poll_job_id[num_poll_fds] = -1;
+                    poll_is_bg[num_poll_fds] = 1;
+                    poll_job_id[num_poll_fds] = job->id;
                     num_poll_fds++;
-                }
-            }
-
-            /* Background job pipes */
-            for (int j = 0; j < t->shell_ctx.job_table.num_jobs; j++) {
-                Job *job = &t->shell_ctx.job_table.jobs[j];
-                if (job->state == JOB_STATE_RUNNING && job->out_pipe_fd >= 0) {
-                    if (num_poll_fds < MAX_POLL_ENTRIES) {
-                        fds[num_poll_fds].fd = job->out_pipe_fd;
-                        fds[num_poll_fds].events = POLLIN | POLLHUP;
-                        fds[num_poll_fds].revents = 0;
-                        poll_tab_idx[num_poll_fds] = i;
-                        poll_is_bg[num_poll_fds] = 1;
-                        poll_job_id[num_poll_fds] = job->id;
-                        num_poll_fds++;
-                    }
                 }
             }
         }
 
-        /* Sleep until an X11 event arrives OR child pipe data is ready (timeout 50ms) */
         int ret = poll(fds, num_poll_fds, 50);
         if (ret < 0) {
             if (errno == EINTR) continue;
-            perror("terminator: poll error");
             break;
         }
 
         int needs_redraw = 0;
-
-        /* Check active child pipes for output */
         for (int i = 1; i < num_poll_fds; i++) {
             if (fds[i].revents & (POLLIN | POLLHUP)) {
                 int t_idx = poll_tab_idx[i];
@@ -1641,60 +1114,43 @@ void gui_run_loop(GuiApp *app) {
 
                 if (n > 0) {
                     tab_append_output(t, buf, (int)n);
-                    if (t_idx == app->active_tab_idx) {
-                        needs_redraw = 1;
-                    }
+                    if (t_idx == app->active_tab_idx) needs_redraw = 1;
                 } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                     if (poll_is_bg[i]) {
-                        /* Background job pipe finished */
                         close(fds[i].fd);
                         Job *bj = jobs_find_by_id(&t->shell_ctx.job_table, poll_job_id[i]);
-                        if (bj) {
-                            bj->out_pipe_fd = -1;
-                        }
+                        if (bj) bj->out_pipe_fd = -1;
                     } else {
-                        /* Foreground pipe closed / child finished */
                         close(t->out_pipe_fd);
                         t->out_pipe_fd = -1;
 
                         int status = 0;
                         waitpid(t->running_pid, &status, WNOHANG);
-                        if (WIFEXITED(status)) {
-                            t->shell_ctx.last_exit_status = WEXITSTATUS(status);
-                        } else if (WIFSIGNALED(status)) {
-                            t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
-                        }
+                        if (WIFEXITED(status)) t->shell_ctx.last_exit_status = WEXITSTATUS(status);
+                        else if (WIFSIGNALED(status)) t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
 
                         t->is_running_cmd = 0;
                         t->running_pid = 0;
                         t->running_pgid = 0;
                         t->running_cmd[0] = '\0';
-
-                        if (t_idx == app->active_tab_idx) {
-                            needs_redraw = 1;
-                        }
+                        if (t_idx == app->active_tab_idx) needs_redraw = 1;
                     }
                 }
             }
         }
 
-        /* Check status of background jobs in each tab and collect completion notifications */
         for (int i = 0; i < app->num_tabs; i++) {
             Tab *t = app->tabs[i];
             if (!t) continue;
-            char notif_buf[1024];
-            notif_buf[0] = '\0';
-            jobs_check_status(&t->shell_ctx.job_table, notif_buf, sizeof(notif_buf));
-            if (notif_buf[0] != '\0') {
-                tab_append_output(t, notif_buf, (int)strlen(notif_buf));
-                if (i == app->active_tab_idx) {
-                    needs_redraw = 1;
-                }
+            char notif[1024];
+            notif[0] = '\0';
+            jobs_check_status(&t->shell_ctx.job_table, notif, sizeof(notif));
+            if (notif[0] != '\0') {
+                tab_append_output(t, notif, (int)strlen(notif));
+                if (i == app->active_tab_idx) needs_redraw = 1;
             }
         }
 
-        if (needs_redraw) {
-            gui_redraw(app);
-        }
+        if (needs_redraw) gui_redraw(app);
     }
 }
