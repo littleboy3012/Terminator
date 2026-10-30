@@ -166,38 +166,19 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
 
         if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
             Command *cmd = &pipeline.commands[0];
-            if (strcmp(cmd->argv[0], "cd") == 0) {
-                int status = execute_builtin(&tab->shell_ctx, cmd);
-                if (status != 0) {
-                    char err[256];
-                    snprintf(err, sizeof(err), "terminator: cd: %s: No such file or directory\n",
-                             cmd->argv[1] ? cmd->argv[1] : "");
-                    if (write(out_fd, err, strlen(err)) < 0) {}
-                } else {
-                    if (getcwd(tab->cwd, sizeof(tab->cwd))) {
-                        char cwd_msg[PATH_MAX + 16];
-                        snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
-                        if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
-                    }
+            char out[8192];
+            out[0] = '\0';
+            int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
+            tab->shell_ctx.last_exit_status = ret;
+            if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
+                if (getcwd(tab->cwd, sizeof(tab->cwd))) {
+                    char cwd_msg[PATH_MAX + 16];
+                    snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
+                    if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
                 }
-            } else if (strcmp(cmd->argv[0], "history") == 0) {
-                char hist_buf[65536];
-                int n = history_format_recent(hist_buf, sizeof(hist_buf), 1000);
-                if (n > 0) {
-                    if (write(out_fd, hist_buf, n) < 0) {}
-                }
-            } else {
-                int save_out = dup(STDOUT_FILENO);
-                int save_err = dup(STDERR_FILENO);
-                dup2(out_fd, STDOUT_FILENO);
-                dup2(out_fd, STDERR_FILENO);
-                execute_builtin(&tab->shell_ctx, cmd);
-                fflush(stdout);
-                fflush(stderr);
-                dup2(save_out, STDOUT_FILENO);
-                dup2(save_err, STDERR_FILENO);
-                close(save_out);
-                close(save_err);
+            }
+            if (out[0] != '\0') {
+                if (write(out_fd, out, strlen(out)) < 0) {}
             }
             free_pipeline(&pipeline);
             continue;
@@ -602,47 +583,15 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             free_pipeline(&pipeline);
             gui_close_tab(app, app->active_tab_idx);
             return;
-        } else if (strcmp(cmd->argv[0], "history") == 0) {
-            char hist_buf[65536];
-            int n = history_format_recent(hist_buf, sizeof(hist_buf), 1000);
-            if (n > 0) tab_append_output(tab, hist_buf, n);
-            free_pipeline(&pipeline);
-            gui_redraw(app);
-            return;
-        } else if (strcmp(cmd->argv[0], "cd") == 0) {
-            int status = execute_builtin(&tab->shell_ctx, cmd);
-            if (status != 0) {
-                char err[256];
-                snprintf(err, sizeof(err), "terminator: cd: %s: No such file or directory\n",
-                         cmd->argv[1] ? cmd->argv[1] : "");
-                tab_append_output(tab, err, (int)strlen(err));
-            } else {
-                snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
-            }
-            free_pipeline(&pipeline);
-            return;
-        } else if (strcmp(cmd->argv[0], "clear") == 0) {
+        }
+        if (strcmp(cmd->argv[0], "clear") == 0) {
             tab->num_lines = 0;
             tab->scroll_offset = 0;
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
-        } else if (strcmp(cmd->argv[0], "jobs") == 0) {
-            char out[4096];
-            jobs_print(&tab->shell_ctx.job_table, out, sizeof(out));
-            if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
-            free_pipeline(&pipeline);
-            gui_redraw(app);
-            return;
-        } else if (strcmp(cmd->argv[0], "bg") == 0) {
-            char out[512];
-            int ret = jobs_builtin_bg(&tab->shell_ctx.job_table, cmd->argv, out, sizeof(out));
-            if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
-            tab->shell_ctx.last_exit_status = ret;
-            free_pipeline(&pipeline);
-            gui_redraw(app);
-            return;
-        } else if (strcmp(cmd->argv[0], "fg") == 0) {
+        }
+        if (strcmp(cmd->argv[0], "fg") == 0) {
             char out[512];
             Job res_job;
             int ret = jobs_builtin_fg(&tab->shell_ctx.job_table, cmd->argv, out, sizeof(out), &res_job);
@@ -661,7 +610,6 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
                 kill(-res_job.pgid, SIGCONT);
                 kill(res_job.pid, SIGCONT);
             }
-
             tab->running_pid = res_job.pid;
             tab->running_pgid = res_job.pgid;
             snprintf(tab->running_cmd, sizeof(tab->running_cmd), "%s", res_job.command);
@@ -671,6 +619,18 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             gui_redraw(app);
             return;
         }
+
+        char out[8192];
+        out[0] = '\0';
+        int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
+        tab->shell_ctx.last_exit_status = ret;
+        if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
+            snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
+        }
+        if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
+        free_pipeline(&pipeline);
+        gui_redraw(app);
+        return;
     }
 
     int pipefds[2];

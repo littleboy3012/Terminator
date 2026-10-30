@@ -1,6 +1,7 @@
 #include "builtins.h"
 #include "multiwatch.h"
 #include "history.h"
+#include "parser.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,61 +12,100 @@
 
 /**
  * @brief Checks whether a given command name corresponds to an internal shell built-in command.
- *
- * @param[in] name The command name string to check (e.g., "cd", "exit").
- *                 Must be a valid null-terminated string or NULL.
- * @return 1 if the command is a built-in, 0 otherwise.
  */
 int is_builtin_command(const char *name) {
-    if (!name) {
-        return 0;
-    }
-
-    if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
-        strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0 ||
-        strcmp(name, "jobs") == 0 || strcmp(name, "fg") == 0 ||
-        strcmp(name, "bg") == 0 || strcmp(name, "history") == 0) {
-        return 1;
-    }
-
-    return 0;
+    if (!name) return 0;
+    return (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
+            strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0 ||
+            strcmp(name, "jobs") == 0 || strcmp(name, "fg") == 0 ||
+            strcmp(name, "bg") == 0 || strcmp(name, "history") == 0 ||
+            strcmp(name, "source") == 0);
 }
 
 /**
  * @brief Dispatches and executes an identified built-in command.
- *
- * Built-in commands run in the shell's own process so they can affect shell state
- * (such as changing the current working directory or exiting the program).
- *
- * @param[in,out] ctx Pointer to the active ShellContext. Its fields (e.g. cwd, should_exit,
- *                    last_exit_status) may be modified during execution.
- * @param[in] cmd Pointer to the Command structure containing the argv array and arguments.
- * @return Integer exit code: 0 on success, non-zero on error.
  */
 int execute_builtin(ShellContext *ctx, const Command *cmd) {
-    if (!ctx || !cmd || cmd->argc == 0 || !cmd->argv[0]) {
-        return 1;
-    }
+    if (!ctx || !cmd || cmd->argc == 0 || !cmd->argv[0]) return 1;
 
-    if (strcmp(cmd->argv[0], "cd") == 0) {
-        return builtin_cd(ctx, cmd->argv);
-    } else if (strcmp(cmd->argv[0], "exit") == 0) {
-        return builtin_exit(ctx, cmd->argv);
-    } else if (strcmp(cmd->argv[0], "clear") == 0) {
-        return builtin_clear(ctx, cmd->argv);
-    } else if (strcasecmp(cmd->argv[0], "multiWatch") == 0) {
-        return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
-    } else if (strcmp(cmd->argv[0], "jobs") == 0) {
-        return builtin_jobs(ctx, cmd->argv);
-    } else if (strcmp(cmd->argv[0], "bg") == 0) {
-        return builtin_bg(ctx, cmd->argv);
-    } else if (strcmp(cmd->argv[0], "fg") == 0) {
-        return builtin_fg(ctx, cmd->argv);
-    } else if (strcmp(cmd->argv[0], "history") == 0) {
-        return builtin_history(ctx, cmd->argv);
-    }
+    const char *name = cmd->argv[0];
+    if (strcmp(name, "cd") == 0) return builtin_cd(ctx, cmd->argv);
+    if (strcmp(name, "exit") == 0) return builtin_exit(ctx, cmd->argv);
+    if (strcmp(name, "clear") == 0) return builtin_clear(ctx, cmd->argv);
+    if (strcasecmp(name, "multiWatch") == 0) return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
+    if (strcmp(name, "jobs") == 0) return builtin_jobs(ctx, cmd->argv);
+    if (strcmp(name, "bg") == 0) return builtin_bg(ctx, cmd->argv);
+    if (strcmp(name, "fg") == 0) return builtin_fg(ctx, cmd->argv);
+    if (strcmp(name, "history") == 0) return builtin_history(ctx, cmd->argv);
+    if (strcmp(name, "source") == 0) return builtin_source(ctx, cmd->argv);
 
     return 1;
+}
+
+int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_buf, size_t max_len) {
+    if (!ctx || !cmd || cmd->argc == 0 || !cmd->argv[0]) return 1;
+    if (out_buf && max_len > 0) out_buf[0] = '\0';
+
+    const char *name = cmd->argv[0];
+    if (strcmp(name, "cd") == 0) {
+        int ret = builtin_cd(ctx, cmd->argv);
+        if (ret != 0 && out_buf && max_len > 0) {
+            snprintf(out_buf, max_len, "terminator: cd: %s: No such file or directory\n",
+                     cmd->argv[1] ? cmd->argv[1] : "");
+        }
+        return ret;
+    }
+    if (strcmp(name, "history") == 0) {
+        if (out_buf && max_len > 0) {
+            int n = history_format_recent(out_buf, max_len, 1000);
+            return (n >= 0) ? 0 : 1;
+        }
+        return builtin_history(ctx, cmd->argv);
+    }
+    if (strcmp(name, "jobs") == 0) {
+        if (out_buf && max_len > 0) {
+            jobs_print(&ctx->job_table, out_buf, max_len);
+            return 0;
+        }
+        return builtin_jobs(ctx, cmd->argv);
+    }
+    if (strcmp(name, "bg") == 0) {
+        if (out_buf && max_len > 0) {
+            return jobs_builtin_bg(&ctx->job_table, cmd->argv, out_buf, max_len);
+        }
+        return builtin_bg(ctx, cmd->argv);
+    }
+    if (strcmp(name, "source") == 0) {
+        return builtin_source(ctx, cmd->argv);
+    }
+    return execute_builtin(ctx, cmd);
+}
+
+int builtin_source(ShellContext *ctx, char **argv) {
+    if (!ctx || !argv || !argv[1]) {
+        fprintf(stderr, "terminator: source: filename argument required\n");
+        return 1;
+    }
+    FILE *fp = fopen(argv[1], "r");
+    if (!fp) {
+        fprintf(stderr, "terminator: source: %s: %s\n", argv[1], strerror(errno));
+        return 1;
+    }
+    char line[4096];
+    int last_status = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        size_t l = strlen(line);
+        while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+        if (l == 0 || line[0] == '#') continue;
+        Pipeline pl;
+        if (parse_line(line, ctx, &pl) == 0) {
+            last_status = shell_execute_pipeline(ctx, &pl);
+            free_pipeline(&pl);
+        }
+    }
+    fclose(fp);
+    ctx->last_exit_status = last_status;
+    return last_status;
 }
 
 int builtin_history(ShellContext *ctx, char **argv) {

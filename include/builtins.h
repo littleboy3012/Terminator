@@ -24,6 +24,28 @@ int is_builtin_command(const char *name);
 int execute_builtin(ShellContext *ctx, const Command *cmd);
 
 /**
+ * @brief Executes a built-in command and captures its textual output into a buffer.
+ *
+ * Used by GUI mode and Process Mode to route built-in output to visual tabs or IPC pipes.
+ *
+ * @param[in,out] ctx Pointer to active ShellContext.
+ * @param[in] cmd Pointer to Command structure.
+ * @param[out] out_buf Destination text buffer for formatted output.
+ * @param[in] max_len Maximum bytes to write to out_buf.
+ * @return Exit status code.
+ */
+int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_buf, size_t max_len);
+
+/**
+ * @brief Built-in command: Executes commands from a script file ('source').
+ *
+ * @param[in,out] ctx Pointer to the ShellContext.
+ * @param[in] argv Argument array (argv[0]="source", argv[1]=script path).
+ * @return 0 on success, non-zero on failure.
+ */
+int builtin_source(ShellContext *ctx, char **argv);
+
+/**
  * @brief Built-in command: Changes the current working directory ('cd').
  *
  * If no arguments are provided, changes directory to the user's HOME directory.
