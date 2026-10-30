@@ -1,7 +1,7 @@
 # Terminator: System Design & Architecture Document
 **Computing Lab (CS69201) · Term Project · IIT Kharagpur**
 
----
+--- 
 
 ## 1. Executive Summary & Project Architecture
 
@@ -54,15 +54,28 @@ flowchart TD
 
 ## 2. Dual Execution Modes
 
-Terminator supports two distinct tab execution models per assignment specifications:
+Terminator supports two distinct execution models per the course specification document, toggled via command line argument `./terminator` (Thread Mode, default) or `./terminator useProcess=True` (Process Mode):
 
 | Dimension | Thread Mode (Default: `./terminator`) | Process Mode (`./terminator useProcess=True`) |
 | :--- | :--- | :--- |
-| **Tab Isolation** | Tabs run as threads within the single application process. | The GUI runs in the parent; each tab forks a dedicated child process. |
-| **Communication** | Direct in-memory structs and thread-safe queues. | Unidirectional UNIX IPC pipes connecting GUI to each tab process. |
-| **CWD & Environment** | Isolated in per-tab `ShellContext` structures. | Naturally isolated by separate operating system process address spaces. |
-| **Shared History** | Mutex/semaphore protected history ring buffer in process memory. | POSIX Shared Memory (`shm_open`, `mmap`) protected by a process-shared semaphore (`sem_open`). |
-| **Fault Resilience** | Crash in a command handled by child `fork()`; main process protected. | Independent process failure cannot compromise sibling tabs or the GUI. |
+| **Tab Isolation** | Tabs run as threads (`pthread_t`) within the single application process. | The GUI runs in the parent; each tab forks a dedicated child process (`fork()`). |
+| **Creation Mechanism** | `pthread_create(&tab->worker_thread, NULL, tab_worker_thread, tab)`. | `fork()` in `gui_create_tab`, running `tab_process_main` in child. |
+| **Communication** | Direct in-memory structures, mutex/semaphore protected shared state. | Bidirectional UNIX IPC pipes (`to_tab_fd` write pipe, `out_pipe_fd` read pipe). |
+| **X11 Display Access** | Only GUI thread touches X11 display handle; worker threads process shell tasks. | Child process immediately closes X11 Display handle (`XCloseDisplay`); only GUI touches X11. |
+| **CWD & Environment** | Isolated in per-tab `ShellContext` structures; changing directory in one tab does not affect others. | Naturally isolated by separate operating system process address spaces; reported via `[CWD]` protocol. |
+| **Shared History** | Mutex/semaphore protected history ring buffer in heap memory (10,000 entries). | POSIX Shared Memory (`shm_open("/terminator_shm_<pid>")`, `mmap`) with process-shared semaphore (`sem_init(..., 1, 1)`). |
+| **Fault Resilience** | Crash in external command handled by child `fork()`; main process protected. | Independent process failure cannot compromise sibling tabs or the GUI. |
+| **Teardown & Cleanup** | Thread canceled/joined; `pthread_cancel` / `pthread_join`. | Child terminated with `SIGTERM` / `waitpid`; pipes closed and shared memory unlinked. |
+
+### 2.1 State Segregation: What is Shared vs. What is Private
+
+- **Shared State**:
+  - **Command History**: All commands entered across all tabs (and in CLI mode) are appended into a centralized ring buffer (`SharedHistory`). Commands typed in Tab 1 immediately become browseable via Up/Down arrows and visible in `history` built-in in Tab 2.
+- **Private State**:
+  - **Working Directory (`cwd`)**: Each tab maintains its independent filesystem directory context. Running `cd` in Tab 1 does not alter Tab 2.
+  - **Job Control Table (`JobTable`)**: Background jobs (`sleep 100 &`) and stopped jobs belong to the tab from which they were launched.
+  - **Shell Status (`$?`)**: Last exit code is tracked independently per tab.
+  - **Scrollback Buffers & Visual Layout**: Input strings, cursor positions, and visual terminal lines remain strictly per-tab.
 
 ---
 
@@ -159,14 +172,16 @@ Manages the complete graphical interface, font rendering, double-buffering, tab 
 - **`tab_add_history(...)`**: Adds a command string to the tab's history ring buffer, ignoring consecutive duplicates.
 - **`tab_insert_char(...)`**: Inserts a character at the current cursor position within the input buffer.
 - **`tab_delete_range(...)`**: Deletes a slice of characters from the input buffer, adjusting cursor and string length.
-- **`gui_init(...)`**: Initializes the X11 connection, creates top-level window, loads monospace fonts, initializes double-buffering pixmap, and creates tab 1.
-- **`gui_cleanup(...)`**: Deallocates graphics contexts, fonts, pixmaps, and closes the X11 display.
-- **`gui_create_tab(...)`**: Instantiates a new independent tab with its own working directory, scrollback, and shell context.
-- **`gui_close_tab(...)`**: Closes a tab, terminates any running child process group via `SIGTERM`, cleans up pipes, and shifts the tab array.
+- **`gui_init(...)`**: Initializes the X11 connection, creates top-level window, loads monospace fonts, initializes double-buffering pixmap, stores `use_process_mode`, and creates tab 1.
+- **`gui_cleanup(...)`**: Closes all active tabs (joining threads in Thread Mode, terminating child processes in Process Mode), deallocates graphics contexts, fonts, pixmaps, and closes the X11 display.
+- **`gui_create_tab(...)`**: Instantiates a new tab with its own working directory, scrollback, and shell context. In Thread Mode, spawns `tab_worker_thread` using `pthread_create`. In Process Mode, forks a child process running `tab_process_main` with dedicated communication pipes (`to_tab_fd` and `out_pipe_fd`).
+- **`tab_worker_thread(...)`**: Entry point for per-tab worker threads in Thread Mode. Handles asynchronous tab operations without blocking the GUI.
+- **`tab_process_main(...)`**: Entry point for per-tab child processes in Process Mode. Closes X11 display handle, reads commands from incoming pipe, executes them, emits `[CWD]` state updates, and forwards stdout/stderr through the outgoing pipe.
+- **`gui_close_tab(...)`**: Closes a tab, cancels/joins thread or sends `SIGTERM` to child process group, closes IPC pipes, and shifts the tab array.
 - **`gui_switch_tab(...)`**: Switches active view to a selected tab index and resets scroll offset.
 - **`tab_append_output(...)`**: Streams incoming text into the tab buffer. Enforces line breaks so output never shares the prompt line.
-- **`tab_submit_command(...)`**: Submits typed input for execution. Handles multiline accumulation, built-in execution (`cd`, `exit`, `clear`, `jobs`, `fg`, `bg`), and background/foreground external process launching.
-- **`gui_handle_key_press(...)`**: Central X11 keyboard handler. Translates keys into editing actions, history browsing, tab switching, or character insertion.
+- **`tab_submit_command(...)`**: Submits typed input for execution. Records command to `history_add`. In Thread Mode, executes command via `shell_execute_pipeline` or built-ins. In Process Mode, writes command to child process pipe `tab->to_tab_fd`.
+- **`gui_handle_key_press(...)`**: Central X11 keyboard handler. Translates keys into editing actions, history browsing via `history_get_relative`, tab switching, or character insertion.
 - **`gui_handle_button_press(...)`**: Handles mouse clicks on tabs, the `[ + ]` button, and mouse wheel scrolling (buttons 4 and 5).
 - **`gui_redraw(...)`**: Paints the entire terminal display into the back buffer (tab bar, scrollback text, prompt, active input, cursor, scrollbar) and blits to the window.
 - **`gui_run_loop(...)`**: Main application loop. Multiplexes X11 events with non-blocking pipe reads from child processes and background jobs.
@@ -205,7 +220,7 @@ Orchestrates process creation, pipeline plumbing, and redirection application.
 ### 4.5 `src/builtins.c` (Shell Built-in Implementations)
 Implements core internal shell commands that manipulate shell state.
 
-- **`is_builtin_command(...)`**: Returns 1 if a command name is handled internally (`cd`, `exit`, `clear`, `multiWatch`, `jobs`, `fg`, `bg`).
+- **`is_builtin_command(...)`**: Returns 1 if a command name is handled internally (`cd`, `exit`, `clear`, `multiWatch`, `jobs`, `fg`, `bg`, `history`).
 - **`execute_builtin(...)`**: Dispatches a command to its corresponding builtin implementation function.
 - **`builtin_cd(...)`**: Changes current directory with tilde (`~`) support and updates `ctx->cwd`.
 - **`builtin_exit(...)`**: Sets `ctx->should_exit = 1` with an optional exit status argument.
@@ -213,6 +228,19 @@ Implements core internal shell commands that manipulate shell state.
 - **`builtin_jobs(...)`**: Formats and prints active background and stopped jobs.
 - **`builtin_bg(...)`**: Sends `SIGCONT` to resume a stopped job in the background.
 - **`builtin_fg(...)`**: Brings a specified background job to the foreground.
+- **`builtin_history(...)`**: Prints enumerated command history from shared history buffer, supporting optional numeric count limit (`history [n]`).
+
+---
+
+### 4.9 `src/history.c` (Cross-Tab Shared Command History)
+Provides thread-safe and process-safe synchronized command history across all tabs.
+
+- **`history_init(int use_process_mode)`**: Allocates and initializes the `SharedHistory` buffer. In Thread Mode, allocates heap memory with a POSIX semaphore (`sem_init(&sem, 0, 1)`). In Process Mode, creates POSIX shared memory (`shm_open("/terminator_shm_<pid>")`, `ftruncate`, `mmap`) with a process-shared semaphore (`sem_init(&sem, 1, 1)`).
+- **`history_cleanup(void)`**: Destroys the semaphore, detaches memory (`munmap` / `free`), and in Process Mode unlinks the shared memory segment (`shm_unlink`).
+- **`history_add(const char *cmd)`**: Thread/process-safely appends a command string into the ring buffer, ignoring empty inputs and consecutive duplicates.
+- **`history_get_relative(int offset, char *out_buf, size_t max_len)`**: Retrieves an entry relative to the end of history (`offset = 1` is most recent) for Up/Down arrow key browsing.
+- **`history_count(void)`**: Returns total number of stored history commands.
+- **`history_format_recent(int max_entries, char *out_buf, size_t max_len)`**: Formats recent history entries with standard bash numbering (`    1  echo hello\n    2  ls`) for the `history` built-in command.
 
 ---
 
@@ -277,14 +305,28 @@ typedef struct {
     int out_pipe_fd;
     int is_multiline;
     char multiline_accum[MAX_LINE_CHARS * 4];
-    char history[MAX_TAB_HISTORY][MAX_LINE_CHARS];
-    int history_count;
     int history_pos;
     char saved_input[MAX_LINE_CHARS];
+
+    /* Thread & Process Mode execution handles */
+    pthread_t worker_thread;  /* Dedicated worker thread in Thread Mode */
+    int is_thread_alive;
+    pid_t tab_pid;            /* Dedicated child process PID in Process Mode */
+    int to_tab_fd;            /* Pipe write-end to send commands to child */
 } Tab;
 ```
 
-### 5.2 `Pipeline` and `Command` (`include/shell.h`)
+### 5.2 `SharedHistory` (`include/history.h`)
+```c
+typedef struct {
+    sem_t sem;                                          /* Process or thread-shared semaphore */
+    int head;                                           /* Next insert index */
+    int count;                                          /* Total commands currently stored */
+    char commands[MAX_SHARED_HISTORY][MAX_LINE_CHARS];  /* Ring buffer of up to 10,000 commands */
+} SharedHistory;
+```
+
+### 5.3 `Pipeline` and `Command` (`include/shell.h`)
 ```c
 typedef struct {
     char **argv;        /* Null-terminated argument vector */
@@ -300,7 +342,7 @@ typedef struct {
 } Pipeline;
 ```
 
-### 5.3 `Job` and `JobTable` (`include/jobs.h`)
+### 5.4 `Job` and `JobTable` (`include/jobs.h`)
 ```c
 typedef enum {
     JOB_STATE_RUNNING,
@@ -325,6 +367,8 @@ typedef struct {
 
 | Test Suite | File | Functionality Verified |
 | :--- | :--- | :--- |
+| **Dual Modes & Shared History** | `tests/test_modes_and_history.py` | Thread Mode vs Process Mode startup banners, `history` built-in, shared history across CLI and modes. |
+| **Tab Isolation & Concurrency** | `tests/test_tabs_thread_process.c` | True `pthread_t` per tab, child process `fork()` per tab, independent `cwd`, shared history, fault isolation. |
 | **Basic Pipeline & Shell** | `tests/test_step1.sh` | Command dispatch, `$?`, 2-command pipelines, `<` and `>` redirections, built-ins (`cd`, `exit`). |
 | **Multiline & Quoting** | `tests/test_multiline.sh` | `\<newline>` continuations, multiline quotes, nested `$(...)` command substitutions, variable expansions. |
 | **Parallel Monitor** | `tests/test_multiwatch_exec.py` | `multiWatch` syntax variants, parallel execution, 2s monotonic timer, stdout capture. |

@@ -1,6 +1,7 @@
 #include "gui.h"
 #include "parser.h"
 #include "builtins.h"
+#include "history.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -11,6 +12,7 @@
 #include <errno.h>
 #include <ctype.h>
 #include <sys/wait.h>
+#include <pthread.h>
 #include <X11/Xatom.h>
 
 #define PROMPT_STRING "user@terminator> "
@@ -100,17 +102,6 @@ static void tab_record_prompt_input(GuiApp *app, Tab *tab, const char *prompt, i
     }
 }
 
-static void tab_add_history(Tab *tab, const char *cmd) {
-    if (!cmd || cmd[0] == '\0') return;
-    if (tab->history_count > 0 && strcmp(tab->history[tab->history_count - 1], cmd) == 0) return;
-    if (tab->history_count < MAX_TAB_HISTORY) {
-        snprintf(tab->history[tab->history_count++], sizeof(tab->history[0]), "%s", cmd);
-    } else {
-        memmove(&tab->history[0], &tab->history[1], sizeof(tab->history[0]) * (MAX_TAB_HISTORY - 1));
-        snprintf(tab->history[MAX_TAB_HISTORY - 1], sizeof(tab->history[0]), "%s", cmd);
-    }
-}
-
 static void tab_insert_char(Tab *tab, char c) {
     if (tab->input_len < MAX_LINE_CHARS - 2) {
         memmove(&tab->input_buffer[tab->cursor_pos + 1],
@@ -138,9 +129,119 @@ static void tab_delete_range(Tab *tab, int start, int end) {
 /*                         Core GUI Lifecycle                                */
 /* ========================================================================= */
 
-int gui_init(GuiApp *app, int width, int height, const char *title) {
+static void *tab_worker_thread(void *arg) {
+    Tab *tab = (Tab *)arg;
+    while (tab && tab->is_thread_alive) {
+        usleep(100000); /* 100ms idle heartbeat; tab thread lives for tab duration */
+    }
+    return NULL;
+}
+
+static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
+    char cmd_line[MAX_LINE_CHARS * 4];
+    FILE *in_fp = fdopen(in_fd, "r");
+    if (!in_fp) _exit(1);
+
+    while (fgets(cmd_line, sizeof(cmd_line), in_fp) != NULL) {
+        size_t len = strlen(cmd_line);
+        while (len > 0 && (cmd_line[len - 1] == '\n' || cmd_line[len - 1] == '\r')) {
+            cmd_line[--len] = '\0';
+        }
+        if (len == 0) continue;
+
+        if (strcmp(cmd_line, "exit") == 0) {
+            break;
+        }
+
+        history_add(cmd_line);
+
+        Pipeline pipeline;
+        if (parse_line(cmd_line, &tab->shell_ctx, &pipeline) != 0) {
+            const char *syn_err = "terminator: syntax error\n";
+            if (write(out_fd, syn_err, strlen(syn_err)) < 0) {}
+            continue;
+        }
+
+        if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
+            Command *cmd = &pipeline.commands[0];
+            if (strcmp(cmd->argv[0], "cd") == 0) {
+                int status = execute_builtin(&tab->shell_ctx, cmd);
+                if (status != 0) {
+                    char err[256];
+                    snprintf(err, sizeof(err), "terminator: cd: %s: No such file or directory\n",
+                             cmd->argv[1] ? cmd->argv[1] : "");
+                    if (write(out_fd, err, strlen(err)) < 0) {}
+                } else {
+                    if (getcwd(tab->cwd, sizeof(tab->cwd))) {
+                        char cwd_msg[PATH_MAX + 16];
+                        snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
+                        if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
+                    }
+                }
+            } else if (strcmp(cmd->argv[0], "history") == 0) {
+                char hist_buf[65536];
+                int n = history_format_recent(hist_buf, sizeof(hist_buf), 1000);
+                if (n > 0) {
+                    if (write(out_fd, hist_buf, n) < 0) {}
+                }
+            } else {
+                int save_out = dup(STDOUT_FILENO);
+                int save_err = dup(STDERR_FILENO);
+                dup2(out_fd, STDOUT_FILENO);
+                dup2(out_fd, STDERR_FILENO);
+                execute_builtin(&tab->shell_ctx, cmd);
+                fflush(stdout);
+                fflush(stderr);
+                dup2(save_out, STDOUT_FILENO);
+                dup2(save_err, STDERR_FILENO);
+                close(save_out);
+                close(save_err);
+            }
+            free_pipeline(&pipeline);
+            continue;
+        }
+
+        /* External pipeline execution */
+        pid_t pid = fork();
+        if (pid == 0) {
+            setpgid(0, 0);
+            dup2(out_fd, STDOUT_FILENO);
+            dup2(out_fd, STDERR_FILENO);
+            close(in_fd);
+            close(out_fd);
+
+            if (pipeline.num_commands == 1) {
+                Command *c = &pipeline.commands[0];
+                if (setup_redirections(c->input_file, c->output_file) != 0) _exit(1);
+                execvp(c->argv[0], c->argv);
+                fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
+                _exit(127);
+            }
+
+            Pipeline exec_pl = pipeline;
+            exec_pl.is_background = 0;
+            int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
+            _exit(ret);
+        }
+
+        if (pipeline.is_background) {
+            char launch_msg[128];
+            snprintf(launch_msg, sizeof(launch_msg), "[bg] %d\n", (int)pid);
+            if (write(out_fd, launch_msg, strlen(launch_msg)) < 0) {}
+        } else {
+            int status = 0;
+            waitpid(pid, &status, 0);
+            tab->shell_ctx.last_exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        }
+        free_pipeline(&pipeline);
+    }
+    _exit(0);
+}
+
+int gui_init(GuiApp *app, int width, int height, const char *title, int use_process_mode) {
     if (!app) return -1;
     memset(app, 0, sizeof(GuiApp));
+    app->use_process_mode = use_process_mode;
 
     app->display = XOpenDisplay(NULL);
     if (!app->display) app->display = XOpenDisplay(":0");
@@ -229,10 +330,25 @@ void gui_cleanup(GuiApp *app) {
         Tab *tab = app->tabs[i];
         if (tab) {
             if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
-            if (tab->running_pid > 0) {
-                pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
-                kill(-pg, SIGTERM);
-                kill(tab->running_pid, SIGTERM);
+            if (tab->to_tab_fd >= 0) close(tab->to_tab_fd);
+
+            if (tab->use_process_mode) {
+                if (tab->tab_pid > 0) {
+                    kill(-tab->tab_pid, SIGTERM);
+                    kill(tab->tab_pid, SIGTERM);
+                    waitpid(tab->tab_pid, NULL, WNOHANG);
+                }
+            } else {
+                if (tab->is_thread_alive) {
+                    tab->is_thread_alive = 0;
+                    pthread_cancel(tab->worker_thread);
+                    pthread_join(tab->worker_thread, NULL);
+                }
+                if (tab->running_pid > 0) {
+                    pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+                    kill(-pg, SIGTERM);
+                    kill(tab->running_pid, SIGTERM);
+                }
             }
             jobs_kill_all(&tab->shell_ctx.job_table);
             free(tab);
@@ -265,7 +381,9 @@ int gui_create_tab(GuiApp *app, const char *initial_cwd) {
     memset(tab, 0, sizeof(Tab));
 
     tab->tab_id = app->num_tabs + 1;
+    tab->use_process_mode = app->use_process_mode;
     tab->out_pipe_fd = -1;
+    tab->to_tab_fd = -1;
     tab->history_pos = -1;
     shell_init(&tab->shell_ctx);
 
@@ -275,6 +393,51 @@ int gui_create_tab(GuiApp *app, const char *initial_cwd) {
         strncpy(tab->cwd, "/", sizeof(tab->cwd) - 1);
     }
     snprintf(tab->shell_ctx.cwd, sizeof(tab->shell_ctx.cwd), "%s", tab->cwd);
+
+    if (tab->use_process_mode) {
+        /* Process Mode: each tab forks its own process and communicates with GUI via pipes */
+        int gui_to_tab[2];
+        int tab_to_gui[2];
+        if (pipe(gui_to_tab) < 0 || pipe(tab_to_gui) < 0) {
+            perror("terminator: pipe failed for Process Mode tab");
+            free(tab);
+            return -1;
+        }
+
+        pid_t pid = fork();
+        if (pid < 0) {
+            perror("terminator: fork failed for Process Mode tab");
+            close(gui_to_tab[0]); close(gui_to_tab[1]);
+            close(tab_to_gui[0]); close(tab_to_gui[1]);
+            free(tab);
+            return -1;
+        }
+
+        if (pid == 0) {
+            setpgid(0, 0);
+            /* GUI is the only part that touches X11 */
+            if (app->display) {
+                XCloseDisplay(app->display);
+                app->display = NULL;
+            }
+            close(gui_to_tab[1]);
+            close(tab_to_gui[0]);
+            tab_process_main(tab, gui_to_tab[0], tab_to_gui[1]);
+            _exit(0);
+        }
+
+        close(gui_to_tab[0]);
+        close(tab_to_gui[1]);
+        tab->tab_pid = pid;
+        tab->to_tab_fd = gui_to_tab[1];
+        tab->out_pipe_fd = tab_to_gui[0];
+        int flags = fcntl(tab->out_pipe_fd, F_GETFL, 0);
+        fcntl(tab->out_pipe_fd, F_SETFL, flags | O_NONBLOCK);
+    } else {
+        /* Thread Mode: each tab is a dedicated POSIX thread */
+        tab->is_thread_alive = 1;
+        pthread_create(&tab->worker_thread, NULL, tab_worker_thread, tab);
+    }
 
     int new_idx = app->num_tabs;
     app->tabs[new_idx] = tab;
@@ -288,10 +451,25 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
 
     Tab *tab = app->tabs[tab_idx];
     if (tab->out_pipe_fd >= 0) close(tab->out_pipe_fd);
-    if (tab->running_pid > 0) {
-        pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
-        kill(-pg, SIGTERM);
-        kill(tab->running_pid, SIGTERM);
+    if (tab->to_tab_fd >= 0) close(tab->to_tab_fd);
+
+    if (tab->use_process_mode) {
+        if (tab->tab_pid > 0) {
+            kill(-tab->tab_pid, SIGTERM);
+            kill(tab->tab_pid, SIGTERM);
+            waitpid(tab->tab_pid, NULL, WNOHANG);
+        }
+    } else {
+        if (tab->is_thread_alive) {
+            tab->is_thread_alive = 0;
+            pthread_cancel(tab->worker_thread);
+            pthread_join(tab->worker_thread, NULL);
+        }
+        if (tab->running_pid > 0) {
+            pid_t pg = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+            kill(-pg, SIGTERM);
+            kill(tab->running_pid, SIGTERM);
+        }
     }
     jobs_kill_all(&tab->shell_ctx.job_table);
     free(tab);
@@ -369,7 +547,6 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         snprintf(tab->multiline_accum + acc_len, sizeof(tab->multiline_accum) - acc_len, "\n%s", tab->input_buffer);
     }
 
-    tab_add_history(tab, tab->input_buffer);
     tab->input_buffer[0] = '\0';
     tab->input_len = 0;
     tab->cursor_pos = 0;
@@ -386,6 +563,16 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     snprintf(cmd_str, sizeof(cmd_str), "%s", tab->multiline_accum);
     tab->multiline_accum[0] = '\0';
 
+    history_add(cmd_str);
+
+    if (tab->use_process_mode) {
+        if (tab->to_tab_fd >= 0) {
+            if (write(tab->to_tab_fd, cmd_str, strlen(cmd_str)) < 0) {}
+            if (write(tab->to_tab_fd, "\n", 1) < 0) {}
+        }
+        return;
+    }
+
     Pipeline pipeline;
     if (parse_line(cmd_str, &tab->shell_ctx, &pipeline) != 0) {
         tab_append_output(tab, "terminator: syntax error\n", 25);
@@ -397,6 +584,13 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         if (strcmp(cmd->argv[0], "exit") == 0) {
             free_pipeline(&pipeline);
             gui_close_tab(app, app->active_tab_idx);
+            return;
+        } else if (strcmp(cmd->argv[0], "history") == 0) {
+            char hist_buf[65536];
+            int n = history_format_recent(hist_buf, sizeof(hist_buf), 1000);
+            if (n > 0) tab_append_output(tab, hist_buf, n);
+            free_pipeline(&pipeline);
+            gui_redraw(app);
             return;
         } else if (strcmp(cmd->argv[0], "cd") == 0) {
             int status = execute_builtin(&tab->shell_ctx, cmd);
@@ -721,18 +915,22 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                     gui_redraw(app);
                     return;
                 }
-                if (tab->history_count > 0) {
+                int h_count = history_count();
+                if (h_count > 0) {
                     if (tab->history_pos == -1) {
                         snprintf(tab->saved_input, sizeof(tab->saved_input), "%s", tab->input_buffer);
-                        tab->history_pos = tab->history_count - 1;
-                    } else if (tab->history_pos > 0) {
-                        tab->history_pos--;
+                        tab->history_pos = 0;
+                    } else if (tab->history_pos + 1 < h_count) {
+                        tab->history_pos++;
                     }
-                    snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->history[tab->history_pos]);
-                    tab->input_len = (int)strlen(tab->input_buffer);
-                    tab->cursor_pos = tab->input_len;
-                    gui_redraw(app);
-                    return;
+                    char h_cmd[MAX_LINE_CHARS];
+                    if (history_get_relative(tab->history_pos, h_cmd, sizeof(h_cmd)) == 0) {
+                        snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", h_cmd);
+                        tab->input_len = (int)strlen(tab->input_buffer);
+                        tab->cursor_pos = tab->input_len;
+                        gui_redraw(app);
+                        return;
+                    }
                 }
                 break;
             case HOTKEY_HISTORY_NEXT:
@@ -748,9 +946,12 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                     }
                 }
                 if (tab->history_pos >= 0) {
-                    if (tab->history_pos < tab->history_count - 1) {
-                        tab->history_pos++;
-                        snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->history[tab->history_pos]);
+                    if (tab->history_pos > 0) {
+                        tab->history_pos--;
+                        char h_cmd[MAX_LINE_CHARS];
+                        if (history_get_relative(tab->history_pos, h_cmd, sizeof(h_cmd)) == 0) {
+                            snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", h_cmd);
+                        }
                     } else {
                         tab->history_pos = -1;
                         snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", tab->saved_input);
@@ -1121,7 +1322,19 @@ void gui_run_loop(GuiApp *app) {
                 ssize_t n = read(fds[i].fd, buf, sizeof(buf));
 
                 if (n > 0) {
-                    tab_append_output(t, buf, (int)n);
+                    if (t->use_process_mode && strncmp(buf, "[CWD]", 5) == 0) {
+                        char *nl = strchr(buf, '\n');
+                        if (nl) {
+                            *nl = '\0';
+                            strncpy(t->cwd, buf + 5, sizeof(t->cwd) - 1);
+                            t->cwd[sizeof(t->cwd) - 1] = '\0';
+                            if (nl + 1 < buf + n) {
+                                tab_append_output(t, nl + 1, (int)(n - (nl + 1 - buf)));
+                            }
+                        }
+                    } else {
+                        tab_append_output(t, buf, (int)n);
+                    }
                     if (t_idx == app->active_tab_idx) needs_redraw = 1;
                 } else if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK)) {
                     if (poll_is_bg[i]) {
@@ -1129,18 +1342,29 @@ void gui_run_loop(GuiApp *app) {
                         Job *bj = jobs_find_by_id(&t->shell_ctx.job_table, poll_job_id[i]);
                         if (bj) bj->out_pipe_fd = -1;
                     } else {
-                        close(t->out_pipe_fd);
-                        t->out_pipe_fd = -1;
+                        if (t->use_process_mode) {
+                            if (t->tab_pid > 0) {
+                                waitpid(t->tab_pid, NULL, WNOHANG);
+                                t->tab_pid = 0;
+                            }
+                            close(t->out_pipe_fd);
+                            t->out_pipe_fd = -1;
+                            if (t->to_tab_fd >= 0) { close(t->to_tab_fd); t->to_tab_fd = -1; }
+                            tab_append_output(t, "\n[Tab process closed]\n", 22);
+                        } else {
+                            close(t->out_pipe_fd);
+                            t->out_pipe_fd = -1;
 
-                        int status = 0;
-                        waitpid(t->running_pid, &status, WNOHANG);
-                        if (WIFEXITED(status)) t->shell_ctx.last_exit_status = WEXITSTATUS(status);
-                        else if (WIFSIGNALED(status)) t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
+                            int status = 0;
+                            waitpid(t->running_pid, &status, WNOHANG);
+                            if (WIFEXITED(status)) t->shell_ctx.last_exit_status = WEXITSTATUS(status);
+                            else if (WIFSIGNALED(status)) t->shell_ctx.last_exit_status = 128 + WTERMSIG(status);
 
-                        t->is_running_cmd = 0;
-                        t->running_pid = 0;
-                        t->running_pgid = 0;
-                        t->running_cmd[0] = '\0';
+                            t->is_running_cmd = 0;
+                            t->running_pid = 0;
+                            t->running_pgid = 0;
+                            t->running_cmd[0] = '\0';
+                        }
                         if (t_idx == app->active_tab_idx) needs_redraw = 1;
                     }
                 }

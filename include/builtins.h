@@ -97,4 +97,13 @@ int builtin_bg(ShellContext *ctx, char **argv);
  */
 int builtin_fg(ShellContext *ctx, char **argv);
 
+/**
+ * @brief Built-in command: Displays the recent shared command history ('history').
+ *
+ * @param[in,out] ctx Pointer to active ShellContext.
+ * @param[in] argv Argument array.
+ * @return 0 on success.
+ */
+int builtin_history(ShellContext *ctx, char **argv);
+
 #endif /* BUILTINS_H */

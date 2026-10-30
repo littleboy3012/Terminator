@@ -1,5 +1,6 @@
 #include "builtins.h"
 #include "multiwatch.h"
+#include "history.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -23,7 +24,7 @@ int is_builtin_command(const char *name) {
     if (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
         strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0 ||
         strcmp(name, "jobs") == 0 || strcmp(name, "fg") == 0 ||
-        strcmp(name, "bg") == 0) {
+        strcmp(name, "bg") == 0 || strcmp(name, "history") == 0) {
         return 1;
     }
 
@@ -60,9 +61,22 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
         return builtin_bg(ctx, cmd->argv);
     } else if (strcmp(cmd->argv[0], "fg") == 0) {
         return builtin_fg(ctx, cmd->argv);
+    } else if (strcmp(cmd->argv[0], "history") == 0) {
+        return builtin_history(ctx, cmd->argv);
     }
 
     return 1;
+}
+
+int builtin_history(ShellContext *ctx, char **argv) {
+    (void)ctx;
+    (void)argv;
+    char hist_buf[65536];
+    int n = history_format_recent(hist_buf, sizeof(hist_buf), 1000);
+    if (n > 0) {
+        if (write(STDOUT_FILENO, hist_buf, n) < 0) {}
+    }
+    return 0;
 }
 
 /**

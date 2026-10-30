@@ -23,7 +23,8 @@ SRCS = $(SRC_DIR)/main.c \
        $(SRC_DIR)/gui.c \
        $(SRC_DIR)/hotkeys.c \
        $(SRC_DIR)/multiwatch.c \
-       $(SRC_DIR)/jobs.c
+       $(SRC_DIR)/jobs.c \
+       $(SRC_DIR)/history.c
 
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 

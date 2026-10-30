@@ -7,6 +7,7 @@
 #include "parser.h"
 #include "gui.h"
 #include "hotkeys.h"
+#include "history.h"
 #include "jobs.h"
 
 #define MAX_LINE_LEN 4096
@@ -108,6 +109,8 @@ static int run_cli_mode(ShellContext *ctx) {
             continue;
         }
 
+        history_add(accum);
+
         /* Execute the parsed pipeline */
         shell_execute_pipeline(ctx, &pipeline);
 
@@ -149,7 +152,9 @@ int main(int argc, char *argv[]) {
     } else {
         printf("[Terminator] Mode: Thread Mode (default)\n");
     }
-    (void)use_process_mode;
+
+    /* Initialize shared history in requested mode (Thread vs Process mode) */
+    history_init(use_process_mode);
 
     /* Ensure ~/.terminatorrc exists and custom hotkeys are loaded */
     HotkeyConfig dummy_hk;
@@ -160,23 +165,27 @@ int main(int argc, char *argv[]) {
         ShellContext ctx;
         if (shell_init(&ctx) != 0) {
             fprintf(stderr, "terminator: failed to initialize shell context\n");
+            history_cleanup();
             return 1;
         }
         int status = run_cli_mode(&ctx);
         shell_cleanup(&ctx);
+        history_cleanup();
         return status;
     }
 
     /* Otherwise, launch the full X11 Graphical User Interface */
     GuiApp app;
-    if (gui_init(&app, 900, 600, "Terminator [Hacker Shell]") != 0) {
+    if (gui_init(&app, 900, 600, "Terminator [Hacker Shell]", use_process_mode) != 0) {
         fprintf(stderr, "terminator: X11 GUI initialization failed; falling back to CLI mode.\n");
         ShellContext ctx;
         if (shell_init(&ctx) != 0) {
+            history_cleanup();
             return 1;
         }
         int status = run_cli_mode(&ctx);
         shell_cleanup(&ctx);
+        history_cleanup();
         return status;
     }
 
@@ -185,6 +194,7 @@ int main(int argc, char *argv[]) {
 
     /* Free all X11 resources upon window closure */
     gui_cleanup(&app);
+    history_cleanup();
 
     return 0;
 }

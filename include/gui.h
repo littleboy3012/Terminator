@@ -6,8 +6,10 @@
 #include <X11/keysym.h>
 #include <sys/types.h>
 #include <limits.h>
+#include <pthread.h>
 #include "shell.h"
 #include "hotkeys.h"
+#include "history.h"
 
 #define MAX_TABS 16
 #define MAX_LINE_CHARS 1024
@@ -44,6 +46,11 @@ typedef struct {
  */
 typedef struct {
     int tab_id;                             /**< Unique numeric identifier for this tab (1-indexed) */
+    int use_process_mode;                   /**< 0 = Thread Mode (worker thread), 1 = Process Mode (child process) */
+    pthread_t worker_thread;                /**< POSIX worker thread handle (Thread Mode) */
+    pid_t tab_pid;                          /**< Dedicated child process PID (Process Mode) */
+    int to_tab_fd;                          /**< Pipe write descriptor (GUI -> Tab) */
+    int is_thread_alive;                    /**< 1 if worker thread is actively running */
     char cwd[PATH_MAX];                     /**< Tab's current working directory */
     TermLine lines[MAX_BUFFER_LINES];       /**< Scrollback line buffer */
     int num_lines;                          /**< Total number of lines currently stored in buffer */
@@ -59,8 +66,6 @@ typedef struct {
     int out_pipe_fd;                        /**< Read end of the pipe capturing stdout/stderr from child process */
     int is_multiline;                       /**< Non-zero if currently reading multiline continuation input ('> ') */
     char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */
-    char history[MAX_TAB_HISTORY][MAX_LINE_CHARS]; /**< Command history ring buffer for this tab */
-    int history_count;                      /**< Number of recorded commands in history */
     int history_pos;                        /**< Active position when browsing history (-1 when at bottom prompt) */
     char saved_input[MAX_LINE_CHARS];       /**< Preserves in-progress typed text when browsing history */
 } Tab;
@@ -108,6 +113,7 @@ typedef struct {
     int clipboard_len;       /**< Length of active clipboard content */
 
     int is_running;          /**< Application loop flag (1 = running, 0 = exit application) */
+    int use_process_mode;    /**< 0 = Thread Mode (default), 1 = Process Mode (useProcess=True) */
 } GuiApp;
 
 /**
@@ -117,9 +123,10 @@ typedef struct {
  * @param[in] width Initial window width in pixels.
  * @param[in] height Initial window height in pixels.
  * @param[in] title Window title string displayed on titlebar.
+ * @param[in] use_process_mode 0 for Thread Mode, 1 for Process Mode.
  * @return 0 on success, or -1 on initialization failure (e.g. Cannot open X display).
  */
-int gui_init(GuiApp *app, int width, int height, const char *title);
+int gui_init(GuiApp *app, int width, int height, const char *title, int use_process_mode);
 
 /**
  * @brief Frees all X11 resources, closed tabs, GCs, pixmaps, and closes connection to X server.
