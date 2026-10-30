@@ -6,8 +6,9 @@
 #include <unistd.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <glob.h>
 
-#define MAX_ARGS 128
+#define MAX_ARGS 1024
 #define MAX_TOKEN_LEN 4096
 
 /**
@@ -256,33 +257,79 @@ static void handle_backtick(const char **p_ptr, const ShellContext *ctx,
  * @brief Helper to handle $VAR or $(...) expansion.
  */
 static void handle_dollar_var(const char **p_ptr, const ShellContext *ctx,
-                              char *token, int *token_len) {
+                              char *token, int *token_len, int *has_wildcard) {
     int consumed = 0;
     char exp_buf[MAX_TOKEN_LEN];
     int exp_len = expand_variable(*p_ptr, exp_buf, sizeof(exp_buf), ctx, &consumed);
     append_token_str(token, token_len, exp_buf, exp_len);
+    if (has_wildcard && strpbrk(exp_buf, "*?[")) {
+        *has_wildcard = 1;
+    }
     *p_ptr += consumed;
 }
 
 /**
  * @brief Flushes accumulated token into argv or redirection target.
+ *
+ * Performs pathname expansion (globbing) on unquoted wildcards (*, ?, [) and tildes (~).
  */
-static void flush_token(char *token, int *token_len, int *in_token,
-                        int *next_in, int *next_out,
-                        Command *cmd, char **argv_list, int *argc) {
-    if (!*in_token) return;
+static int flush_token(char *token, int *token_len, int *in_token,
+                       int *has_wildcard, int *next_in, int *next_out,
+                       Command *cmd, char **argv_list, int *argc) {
+    if (!*in_token) return 0;
     token[*token_len] = '\0';
-    if (*next_in) {
-        cmd->input_file = strdup(token);
-        *next_in = 0;
-    } else if (*next_out) {
-        cmd->output_file = strdup(token);
-        *next_out = 0;
-    } else if (*argc < MAX_ARGS - 1) {
-        argv_list[(*argc)++] = strdup(token);
+
+    if (*next_in || *next_out) {
+        char *target = NULL;
+        if (*has_wildcard) {
+            glob_t g;
+            if (glob(token, GLOB_TILDE, NULL, &g) == 0) {
+                if (g.gl_pathc == 1) {
+                    target = strdup(g.gl_pathv[0]);
+                } else if (g.gl_pathc > 1) {
+                    fprintf(stderr, "terminator: %s: ambiguous redirect\n", token);
+                    globfree(&g);
+                    return -1;
+                }
+                globfree(&g);
+            }
+        }
+        if (!target) {
+            target = strdup(token);
+        }
+
+        if (*next_in) {
+            cmd->input_file = target;
+            *next_in = 0;
+        } else {
+            cmd->output_file = target;
+            *next_out = 0;
+        }
+    } else {
+        if (*has_wildcard) {
+            glob_t g;
+            int ret = glob(token, GLOB_NOCHECK | GLOB_TILDE, NULL, &g);
+            if (ret == 0) {
+                for (size_t i = 0; i < g.gl_pathc && *argc < MAX_ARGS - 1; i++) {
+                    argv_list[(*argc)++] = strdup(g.gl_pathv[i]);
+                }
+                globfree(&g);
+            } else {
+                if (*argc < MAX_ARGS - 1) {
+                    argv_list[(*argc)++] = strdup(token);
+                }
+            }
+        } else {
+            if (*argc < MAX_ARGS - 1) {
+                argv_list[(*argc)++] = strdup(token);
+            }
+        }
     }
+
     *token_len = 0;
     *in_token = 0;
+    *has_wildcard = 0;
+    return 0;
 }
 
 /**
@@ -296,12 +343,17 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
 
     int argc = 0, token_len = 0, in_token = 0;
     int next_in = 0, next_out = 0;
+    int has_wildcard = 0;
     char token[MAX_TOKEN_LEN];
     const char *p = cmd_segment;
 
     while (*p) {
         if (isspace((unsigned char)*p)) {
-            flush_token(token, &token_len, &in_token, &next_in, &next_out, cmd, argv_list, &argc);
+            if (flush_token(token, &token_len, &in_token, &has_wildcard, &next_in, &next_out, cmd, argv_list, &argc) != 0) {
+                for (int i = 0; i < argc; i++) free(argv_list[i]);
+                free(argv_list);
+                return -1;
+            }
             p++;
             continue;
         }
@@ -349,7 +401,7 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
                 if (*p == '\\' && *(p + 1) == '\n') {
                     p += 2;
                 } else if (*p == '$') {
-                    handle_dollar_var(&p, ctx, token, &token_len);
+                    handle_dollar_var(&p, ctx, token, &token_len, NULL);
                 } else if (*p == '`') {
                     handle_backtick(&p, ctx, token, &token_len);
                 } else if (*p == '\\' && *(p + 1) != '\0') {
@@ -367,11 +419,17 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
         /* Unquoted character */
         in_token = 1;
         if (*p == '$') {
-            handle_dollar_var(&p, ctx, token, &token_len);
+            handle_dollar_var(&p, ctx, token, &token_len, &has_wildcard);
             continue;
         }
         if (*p == '\\' && *(p + 1) != '\0') {
             p++;
+        } else {
+            if (*p == '*' || *p == '?' || *p == '[') {
+                has_wildcard = 1;
+            } else if (*p == '~' && token_len == 0) {
+                has_wildcard = 1;
+            }
         }
         if (token_len < MAX_TOKEN_LEN - 1) {
             token[token_len++] = *p;
@@ -379,7 +437,11 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
         p++;
     }
 
-    flush_token(token, &token_len, &in_token, &next_in, &next_out, cmd, argv_list, &argc);
+    if (flush_token(token, &token_len, &in_token, &has_wildcard, &next_in, &next_out, cmd, argv_list, &argc) != 0) {
+        for (int i = 0; i < argc; i++) free(argv_list[i]);
+        free(argv_list);
+        return -1;
+    }
 
     if (next_in || next_out) {
         fprintf(stderr, "terminator: syntax error near unexpected token 'newline'\n");
