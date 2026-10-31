@@ -239,7 +239,7 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
         return 0;
     }
 
-    /* Background execution handling in CLI mode */
+    /* Background execution handling */
     if (pipeline->is_background) {
         pid_t bg_pid = fork();
         if (bg_pid < 0) {

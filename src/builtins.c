@@ -223,7 +223,7 @@ int builtin_clear(ShellContext *ctx, char **argv) {
 }
 
 /**
- * @brief Lists active background and stopped jobs in CLI mode.
+ * @brief Lists active background and stopped jobs.
  */
 int builtin_jobs(ShellContext *ctx, char **argv) {
     if (!ctx) return 1;
@@ -237,7 +237,7 @@ int builtin_jobs(ShellContext *ctx, char **argv) {
 }
 
 /**
- * @brief Resumes a stopped job in the background in CLI mode.
+ * @brief Resumes a stopped job in the background.
  */
 int builtin_bg(ShellContext *ctx, char **argv) {
     if (!ctx) return 1;
@@ -251,7 +251,7 @@ int builtin_bg(ShellContext *ctx, char **argv) {
 }
 
 /**
- * @brief Brings a job to the foreground in CLI mode.
+ * @brief Brings a job to the foreground.
  */
 int builtin_fg(ShellContext *ctx, char **argv) {
     if (!ctx) return 1;

@@ -1,7 +1,7 @@
 #!/bin/bash
 echo "=== Running Multiline & Substitution Tests ==="
 
-./terminator --cli << 'EOF'
+./build/test_shell_runner << 'EOF'
 echo "Line 1 continuation \
 Line 2 of command"
 echo "Unclosed double quotes

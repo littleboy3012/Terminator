@@ -6,7 +6,7 @@ import sys
 def run_test(name, commands, sleep_before_exit=0.3, send_sig=None, sleep_after_sig=0.3):
     print(f"==================== {name} ====================")
     p = subprocess.Popen(
-        ["./terminator", "--cli"],
+        ["./build/test_shell_runner"],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -38,7 +38,7 @@ assert "sleep 10" in out, "Command name not in jobs"
 print(">>> TEST 1 PASSED!\n")
 
 out, _ = run_test("TEST 2: Background completion notification", ["sleep 1 &"], sleep_before_exit=1.2)
-p2 = subprocess.Popen(["./terminator", "--cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p2 = subprocess.Popen(["./build/test_shell_runner"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 p2.stdin.write("sleep 1 &\n")
 p2.stdin.flush()
 time.sleep(1.2)
@@ -54,7 +54,7 @@ assert "Done" in out2, "Done notification not displayed"
 print(">>> TEST 2 PASSED!\n")
 
 # TEST 3: Ctrl+Z (suspend) and jobs
-p3 = subprocess.Popen(["./terminator", "--cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p3 = subprocess.Popen(["./build/test_shell_runner"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 p3.stdin.write("sleep 50\n")
 p3.stdin.flush()
 time.sleep(0.3)
@@ -72,7 +72,7 @@ assert "Stopped" in out3, "Job not marked as Stopped after SIGTSTP"
 print(">>> TEST 3 PASSED!\n")
 
 # TEST 4: bg %1 command
-p4 = subprocess.Popen(["./terminator", "--cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p4 = subprocess.Popen(["./build/test_shell_runner"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 p4.stdin.write("sleep 50\n")
 p4.stdin.flush()
 time.sleep(0.3)
@@ -94,7 +94,7 @@ assert "Running" in out4, "Job not running after bg"
 print(">>> TEST 4 PASSED!\n")
 
 # TEST 5: fg %1 command and Ctrl+C
-p5 = subprocess.Popen(["./terminator", "--cli"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+p5 = subprocess.Popen(["./build/test_shell_runner"], stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 p5.stdin.write("sleep 50 &\n")
 p5.stdin.flush()
 time.sleep(0.2)
@@ -114,4 +114,4 @@ print("TEST 5 OUTPUT:\n" + out5)
 assert "sleep 50 &" not in out5.split("jobs")[-1], "Job was not terminated by SIGINT in foreground"
 print(">>> TEST 5 PASSED!\n")
 
-print("ALL TASK 8 CLI TESTS COMPLETED SUCCESSFULLY!")
+print("ALL TASK 8 TESTS COMPLETED SUCCESSFULLY!")

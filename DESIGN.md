@@ -60,7 +60,7 @@ flowchart TD
 
 | File Name | Header | Role & Responsibility | Core Functions & Key Structs |
 | :--- | :--- | :--- | :--- |
-| `src/main.c` | None | Primary process entry point; CLI argument parsing; headless fallback controller. | `main()`, `run_cli_mode()`, `print_prompt()`, `cli_sig_handler()` |
+| `src/main.c` | None | Primary process entry point; mode flag evaluation (Thread Mode vs Process Mode) and GUI lifecycle controller. | `main()` |
 | `src/gui.c` | `include/gui.h` | X11 window management; double-buffering; tab lifecycle; input editing; event loop. | `gui_init()`, `gui_cleanup()`, `gui_run_loop()`, `gui_redraw()`, `gui_create_tab()`, `gui_close_tab()`, `gui_switch_tab()`, `tab_submit_command()`, `gui_handle_key_press()`, `tab_process_main()`, `tab_worker_thread()`<br>Structs: `GuiApp`, `Tab`, `TermLine` |
 | `src/parser.c` | `include/parser.h` | Lexer, tokenizer, multiline state machine, quote stripper, `$VAR` expander, command substitution, and wildcard globber. | `parse_line()`, `is_command_incomplete()`, `expand_variable()`, `execute_substitution()`, `flush_token()`, `free_pipeline()`, `free_command()`<br>Structs: `Command`, `Pipeline` |
 | `src/shell.c` | `include/shell.h` | Pipeline orchestrator; I/O redirection; external process fork/exec; process group leader. | `shell_init()`, `shell_cleanup()`, `shell_execute_pipeline()`, `shell_execute_command()`, `setup_redirections()`<br>Structs: `ShellContext` |
@@ -86,7 +86,7 @@ sequenceDiagram
     participant Tab as src/gui.c:gui_create_tab()
     participant X11 as Xlib / X Server
 
-    Main->>Main: Parse argv ("useProcess=True", "--cli")
+    Main->>Main: Parse argv ("useProcess=True")
     Main->>Hist: history_init(use_process_mode)
     alt Thread Mode
         Hist->>Hist: malloc(sizeof(SharedHistory)) + sem_init(&sem, 0, 1)
@@ -94,39 +94,34 @@ sequenceDiagram
         Hist->>Hist: shm_open("/terminator_shm_<pid>") + ftruncate + mmap + sem_init(&sem, 1, 1)
     end
     Main->>HK: hotkeys_init(&dummy_hk) (~/.terminatorrc check)
-    alt Headless or Pipe or --cli
-        Main->>Main: run_cli_mode(&ctx)
-    else GUI Mode
-        Main->>GUI: gui_init(&app, 900, 600, "Terminator", use_process_mode)
-        GUI->>X11: XInitThreads() + XOpenDisplay(NULL)
-        GUI->>X11: fcntl(ConnectionNumber(app->display), F_SETFD, FD_CLOEXEC)
-        GUI->>X11: XCreateSimpleWindow() + GCs + XCreatePixmap()
-        GUI->>X11: XInternAtom("WM_DELETE_WINDOW", "CLIPBOARD")
-        GUI->>X11: XMapWindow() + XFlush()
-        GUI->>Tab: gui_create_tab(&app, NULL)
-        alt Thread Mode
-            Tab->>Tab: pthread_create(&tab->worker_thread, NULL, tab_worker_thread, tab)
-        else Process Mode
-            Tab->>Tab: pipe(gui_to_tab) + pipe(tab_to_gui) + fork()
-            Note over Tab: Child tab closes X11 fd and enters tab_process_main()
-        end
-        Main->>GUI: gui_run_loop(&app)
+    Main->>GUI: gui_init(&app, 900, 600, "Terminator", use_process_mode)
+    GUI->>X11: XInitThreads() + XOpenDisplay(NULL)
+    GUI->>X11: fcntl(ConnectionNumber(app->display), F_SETFD, FD_CLOEXEC)
+    GUI->>X11: XCreateSimpleWindow() + GCs + XCreatePixmap()
+    GUI->>X11: XInternAtom("WM_DELETE_WINDOW", "CLIPBOARD")
+    GUI->>X11: XMapWindow() + XFlush()
+    GUI->>Tab: gui_create_tab(&app, NULL)
+    alt Thread Mode
+        Tab->>Tab: pthread_create(&tab->worker_thread, NULL, tab_worker_thread, tab)
+    else Process Mode
+        Tab->>Tab: pipe(gui_to_tab) + pipe(tab_to_gui) + fork()
+        Note over Tab: Child tab closes X11 fd and enters tab_process_main()
     end
+    Main->>GUI: gui_run_loop(&app)
 ```
 
 ### 2.1 Detailed Call Chain Trace
 
 1. **`main.c:main(argc, argv)`**:
-   - Evaluates command-line flags: scans for `useProcess=True` (`use_process_mode = 1`) and `--cli` (`force_cli = 1`).
+   - Evaluates command-line flags: checks for `useProcess=True` to activate Process Mode (`use_process_mode = 1`), or defaults to Thread Mode (`use_process_mode = 0`).
    - Prints startup mode banner: `[Terminator] Mode: Thread Mode (default)` or `[Terminator] Mode: Process Mode (useProcess=True)`.
 2. **`history.c:history_init(use_process_mode)`**:
    - In **Thread Mode** (`use_process_mode == 0`): Allocates heap memory `malloc(sizeof(SharedHistory))`. Initializes thread-shared POSIX semaphore `sem_init(&g_shared_history->sem, 0, 1)`.
    - In **Process Mode** (`use_process_mode == 1`): Formats unique shared memory path `/terminator_shm_<pid>` using `getpid()`. Calls `shm_open(shm_path, O_CREAT | O_RDWR | O_TRUNC, 0666)`, truncates with `ftruncate(fd, sizeof(SharedHistory))`, maps with `mmap(NULL, sizeof(SharedHistory), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0)`, and initializes process-shared semaphore `sem_init(&g_shared_history->sem, 1, 1)`.
 3. **`hotkeys.c:hotkeys_init(&cfg)`**:
    - Resolves `~/.terminatorrc`. If absent, writes default keybinding configuration. Parses custom mappings, executes `check_and_resolve_conflicts()`, and falls back to default bindings if conflicts are found.
-4. **GUI Detection & Fallback**:
-   - Checks `force_cli || !isatty(STDIN_FILENO)`. If true, bypasses X11 and calls `main.c:run_cli_mode(&ctx)`.
-   - Otherwise, invokes `gui.c:gui_init(&app, 900, 600, "Terminator", use_process_mode)`.
+4. **GUI Initialization**:
+   - Invokes `gui.c:gui_init(&app, 900, 600, "Terminator", use_process_mode)`. If the X server connection fails, reports error to stderr and exits with code 1.
 5. **`gui.c:gui_init(app, width, height, title, use_process_mode)`**:
    - Calls `XInitThreads()`.
    - Establishes X11 display connection via `XOpenDisplay(NULL)` (falling back to `:0`).
@@ -583,7 +578,6 @@ sequenceDiagram
 | Task / Command | Entry Function (`File:Func`) | Core Worker Functions (`File:Func`) | Key Data Structures Modified | Helper / Utility Files Used |
 | :--- | :--- | :--- | :--- | :--- |
 | **System Startup** | `src/main.c:main` | `history_init`, `gui_init`, `hotkeys_init`, `gui_create_tab` | `GuiApp`, `SharedHistory`, `HotkeyConfig` | `history.c`, `gui.c`, `hotkeys.c` |
-| **CLI Fallback Mode**| `src/main.c:run_cli_mode` | `parse_line`, `shell_execute_pipeline`, `history_add` | `ShellContext`, `Pipeline` | `parser.c`, `shell.c`, `history.c` |
 | **X11 Event Loop** | `src/gui.c:gui_run_loop` | `poll`, `gui_redraw`, `gui_handle_key_press`, `tab_append_output` | `GuiApp`, `struct pollfd[]` | `gui.c`, `Xlib` |
 | **Double-Buffered Draw**| `src/gui.c:gui_redraw` | `XFillRectangle`, `XDrawString`, `XCopyArea` | `app->back_buffer`, `tab->lines` | `gui.c`, `Xlib` |
 | **Tab Creation** | `src/gui.c:gui_create_tab` | `pthread_create` (Thread) / `fork` + `pipe` (Process) | `app->tabs[]`, `app->num_tabs`, `Tab` | `gui.c`, `pthread`, `unistd` |

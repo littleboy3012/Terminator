@@ -4,7 +4,7 @@ import signal
 import sys
 
 proc = subprocess.Popen(
-    ["./terminator", "--cli"],
+    ["./build/test_shell_runner"],
     stdin=subprocess.PIPE,
     stdout=subprocess.PIPE,
     stderr=subprocess.PIPE,

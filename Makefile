@@ -30,10 +30,15 @@ OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 
 .PHONY: all clean test
 
+TEST_RUNNER = $(BUILD_DIR)/test_shell_runner
+
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+
+$(TEST_RUNNER): tests/test_shell_runner.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -44,7 +49,5 @@ $(BUILD_DIR):
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
 
-# Quick test rule to verify execution in headless environment
-test: $(TARGET)
-	@echo "Testing built-in and external command execution..."
-	./$(TARGET) < /dev/null
+test: $(TARGET) $(TEST_RUNNER)
+	python3 tests/test_modes_and_history.py

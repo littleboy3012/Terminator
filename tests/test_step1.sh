@@ -1,7 +1,7 @@
 echo "=== Running Terminator Step 1 Functional Tests ==="
 
 set +e
-./terminator << 'EOF'
+./build/test_shell_runner << 'EOF'
 echo Hello from Terminator shell
 ls -d include src Makefile
 notacommand
