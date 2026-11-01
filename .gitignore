@@ -1,6 +1,7 @@
 # Build artifacts
 build/
 terminator
+harness
 *.o
 
 # Temporary test files
