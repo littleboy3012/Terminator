@@ -196,11 +196,18 @@ void jobs_print(const JobTable *table, char *out_buf, size_t max_len) {
             state_str = "Done";
         }
 
+        char cmd_buf[256];
+        snprintf(cmd_buf, sizeof(cmd_buf), "%s", j->command);
+        char *end = cmd_buf + strlen(cmd_buf);
+        while (end > cmd_buf && (isspace((unsigned char)*(end - 1)) || *(end - 1) == '&')) {
+            *(--end) = '\0';
+        }
+
         char line[256];
         if (j->state == JOB_STATE_RUNNING) {
-            snprintf(line, sizeof(line), "[%d]%c  %-24s%s &\n", j->id, sign, state_str, j->command);
+            snprintf(line, sizeof(line), "[%d]%c %-24s%s &\n", j->id, sign, state_str, cmd_buf);
         } else {
-            snprintf(line, sizeof(line), "[%d]%c  %-24s%s\n", j->id, sign, state_str, j->command);
+            snprintf(line, sizeof(line), "[%d]%c %-24s%s\n", j->id, sign, state_str, cmd_buf);
         }
 
         size_t cur_len = strlen(out_buf);
@@ -224,9 +231,15 @@ void jobs_check_status(JobTable *table, char *notification_buf, size_t max_len) 
 
             if (WIFEXITED(status) || WIFSIGNALED(status)) {
                 /* Job terminated */
+                char cmd_clean[256];
+                snprintf(cmd_clean, sizeof(cmd_clean), "%s", j->command);
+                char *end_c = cmd_clean + strlen(cmd_clean);
+                while (end_c > cmd_clean && (isspace((unsigned char)*(end_c - 1)) || *(end_c - 1) == '&')) {
+                    *(--end_c) = '\0';
+                }
                 char notif[256];
-                snprintf(notif, sizeof(notif), "[%d]%c  Done                    %s\n",
-                         j->id, sign, j->command);
+                snprintf(notif, sizeof(notif), "[%d]%c Done %s\n",
+                         j->id, sign, cmd_clean);
 
                 size_t cur_len = strlen(notification_buf);
                 if (cur_len + strlen(notif) < max_len) {

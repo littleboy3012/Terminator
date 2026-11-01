@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include <errno.h>
 
 /**
@@ -15,11 +16,11 @@
  */
 int is_builtin_command(const char *name) {
     if (!name) return 0;
-    return (strcmp(name, "cd") == 0 || strcmp(name, "exit") == 0 ||
-            strcmp(name, "clear") == 0 || strcasecmp(name, "multiWatch") == 0 ||
-            strcmp(name, "jobs") == 0 || strcmp(name, "fg") == 0 ||
-            strcmp(name, "bg") == 0 || strcmp(name, "history") == 0 ||
-            strcmp(name, "source") == 0);
+    return (strcmp(name, "cd") == 0 || strcmp(name, "pwd") == 0 ||
+            strcmp(name, "exit") == 0 || strcmp(name, "clear") == 0 ||
+            strcasecmp(name, "multiWatch") == 0 || strcmp(name, "jobs") == 0 ||
+            strcmp(name, "fg") == 0 || strcmp(name, "bg") == 0 ||
+            strcmp(name, "history") == 0 || strcmp(name, "source") == 0);
 }
 
 /**
@@ -30,6 +31,7 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
 
     const char *name = cmd->argv[0];
     if (strcmp(name, "cd") == 0) return builtin_cd(ctx, cmd->argv);
+    if (strcmp(name, "pwd") == 0) return builtin_pwd(ctx, cmd->argv);
     if (strcmp(name, "exit") == 0) return builtin_exit(ctx, cmd->argv);
     if (strcmp(name, "clear") == 0) return builtin_clear(ctx, cmd->argv);
     if (strcasecmp(name, "multiWatch") == 0) return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
@@ -49,11 +51,26 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
     const char *name = cmd->argv[0];
     if (strcmp(name, "cd") == 0) {
         int ret = builtin_cd(ctx, cmd->argv);
-        if (ret != 0 && out_buf && max_len > 0) {
+        if (ret == 0 && cmd->argv[1] && strcmp(cmd->argv[1], "-") == 0) {
+            snprintf(out_buf, max_len, "%s\n", ctx->cwd);
+        } else if (ret != 0 && out_buf && max_len > 0) {
             snprintf(out_buf, max_len, "terminator: cd: %s: No such file or directory\n",
                      cmd->argv[1] ? cmd->argv[1] : "");
         }
         return ret;
+    }
+    if (strcmp(name, "pwd") == 0) {
+        if (out_buf && max_len > 0) {
+            snprintf(out_buf, max_len, "%s\n", ctx->cwd);
+        }
+        return 0;
+    }
+    if (strcasecmp(name, "multiWatch") == 0) {
+        if (cmd->argc <= 1) {
+            snprintf(out_buf, max_len, "usage: multiWatch [-n interval] [\"cmd1\", \"cmd2\", ...]\n");
+            return 1;
+        }
+        return builtin_multiwatch(ctx, cmd->argc, cmd->argv);
     }
     if (strcmp(name, "history") == 0) {
         if (out_buf && max_len > 0) {
@@ -76,6 +93,10 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
         return builtin_bg(ctx, cmd->argv);
     }
     if (strcmp(name, "source") == 0) {
+        if (!cmd->argv[1]) {
+            snprintf(out_buf, max_len, "terminator: source: not implemented yet\n");
+            return 1;
+        }
         return builtin_source(ctx, cmd->argv);
     }
     return execute_builtin(ctx, cmd);
@@ -83,7 +104,7 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
 
 int builtin_source(ShellContext *ctx, char **argv) {
     if (!ctx || !argv || !argv[1]) {
-        fprintf(stderr, "terminator: source: filename argument required\n");
+        fprintf(stderr, "terminator: source: not implemented yet\n");
         return 1;
     }
     FILE *fp = fopen(argv[1], "r");
@@ -119,6 +140,14 @@ int builtin_history(ShellContext *ctx, char **argv) {
     return 0;
 }
 
+int builtin_pwd(ShellContext *ctx, char **argv) {
+    (void)argv;
+    if (!ctx) return 1;
+    printf("%s\n", ctx->cwd);
+    fflush(stdout);
+    return 0;
+}
+
 /**
  * @brief Changes the working directory of the shell session.
  *
@@ -145,6 +174,12 @@ int builtin_cd(ShellContext *ctx, char **argv) {
             fprintf(stderr, "terminator: cd: HOME not set\n");
             return 1;
         }
+    } else if (strcmp(argv[1], "-") == 0) {
+        if (ctx->prev_cwd[0] == '\0') {
+            fprintf(stderr, "terminator: cd: OLDPWD not set\n");
+            return 1;
+        }
+        target_dir = ctx->prev_cwd;
     } else {
         /* Check for tilde expansion (e.g., "~" or "~/some/path") */
         if (argv[1][0] == '~') {
@@ -164,16 +199,35 @@ int builtin_cd(ShellContext *ctx, char **argv) {
         }
     }
 
-    /* Perform the directory change using chdir() system call */
-    if (chdir(target_dir) != 0) {
+    /* Save old cwd before changing */
+    char old_cwd[PATH_MAX];
+    snprintf(old_cwd, sizeof(old_cwd), "%s", ctx->cwd);
+
+    char full_path[PATH_MAX * 2];
+    if (target_dir[0] == '/') {
+        snprintf(full_path, sizeof(full_path), "%s", target_dir);
+    } else {
+        snprintf(full_path, sizeof(full_path), "%s/%s", ctx->cwd, target_dir);
+    }
+
+    char canonical[PATH_MAX];
+    if (realpath(full_path, canonical) == NULL) {
         fprintf(stderr, "terminator: cd: %s: %s\n", target_dir, strerror(errno));
         return 1;
     }
 
-    /* Update the cached current working directory in the ShellContext */
-    if (getcwd(ctx->cwd, sizeof(ctx->cwd)) == NULL) {
-        perror("terminator: cd: getcwd failed");
+    struct stat st;
+    if (stat(canonical, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        fprintf(stderr, "terminator: cd: %s: Not a directory\n", target_dir);
         return 1;
+    }
+
+    snprintf(ctx->cwd, sizeof(ctx->cwd), "%s", canonical);
+    snprintf(ctx->prev_cwd, sizeof(ctx->prev_cwd), "%s", old_cwd);
+
+    if (argv[1] && strcmp(argv[1], "-") == 0) {
+        printf("%s\n", ctx->cwd);
+        fflush(stdout);
     }
 
     return 0;

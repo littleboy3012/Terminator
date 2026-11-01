@@ -25,6 +25,7 @@ int shell_init(ShellContext *ctx) {
 
     ctx->last_exit_status = 0;
     ctx->should_exit = 0;
+    ctx->prev_cwd[0] = '\0';
     jobs_init(&ctx->job_table);
     ctx->foreground_pid = 0;
     ctx->foreground_cmd[0] = '\0';
@@ -93,6 +94,58 @@ int setup_redirections(const char *input_file, const char *output_file) {
     return 0;
 }
 
+int setup_command_redirections(const Command *cmd) {
+    if (!cmd) return 0;
+    if (cmd->nredirs > 0) {
+        for (int i = 0; i < cmd->nredirs; i++) {
+            const Redir *r = &cmd->redirs[i];
+            if (r->type == REDIR_IN) {
+                int fd = open(r->filename, O_RDONLY);
+                if (fd < 0) {
+                    fprintf(stderr, "terminator: %s: %s\n", r->filename, strerror(errno));
+                    return -1;
+                }
+                int target = (r->fd >= 0) ? r->fd : STDIN_FILENO;
+                if (dup2(fd, target) < 0) {
+                    close(fd);
+                    return -1;
+                }
+                close(fd);
+            } else if (r->type == REDIR_OUT) {
+                int target = (r->fd > 0) ? r->fd : STDOUT_FILENO;
+                int fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                if (fd < 0) {
+                    fprintf(stderr, "terminator: %s: %s\n", r->filename, strerror(errno));
+                    return -1;
+                }
+                if (dup2(fd, target) < 0) {
+                    close(fd);
+                    return -1;
+                }
+                close(fd);
+            } else if (r->type == REDIR_APPEND) {
+                int target = (r->fd > 0) ? r->fd : STDOUT_FILENO;
+                int fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                if (fd < 0) {
+                    fprintf(stderr, "terminator: %s: %s\n", r->filename, strerror(errno));
+                    return -1;
+                }
+                if (dup2(fd, target) < 0) {
+                    close(fd);
+                    return -1;
+                }
+                close(fd);
+            } else if (r->type == REDIR_DUP) {
+                if (dup2(r->dup_target, r->fd) < 0) {
+                    return -1;
+                }
+            }
+        }
+        return 0;
+    }
+    return setup_redirections(cmd->input_file, cmd->output_file);
+}
+
 /**
  * @brief Executes a single Command, handling built-ins directly or external commands via fork/exec.
  *
@@ -120,14 +173,16 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
     /* Check if command is a built-in */
     if (is_builtin_command(cmd->argv[0])) {
         /* If redirections are requested on a built-in, redirect stdout/stdin temporarily */
-        if (cmd->input_file || cmd->output_file) {
+        if (cmd->nredirs > 0 || cmd->input_file || cmd->output_file) {
             int saved_stdin = dup(STDIN_FILENO);
             int saved_stdout = dup(STDOUT_FILENO);
+            int saved_stderr = dup(STDERR_FILENO);
 
-            if (setup_redirections(cmd->input_file, cmd->output_file) != 0) {
+            if (setup_command_redirections(cmd) != 0) {
                 ctx->last_exit_status = 1;
                 close(saved_stdin);
                 close(saved_stdout);
+                close(saved_stderr);
                 return 1;
             }
 
@@ -136,8 +191,10 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
 
             dup2(saved_stdin, STDIN_FILENO);
             dup2(saved_stdout, STDOUT_FILENO);
+            dup2(saved_stderr, STDERR_FILENO);
             close(saved_stdin);
             close(saved_stdout);
+            close(saved_stderr);
             return status;
         }
 
@@ -156,14 +213,21 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
 
     if (pid == 0) {
         setpgid(0, 0);
+        if (ctx->cwd[0] != '\0') {
+            if (chdir(ctx->cwd) < 0) {}
+        }
         /* Child process */
-        if (setup_redirections(cmd->input_file, cmd->output_file) != 0) {
+        if (setup_command_redirections(cmd) != 0) {
             _exit(1);
         }
 
         execvp(cmd->argv[0], cmd->argv);
 
         /* Reached only if execvp failed */
+        if (errno == EACCES) {
+            fprintf(stderr, "terminator: %s: Permission denied\n", cmd->argv[0]);
+            _exit(126);
+        }
         fprintf(stderr, "terminator: %s: command not found\n", cmd->argv[0]);
         _exit(127);
     }
@@ -250,6 +314,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
 
         if (bg_pid == 0) {
             setpgid(0, 0);
+            if (ctx->cwd[0] != '\0') {
+                if (chdir(ctx->cwd) < 0) {}
+            }
 
             /* In background, redirect stdin from /dev/null if not already redirected */
             if (pipeline->commands[0].input_file == NULL) {
@@ -262,7 +329,7 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
 
             if (pipeline->num_commands == 1) {
                 Command *c = &pipeline->commands[0];
-                if (setup_redirections(c->input_file, c->output_file) != 0) {
+                if (setup_command_redirections(c) != 0) {
                     _exit(1);
                 }
                 if (is_builtin_command(c->argv[0])) {
@@ -270,6 +337,10 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
                     _exit(ret);
                 } else {
                     execvp(c->argv[0], c->argv);
+                    if (errno == EACCES) {
+                        fprintf(stderr, "terminator: %s: Permission denied\n", c->argv[0]);
+                        _exit(126);
+                    }
                     fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
                     _exit(127);
                 }
@@ -342,6 +413,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
         if (pids[i] == 0) {
             pid_t pgid = (i == 0) ? 0 : pids[0];
             setpgid(0, pgid);
+            if (ctx->cwd[0] != '\0') {
+                if (chdir(ctx->cwd) < 0) {}
+            }
 
             /* Child process i: rewire stdin from previous pipe if not first */
             if (i > 0) {
@@ -354,8 +428,7 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
             }
 
             /* Explicit file redirection overrides pipe redirection */
-            if (setup_redirections(pipeline->commands[i].input_file,
-                                   pipeline->commands[i].output_file) != 0) {
+            if (setup_command_redirections(&pipeline->commands[i]) != 0) {
                 _exit(1);
             }
 
@@ -370,6 +443,11 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
                 _exit(ret);
             } else {
                 execvp(pipeline->commands[i].argv[0], pipeline->commands[i].argv);
+                if (errno == EACCES) {
+                    fprintf(stderr, "terminator: %s: Permission denied\n",
+                            pipeline->commands[i].argv[0]);
+                    _exit(126);
+                }
                 fprintf(stderr, "terminator: %s: command not found\n",
                         pipeline->commands[i].argv[0]);
                 _exit(127);

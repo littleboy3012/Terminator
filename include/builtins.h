@@ -58,6 +58,15 @@ int builtin_source(ShellContext *ctx, char **argv);
 int builtin_cd(ShellContext *ctx, char **argv);
 
 /**
+ * @brief Built-in command: Prints current working directory ('pwd').
+ *
+ * @param[in,out] ctx Pointer to the ShellContext.
+ * @param[in] argv NULL-terminated array of arguments (argv[0]="pwd").
+ * @return 0 on success.
+ */
+int builtin_pwd(ShellContext *ctx, char **argv);
+
+/**
  * @brief Built-in command: Exits the shell session ('exit').
  *
  * Sets the should_exit flag in the ShellContext and optionally records the specified exit code.

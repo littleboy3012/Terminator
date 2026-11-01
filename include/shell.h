@@ -9,6 +9,28 @@
 #define PATH_MAX 4096
 #endif
 
+#define MAX_REDIRS 16
+
+/**
+ * @brief Redirection types supported by Terminator.
+ */
+typedef enum {
+    REDIR_IN = 0,
+    REDIR_OUT = 1,
+    REDIR_APPEND = 2,
+    REDIR_DUP = 3
+} RedirType;
+
+/**
+ * @brief Represents an individual file descriptor redirection.
+ */
+typedef struct {
+    RedirType type;
+    int fd;
+    int dup_target;
+    char filename[PATH_MAX];
+} Redir;
+
 /**
  * @brief Structure representing a single parsed command,
  *        including its arguments and I/O redirection targets.
@@ -18,14 +40,23 @@ typedef struct {
     int argc;             /**< Number of arguments in argv */
     char *input_file;     /**< Path to file for input redirection ('<'), or NULL if none */
     char *output_file;    /**< Path to file for output redirection ('>'), or NULL if none */
+    int is_append;        /**< Non-zero if output redirection is in append mode ('>>') */
+    int nredirs;          /**< Number of active redirections */
+    Redir redirs[16];     /**< Array of individual redirections */
 } Command;
 
 /**
  * @brief Structure representing an entire pipeline of commands (e.g. cmd1 | cmd2 | cmd3).
  */
 typedef struct {
-    Command *commands;    /**< Array of Command structures in the pipeline */
-    int num_commands;     /**< Total number of commands connected by pipes */
+    union {
+        Command *commands;/**< Array of Command structures in the pipeline */
+        Command *cmds;    /**< Alias for commands */
+    };
+    union {
+        int num_commands; /**< Total number of commands connected by pipes */
+        int n;            /**< Alias for num_commands */
+    };
     int is_background;    /**< Non-zero if pipeline should execute in the background (trailing '&') */
 } Pipeline;
 
@@ -36,6 +67,7 @@ typedef struct {
     int last_exit_status; /**< Exit status of the most recently executed foreground command ($?) */
     int should_exit;      /**< Non-zero if the shell received an 'exit' command and should shut down */
     char cwd[PATH_MAX];   /**< Current working directory of this shell session */
+    char prev_cwd[PATH_MAX]; /**< Previous working directory for 'cd -' support */
     JobTable job_table;   /**< Active background and stopped jobs in this shell session (Task 8) */
     pid_t foreground_pid; /**< Active foreground process PID (0 if idle) */
     char foreground_cmd[MAX_CMD_LEN]; /**< Command line string of active foreground process */
@@ -82,5 +114,13 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd);
  * @return 0 on success, or -1 on error.
  */
 int setup_redirections(const char *input_file, const char *output_file);
+
+/**
+ * @brief Applies all redirections for a Command using its redirs array or legacy fields.
+ *
+ * @param[in] cmd Pointer to Command structure.
+ * @return 0 on success, -1 on error.
+ */
+int setup_command_redirections(const Command *cmd);
 
 #endif /* SHELL_H */

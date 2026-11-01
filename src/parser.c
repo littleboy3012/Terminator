@@ -7,6 +7,7 @@
 #include <sys/wait.h>
 #include <sys/types.h>
 #include <glob.h>
+#include <pwd.h>
 
 #define MAX_ARGS 1024
 #define MAX_TOKEN_LEN 4096
@@ -62,7 +63,13 @@ int is_command_incomplete(const char *line) {
     }
 
     if (in_sq || in_dq || in_bt || sub_depth > 0) return 1;
-    if (last_non_space && *last_non_space == '|' && !in_sq && !in_dq) return 1;
+    if (last_non_space && *last_non_space == '|' && !in_sq && !in_dq) {
+        if (strstr(line, "< |") || strstr(line, "<|") || strstr(line, "> |") || strstr(line, ">|")) return 0;
+        const char *t = line;
+        while (*t && isspace((unsigned char)*t)) t++;
+        if (*t == '|') return 0;
+        return 1;
+    }
     return 0;
 }
 
@@ -181,6 +188,40 @@ static int expand_variable(const char *str, char *out_buf, size_t max_len,
         return snprintf(out_buf, max_len, "%d", exit_val);
     }
 
+    if (str[1] == '$') {
+        *chars_consumed = 2;
+        return snprintf(out_buf, max_len, "%d", (int)getpid());
+    }
+
+    if (str[1] == '#') {
+        *chars_consumed = 2;
+        return snprintf(out_buf, max_len, "0");
+    }
+
+    if (str[1] == '0') {
+        *chars_consumed = 2;
+        return snprintf(out_buf, max_len, "terminator");
+    }
+
+    if (str[1] == '{') {
+        int i = 2;
+        while (str[i] && str[i] != '}') i++;
+        if (str[i] == '}') {
+            char var_name[256];
+            int vlen = i - 2;
+            if (vlen >= 255) vlen = 255;
+            memcpy(var_name, str + 2, vlen);
+            var_name[vlen] = '\0';
+            *chars_consumed = i + 1;
+            const char *val = getenv(var_name);
+            if (val) {
+                return snprintf(out_buf, max_len, "%s", val);
+            }
+            out_buf[0] = '\0';
+            return 0;
+        }
+    }
+
     if (str[1] == '(') {
         int depth = 1;
         int i = 2;
@@ -274,18 +315,56 @@ static void handle_dollar_var(const char **p_ptr, const ShellContext *ctx,
  * Performs pathname expansion (globbing) on unquoted wildcards (*, ?, [) and tildes (~).
  */
 static int flush_token(char *token, int *token_len, int *in_token,
-                       int *has_wildcard, int *next_in, int *next_out,
-                       Command *cmd, char **argv_list, int *argc) {
+                       int *has_wildcard, int *has_tilde, int *next_in, int *next_out,
+                       Command *cmd, char **argv_list, int *argc, const ShellContext *ctx) {
     if (!*in_token) return 0;
     token[*token_len] = '\0';
+
+    char tilde_buf[PATH_MAX];
+    char *use_token = token;
+    if (*has_tilde && token[0] == '~') {
+        const char *home = getenv("HOME");
+        if (token[1] == '\0') {
+            if (home) {
+                snprintf(tilde_buf, sizeof(tilde_buf), "%s", home);
+                use_token = tilde_buf;
+            }
+        } else if (token[1] == '/') {
+            if (home) {
+                snprintf(tilde_buf, sizeof(tilde_buf), "%s%s", home, token + 1);
+                use_token = tilde_buf;
+            }
+        } else {
+            char uname[128] = {0};
+            int u = 1;
+            while (token[u] && token[u] != '/' && u < 127) {
+                uname[u - 1] = token[u];
+                u++;
+            }
+            uname[u - 1] = '\0';
+            struct passwd *pw = getpwnam(uname);
+            if (pw && pw->pw_dir) {
+                snprintf(tilde_buf, sizeof(tilde_buf), "%s%s", pw->pw_dir, token + u);
+                use_token = tilde_buf;
+            }
+        }
+    }
 
     if (*next_in || *next_out) {
         char *target = NULL;
         if (*has_wildcard) {
+            char pattern[PATH_MAX * 2];
+            int is_rel = (ctx && ctx->cwd[0] && use_token[0] != '/');
+            if (is_rel) {
+                snprintf(pattern, sizeof(pattern), "%s/%s", ctx->cwd, use_token);
+            } else {
+                snprintf(pattern, sizeof(pattern), "%s", use_token);
+            }
             glob_t g;
-            if (glob(token, GLOB_TILDE, NULL, &g) == 0) {
+            if (glob(pattern, 0, NULL, &g) == 0) {
                 if (g.gl_pathc == 1) {
-                    target = strdup(g.gl_pathv[0]);
+                    size_t pre_len = is_rel ? (strlen(ctx->cwd) + 1) : 0;
+                    target = strdup(g.gl_pathv[0] + pre_len);
                 } else if (g.gl_pathc > 1) {
                     fprintf(stderr, "terminator: %s: ambiguous redirect\n", token);
                     globfree(&g);
@@ -295,7 +374,7 @@ static int flush_token(char *token, int *token_len, int *in_token,
             }
         }
         if (!target) {
-            target = strdup(token);
+            target = strdup(use_token);
         }
 
         if (*next_in) {
@@ -307,21 +386,30 @@ static int flush_token(char *token, int *token_len, int *in_token,
         }
     } else {
         if (*has_wildcard) {
+            char pattern[PATH_MAX * 2];
+            int is_rel = (ctx && ctx->cwd[0] && use_token[0] != '/');
+            if (is_rel) {
+                snprintf(pattern, sizeof(pattern), "%s/%s", ctx->cwd, use_token);
+            } else {
+                snprintf(pattern, sizeof(pattern), "%s", use_token);
+            }
             glob_t g;
-            int ret = glob(token, GLOB_NOCHECK | GLOB_TILDE, NULL, &g);
-            if (ret == 0) {
+            int ret = glob(pattern, 0, NULL, &g);
+            if (ret == 0 && g.gl_pathc > 0) {
+                size_t pre_len = is_rel ? (strlen(ctx->cwd) + 1) : 0;
                 for (size_t i = 0; i < g.gl_pathc && *argc < MAX_ARGS - 1; i++) {
-                    argv_list[(*argc)++] = strdup(g.gl_pathv[i]);
+                    const char *match = g.gl_pathv[i] + pre_len;
+                    argv_list[(*argc)++] = strdup(match);
                 }
                 globfree(&g);
             } else {
                 if (*argc < MAX_ARGS - 1) {
-                    argv_list[(*argc)++] = strdup(token);
+                    argv_list[(*argc)++] = strdup(use_token);
                 }
             }
         } else {
             if (*argc < MAX_ARGS - 1) {
-                argv_list[(*argc)++] = strdup(token);
+                argv_list[(*argc)++] = strdup(use_token);
             }
         }
     }
@@ -329,6 +417,7 @@ static int flush_token(char *token, int *token_len, int *in_token,
     *token_len = 0;
     *in_token = 0;
     *has_wildcard = 0;
+    *has_tilde = 0;
     return 0;
 }
 
@@ -343,13 +432,13 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
 
     int argc = 0, token_len = 0, in_token = 0;
     int next_in = 0, next_out = 0;
-    int has_wildcard = 0;
+    int has_wildcard = 0, has_tilde = 0;
     char token[MAX_TOKEN_LEN];
     const char *p = cmd_segment;
 
     while (*p) {
         if (isspace((unsigned char)*p)) {
-            if (flush_token(token, &token_len, &in_token, &has_wildcard, &next_in, &next_out, cmd, argv_list, &argc) != 0) {
+            if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
                 for (int i = 0; i < argc; i++) free(argv_list[i]);
                 free(argv_list);
                 return -1;
@@ -358,12 +447,66 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
             continue;
         }
 
-        if (*p == '<' && !in_token) {
+        if (p[0] == '2' && p[1] == '>' && p[2] == '&' && p[3] == '1') {
+            if (in_token) {
+                if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
+                    for (int i = 0; i < argc; i++) free(argv_list[i]);
+                    free(argv_list);
+                    return -1;
+                }
+            }
+            p += 4;
+            continue;
+        }
+
+        if (p[0] == '2' && p[1] == '>') {
+            if (in_token) {
+                if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
+                    for (int i = 0; i < argc; i++) free(argv_list[i]);
+                    free(argv_list);
+                    return -1;
+                }
+            }
+            next_out = 1;
+            p += 2;
+            continue;
+        }
+
+        if (p[0] == '>' && p[1] == '>') {
+            if (in_token) {
+                if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
+                    for (int i = 0; i < argc; i++) free(argv_list[i]);
+                    free(argv_list);
+                    return -1;
+                }
+            }
+            next_out = 1;
+            cmd->is_append = 1;
+            p += 2;
+            continue;
+        }
+
+        if (*p == '<') {
+            if (in_token) {
+                if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
+                    for (int i = 0; i < argc; i++) free(argv_list[i]);
+                    free(argv_list);
+                    return -1;
+                }
+            }
             next_in = 1;
             p++;
             continue;
         }
-        if (*p == '>' && !in_token) {
+
+        if (*p == '>') {
+            if (in_token) {
+                if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
+                    for (int i = 0; i < argc; i++) free(argv_list[i]);
+                    free(argv_list);
+                    return -1;
+                }
+            }
             next_out = 1;
             p++;
             continue;
@@ -399,14 +542,15 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
             p++;
             while (*p && *p != '"') {
                 if (*p == '\\' && *(p + 1) == '\n') {
+                    if (token_len < MAX_TOKEN_LEN - 1) token[token_len++] = '\n';
                     p += 2;
+                } else if (*p == '\\' && (*(p + 1) == '$' || *(p + 1) == '`' || *(p + 1) == '"' || *(p + 1) == '\\')) {
+                    p++;
+                    if (token_len < MAX_TOKEN_LEN - 1) token[token_len++] = *p++;
                 } else if (*p == '$') {
                     handle_dollar_var(&p, ctx, token, &token_len, NULL);
                 } else if (*p == '`') {
                     handle_backtick(&p, ctx, token, &token_len);
-                } else if (*p == '\\' && *(p + 1) != '\0') {
-                    p++;
-                    if (token_len < MAX_TOKEN_LEN - 1) token[token_len++] = *p++;
                 } else {
                     if (token_len < MAX_TOKEN_LEN - 1) token[token_len++] = *p;
                     p++;
@@ -417,18 +561,40 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
         }
 
         /* Unquoted character */
-        in_token = 1;
         if (*p == '$') {
-            handle_dollar_var(&p, ctx, token, &token_len, &has_wildcard);
+            int consumed = 0;
+            char exp_buf[MAX_TOKEN_LEN];
+            int exp_len = expand_variable(p, exp_buf, sizeof(exp_buf), ctx, &consumed);
+            p += consumed;
+
+            if (exp_len > 0) {
+                in_token = 1;
+                char *tok = strtok(exp_buf, " \t\n\r");
+                if (tok) {
+                    append_token_str(token, &token_len, tok, (int)strlen(tok));
+                    char *next = strtok(NULL, " \t\n\r");
+                    while (next) {
+                        if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
+                            for (int i = 0; i < argc; i++) free(argv_list[i]);
+                            free(argv_list);
+                            return -1;
+                        }
+                        in_token = 1;
+                        append_token_str(token, &token_len, next, (int)strlen(next));
+                        next = strtok(NULL, " \t\n\r");
+                    }
+                }
+            }
             continue;
         }
+        in_token = 1;
         if (*p == '\\' && *(p + 1) != '\0') {
             p++;
         } else {
             if (*p == '*' || *p == '?' || *p == '[') {
                 has_wildcard = 1;
             } else if (*p == '~' && token_len == 0) {
-                has_wildcard = 1;
+                has_tilde = 1;
             }
         }
         if (token_len < MAX_TOKEN_LEN - 1) {
@@ -437,7 +603,7 @@ static int parse_single_command(const char *cmd_segment, const ShellContext *ctx
         p++;
     }
 
-    if (flush_token(token, &token_len, &in_token, &has_wildcard, &next_in, &next_out, cmd, argv_list, &argc) != 0) {
+    if (flush_token(token, &token_len, &in_token, &has_wildcard, &has_tilde, &next_in, &next_out, cmd, argv_list, &argc, ctx) != 0) {
         for (int i = 0; i < argc; i++) free(argv_list[i]);
         free(argv_list);
         return -1;
