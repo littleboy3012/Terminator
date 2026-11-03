@@ -547,41 +547,11 @@ void tab_append_output(Tab *tab, const char *text, int len) {
 /*                         Command Execution                                 */
 /* ========================================================================= */
 
-void tab_submit_command(GuiApp *app, Tab *tab) {
-    if (!app || !tab) return;
+static void tab_execute_cmd_string(GuiApp *app, Tab *tab, const char *cmd_str);
+static void tab_flush_pending_commands(GuiApp *app, Tab *tab);
 
-    tab->scroll_offset = 0;
-    const char *prompt_used = tab->is_multiline ? "> " : PROMPT_STRING;
-    int p_len = (int)strlen(prompt_used);
-
-    tab_record_prompt_input(app, tab, prompt_used, p_len);
-
-    if (tab->input_len == 0 && !tab->is_multiline) return;
-
-    if (!tab->is_multiline) {
-        snprintf(tab->multiline_accum, sizeof(tab->multiline_accum), "%s", tab->input_buffer);
-    } else {
-        size_t acc_len = strlen(tab->multiline_accum);
-        snprintf(tab->multiline_accum + acc_len, sizeof(tab->multiline_accum) - acc_len, "\n%s", tab->input_buffer);
-    }
-
-    tab->input_buffer[0] = '\0';
-    tab->input_len = 0;
-    tab->cursor_pos = 0;
-    tab->history_pos = -1;
-    tab->saved_input[0] = '\0';
-
-    if (is_command_incomplete(tab->multiline_accum)) {
-        tab->is_multiline = 1;
-        return;
-    }
-
-    tab->is_multiline = 0;
-    char cmd_str[sizeof(tab->multiline_accum)];
-    snprintf(cmd_str, sizeof(cmd_str), "%s", tab->multiline_accum);
-    tab->multiline_accum[0] = '\0';
-
-    history_add(cmd_str);
+static void tab_execute_cmd_string(GuiApp *app, Tab *tab, const char *cmd_str) {
+    if (!app || !tab || !cmd_str) return;
 
     Pipeline pipeline;
     if (parse_line(cmd_str, &tab->shell_ctx, &pipeline) != 0) {
@@ -605,19 +575,6 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             gui_redraw(app);
             return;
         }
-    }
-
-    if (tab->use_process_mode) {
-        free_pipeline(&pipeline);
-        if (tab->to_tab_fd >= 0) {
-            if (write(tab->to_tab_fd, cmd_str, strlen(cmd_str)) < 0) {}
-            if (write(tab->to_tab_fd, "\n", 1) < 0) {}
-        }
-        return;
-    }
-
-    if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
-        Command *cmd = &pipeline.commands[0];
         if (strcmp(cmd->argv[0], "fg") == 0) {
             char out[512];
             Job res_job;
@@ -682,6 +639,9 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
 
     if (pid == 0) {
         setpgid(0, 0);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
         if (chdir(tab->cwd) != 0) {}
 
         dup2(pipefds[1], STDOUT_FILENO);
@@ -695,6 +655,21 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
                 dup2(devnull, STDIN_FILENO);
                 close(devnull);
             }
+        }
+
+        /* Single command optimization: execute directly without wrapper fork */
+        if (pipeline.num_commands == 1 && !is_builtin_command(pipeline.commands[0].argv[0])) {
+            Command *c = &pipeline.commands[0];
+            if (setup_command_redirections(c) != 0) {
+                _exit(1);
+            }
+            execvp(c->argv[0], c->argv);
+            if (errno == EACCES) {
+                fprintf(stderr, "terminator: %s: Permission denied\n", c->argv[0]);
+                _exit(126);
+            }
+            fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
+            _exit(127);
         }
 
         Pipeline exec_pl = pipeline;
@@ -722,6 +697,76 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
     }
 
     free_pipeline(&pipeline);
+}
+
+static void tab_flush_pending_commands(GuiApp *app, Tab *tab) {
+    if (!app || !tab || tab->is_running_cmd || tab->pending_cmd_count <= 0) return;
+
+    while (!tab->is_running_cmd && tab->pending_cmd_count > 0) {
+        char next_cmd[sizeof(tab->pending_cmds[0])];
+        snprintf(next_cmd, sizeof(next_cmd), "%s", tab->pending_cmds[0]);
+
+        for (int i = 0; i < tab->pending_cmd_count - 1; i++) {
+            strncpy(tab->pending_cmds[i], tab->pending_cmds[i + 1], sizeof(tab->pending_cmds[i]));
+        }
+        tab->pending_cmd_count--;
+
+        tab_execute_cmd_string(app, tab, next_cmd);
+    }
+}
+
+void tab_submit_command(GuiApp *app, Tab *tab) {
+    if (!app || !tab) return;
+
+    tab->scroll_offset = 0;
+    const char *prompt_used = tab->is_multiline ? "> " : PROMPT_STRING;
+    int p_len = (int)strlen(prompt_used);
+
+    tab_record_prompt_input(app, tab, prompt_used, p_len);
+
+    if (tab->input_len == 0 && !tab->is_multiline) return;
+
+    if (!tab->is_multiline) {
+        snprintf(tab->multiline_accum, sizeof(tab->multiline_accum), "%s", tab->input_buffer);
+    } else {
+        size_t acc_len = strlen(tab->multiline_accum);
+        snprintf(tab->multiline_accum + acc_len, sizeof(tab->multiline_accum) - acc_len, "\n%s", tab->input_buffer);
+    }
+
+    tab->input_buffer[0] = '\0';
+    tab->input_len = 0;
+    tab->cursor_pos = 0;
+    tab->history_pos = -1;
+    tab->saved_input[0] = '\0';
+
+    if (is_command_incomplete(tab->multiline_accum)) {
+        tab->is_multiline = 1;
+        return;
+    }
+
+    tab->is_multiline = 0;
+    char cmd_str[sizeof(tab->multiline_accum)];
+    snprintf(cmd_str, sizeof(cmd_str), "%s", tab->multiline_accum);
+    tab->multiline_accum[0] = '\0';
+
+    history_add(cmd_str);
+
+    if (tab->use_process_mode) {
+        if (tab->to_tab_fd >= 0) {
+            if (write(tab->to_tab_fd, cmd_str, strlen(cmd_str)) < 0) {}
+            if (write(tab->to_tab_fd, "\n", 1) < 0) {}
+        }
+        return;
+    }
+
+    if (tab->is_running_cmd) {
+        if (tab->pending_cmd_count < MAX_PENDING_CMDS) {
+            snprintf(tab->pending_cmds[tab->pending_cmd_count++], sizeof(tab->pending_cmds[0]), "%s", cmd_str);
+        }
+        return;
+    }
+
+    tab_execute_cmd_string(app, tab, cmd_str);
 }
 
 /* ========================================================================= */
@@ -923,11 +968,13 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
             pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
             kill(-target, SIGINT);
             kill(tab->running_pid, SIGINT);
+            tab->pending_cmd_count = 0;
         } else {
             tab->input_buffer[0] = '\0';
             tab->input_len = 0;
             tab->cursor_pos = 0;
             tab->history_pos = -1;
+            tab->pending_cmd_count = 0;
         }
         tab_append_output(tab, "^C\n", 3);
         gui_redraw(app);
@@ -957,6 +1004,8 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
             tab->running_pgid = 0;
             tab->out_pipe_fd = -1;
             tab->running_cmd[0] = '\0';
+
+            tab_flush_pending_commands(app, tab);
             gui_redraw(app);
             return;
         }
@@ -1527,6 +1576,8 @@ void gui_run_loop(GuiApp *app) {
                             t->running_pid = 0;
                             t->running_pgid = 0;
                             t->running_cmd[0] = '\0';
+
+                            tab_flush_pending_commands(app, t);
                         }
                         if (t_idx == app->active_tab_idx) needs_redraw = 1;
                     }

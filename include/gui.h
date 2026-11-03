@@ -15,6 +15,7 @@
 #define MAX_LINE_CHARS 1024
 #define MAX_BUFFER_LINES 2000
 #define TAB_BAR_HEIGHT 36
+#define MAX_PENDING_CMDS 16
 
 /**
  * @brief Represents the visual category of a line in the terminal buffer.
@@ -76,6 +77,8 @@ typedef struct {
     size_t completion_word_start;           /**< Start index of word being completed */
     size_t completion_word_len;             /**< Length of word prefix */
     char completion_dir_prefix[PATH_MAX];   /**< Directory prefix to prepend to candidate */
+    char pending_cmds[MAX_PENDING_CMDS][MAX_LINE_CHARS * 4]; /**< Queued commands submitted while a foreground command was running */
+    int pending_cmd_count;                  /**< Number of queued pending commands */
 } Tab;
 
 /**
