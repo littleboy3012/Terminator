@@ -36,12 +36,6 @@ TEST_RUNNER = $(BUILD_DIR)/test_shell_runner
 
 all: $(TARGET)
 
-HARNESS = harness
-HARNESS_OBJS = $(filter-out $(BUILD_DIR)/main.o, $(OBJS))
-
-$(HARNESS): harness.c tests/harness_compat.h $(HARNESS_OBJS)
-	$(CC) $(CFLAGS) harness.c $(HARNESS_OBJS) -o $(HARNESS) $(LDFLAGS)
-
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
@@ -60,7 +54,7 @@ $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
-	rm -rf $(BUILD_DIR) $(TARGET) $(HARNESS)
+	rm -rf $(BUILD_DIR) $(TARGET)
 
 test: $(TARGET) $(TEST_RUNNER) $(TEST_SCRIPT_RUNNER)
 	./$(TEST_SCRIPT_RUNNER)

@@ -23,5 +23,6 @@
  * @return 0 on success / interruption, 1 on syntax or execution failure.
  */
 int builtin_multiwatch(ShellContext *ctx, int argc, char **argv);
+int builtin_multiwatch_fd(ShellContext *ctx, int argc, char **argv, int out_fd);
 
 #endif /* MULTIWATCH_H */

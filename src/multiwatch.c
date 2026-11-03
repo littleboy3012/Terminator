@@ -202,24 +202,25 @@ static int spawn_watched_cmd(WatchedCmd *wcmd, const ShellContext *ctx) {
  * <output of cmd1>
  * ----------------------------------------------------
  */
-static void print_formatted_output(const WatchedCmd *wcmd) {
+static void print_formatted_output(const WatchedCmd *wcmd, int out_fd) {
     time_t now = time(NULL);
+    if (out_fd < 0) out_fd = STDOUT_FILENO;
 
-    printf("\"%s\", %ld:\n", wcmd->name, (long)now);
-    printf("----------------------------------------------------\n");
+    dprintf(out_fd, "\"%s\", %ld:\n", wcmd->name, (long)now);
+    dprintf(out_fd, "----------------------------------------------------\n");
     if (wcmd->output_len > 0) {
-        printf("%s", wcmd->output_buf);
+        dprintf(out_fd, "%s", wcmd->output_buf);
         if (wcmd->output_buf[wcmd->output_len - 1] != '\n') {
-            printf("\n");
+            dprintf(out_fd, "\n");
         }
     }
-    printf("----------------------------------------------------\n");
-    fflush(stdout);
+    dprintf(out_fd, "----------------------------------------------------\n");
 }
 
-int builtin_multiwatch(ShellContext *ctx, int argc, char **argv) {
+int builtin_multiwatch_fd(ShellContext *ctx, int argc, char **argv, int out_fd) {
+    if (out_fd < 0) out_fd = STDOUT_FILENO;
     if (!ctx || argc < 2 || !argv) {
-        fprintf(stderr, "terminator: multiWatch: expected multiWatch [\"cmd1\", \"cmd2\", ...]\n");
+        dprintf(out_fd, "terminator: multiWatch: expected multiWatch [\"cmd1\", \"cmd2\", ...]\n");
         return 1;
     }
 
@@ -227,7 +228,7 @@ int builtin_multiwatch(ShellContext *ctx, int argc, char **argv) {
     int num_cmds = parse_multiwatch_commands(argc, argv, cmds, MAX_MW_COMMANDS);
 
     if (num_cmds == 0) {
-        fprintf(stderr, "terminator: multiWatch: no valid commands found in argument list\n");
+        dprintf(out_fd, "terminator: multiWatch: no valid commands found in argument list\n");
         return 1;
     }
 
@@ -323,7 +324,7 @@ int builtin_multiwatch(ShellContext *ctx, int argc, char **argv) {
                     cmds[i].last_finish_time = time(NULL);
 
                     /* Print the complete formatted output block */
-                    print_formatted_output(&cmds[i]);
+                    print_formatted_output(&cmds[i], out_fd);
 
                     /* Reset output buffer for next run */
                     cmds[i].output_len = 0;
@@ -351,4 +352,8 @@ int builtin_multiwatch(ShellContext *ctx, int argc, char **argv) {
     sigaction(SIGINT, &old_sa, NULL);
 
     return 0;
+}
+
+int builtin_multiwatch(ShellContext *ctx, int argc, char **argv) {
+    return builtin_multiwatch_fd(ctx, argc, argv, STDOUT_FILENO);
 }

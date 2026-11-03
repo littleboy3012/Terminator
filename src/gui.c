@@ -152,7 +152,7 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
         }
         if (len == 0) continue;
 
-        if (strcmp(cmd_line, "exit") == 0) {
+        if (strcmp(cmd_line, "exit") == 0 || tab->shell_ctx.should_exit) {
             break;
         }
 
@@ -167,28 +167,37 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
 
         if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
             Command *cmd = &pipeline.commands[0];
-            char out[8192];
-            out[0] = '\0';
-            int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
-            tab->shell_ctx.last_exit_status = ret;
-            if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
-                if (getcwd(tab->cwd, sizeof(tab->cwd))) {
-                    char cwd_msg[PATH_MAX + 16];
-                    snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
-                    if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
+            if (strcmp(cmd->argv[0], "exit") == 0) {
+                free_pipeline(&pipeline);
+                break;
+            }
+            if (strcasecmp(cmd->argv[0], "multiWatch") != 0) {
+                char out[8192];
+                out[0] = '\0';
+                int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
+                tab->shell_ctx.last_exit_status = ret;
+                if (tab->shell_ctx.should_exit) {
+                    free_pipeline(&pipeline);
+                    break;
                 }
+                if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
+                    if (getcwd(tab->cwd, sizeof(tab->cwd))) {
+                        char cwd_msg[PATH_MAX + 16];
+                        snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
+                        if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
+                    }
+                }
+                if (out[0] != '\0') {
+                    if (write(out_fd, out, strlen(out)) < 0) {}
+                }
+                free_pipeline(&pipeline);
+                continue;
             }
-            if (out[0] != '\0') {
-                if (write(out_fd, out, strlen(out)) < 0) {}
-            }
-            free_pipeline(&pipeline);
-            continue;
         }
 
         /* External pipeline execution */
         pid_t pid = fork();
         if (pid == 0) {
-            setpgid(0, 0);
             signal(SIGINT, SIG_DFL);
             signal(SIGTSTP, SIG_DFL);
             dup2(out_fd, STDOUT_FILENO);
@@ -321,7 +330,12 @@ void gui_cleanup(GuiApp *app) {
                 if (tab->tab_pid > 0) {
                     kill(-tab->tab_pid, SIGTERM);
                     kill(tab->tab_pid, SIGTERM);
-                    waitpid(tab->tab_pid, NULL, WNOHANG);
+                    if (waitpid(tab->tab_pid, NULL, WNOHANG) == 0) {
+                        kill(-tab->tab_pid, SIGKILL);
+                        kill(tab->tab_pid, SIGKILL);
+                        waitpid(tab->tab_pid, NULL, 0);
+                    }
+                    tab->tab_pid = 0;
                 }
             } else {
                 if (tab->is_thread_alive) {
@@ -451,7 +465,12 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
         if (tab->tab_pid > 0) {
             kill(-tab->tab_pid, SIGTERM);
             kill(tab->tab_pid, SIGTERM);
-            waitpid(tab->tab_pid, NULL, WNOHANG);
+            if (waitpid(tab->tab_pid, NULL, WNOHANG) == 0) {
+                kill(-tab->tab_pid, SIGKILL);
+                kill(tab->tab_pid, SIGKILL);
+                waitpid(tab->tab_pid, NULL, 0);
+            }
+            tab->tab_pid = 0;
         }
     } else {
         if (tab->is_thread_alive) {
@@ -479,6 +498,8 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
 
     if (app->num_tabs == 0) {
         app->is_running = 0;
+    } else if (tab_idx < app->active_tab_idx) {
+        app->active_tab_idx--;
     } else if (app->active_tab_idx >= app->num_tabs) {
         app->active_tab_idx = app->num_tabs - 1;
     }
@@ -562,14 +583,6 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
 
     history_add(cmd_str);
 
-    if (tab->use_process_mode) {
-        if (tab->to_tab_fd >= 0) {
-            if (write(tab->to_tab_fd, cmd_str, strlen(cmd_str)) < 0) {}
-            if (write(tab->to_tab_fd, "\n", 1) < 0) {}
-        }
-        return;
-    }
-
     Pipeline pipeline;
     if (parse_line(cmd_str, &tab->shell_ctx, &pipeline) != 0) {
         tab_append_output(tab, "terminator: syntax error\n", 25);
@@ -580,7 +593,9 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
         Command *cmd = &pipeline.commands[0];
         if (strcmp(cmd->argv[0], "exit") == 0) {
             free_pipeline(&pipeline);
-            gui_close_tab(app, app->active_tab_idx);
+            int cur_idx = app->active_tab_idx;
+            gui_close_tab(app, cur_idx);
+            gui_redraw(app);
             return;
         }
         if (strcmp(cmd->argv[0], "clear") == 0) {
@@ -590,6 +605,19 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             gui_redraw(app);
             return;
         }
+    }
+
+    if (tab->use_process_mode) {
+        free_pipeline(&pipeline);
+        if (tab->to_tab_fd >= 0) {
+            if (write(tab->to_tab_fd, cmd_str, strlen(cmd_str)) < 0) {}
+            if (write(tab->to_tab_fd, "\n", 1) < 0) {}
+        }
+        return;
+    }
+
+    if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
+        Command *cmd = &pipeline.commands[0];
         if (strcmp(cmd->argv[0], "fg") == 0) {
             char out[512];
             Job res_job;
@@ -619,17 +647,19 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             return;
         }
 
-        char out[8192];
-        out[0] = '\0';
-        int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
-        tab->shell_ctx.last_exit_status = ret;
-        if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
-            snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
+        if (strcasecmp(cmd->argv[0], "multiWatch") != 0) {
+            char out[8192];
+            out[0] = '\0';
+            int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
+            tab->shell_ctx.last_exit_status = ret;
+            if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
+                snprintf(tab->cwd, sizeof(tab->cwd), "%s", tab->shell_ctx.cwd);
+            }
+            if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
+            free_pipeline(&pipeline);
+            gui_redraw(app);
+            return;
         }
-        if (out[0] != '\0') tab_append_output(tab, out, (int)strlen(out));
-        free_pipeline(&pipeline);
-        gui_redraw(app);
-        return;
     }
 
     int pipefds[2];
@@ -1481,14 +1511,9 @@ void gui_run_loop(GuiApp *app) {
                         if (bj) bj->out_pipe_fd = -1;
                     } else {
                         if (t->use_process_mode) {
-                            if (t->tab_pid > 0) {
-                                waitpid(t->tab_pid, NULL, WNOHANG);
-                                t->tab_pid = 0;
-                            }
-                            close(t->out_pipe_fd);
-                            t->out_pipe_fd = -1;
-                            if (t->to_tab_fd >= 0) { close(t->to_tab_fd); t->to_tab_fd = -1; }
-                            tab_append_output(t, "\n[Tab process closed]\n", 22);
+                            gui_close_tab(app, t_idx);
+                            needs_redraw = 1;
+                            break;
                         } else {
                             close(t->out_pipe_fd);
                             t->out_pipe_fd = -1;
@@ -1507,6 +1532,11 @@ void gui_run_loop(GuiApp *app) {
                     }
                 }
             }
+        }
+
+        if (app->num_tabs == 0 || !app->is_running) {
+            app->is_running = 0;
+            break;
         }
 
         for (int i = 0; i < app->num_tabs; i++) {
