@@ -178,8 +178,8 @@ static void append_token_str(char *token, int *token_len, const char *str, int l
 /**
  * @brief Expands environment variables, "$?", or "$(...)" into out_buf.
  */
-static int expand_variable(const char *str, char *out_buf, size_t max_len,
-                           const ShellContext *ctx, int *chars_consumed) {
+int expand_variable(const char *str, char *out_buf, size_t max_len,
+                    const ShellContext *ctx, int *chars_consumed) {
     *chars_consumed = 1;
 
     if (str[1] == '?') {

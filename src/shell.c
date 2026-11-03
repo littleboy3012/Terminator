@@ -66,38 +66,6 @@ void shell_cleanup(ShellContext *ctx) {
  * @param[in] output_file Path to output redirection file (e.g. "> outfile.txt"), or NULL.
  * @return 0 on success, or -1 if opening either redirection file failed.
  */
-int setup_redirections(const char *input_file, const char *output_file) {
-    if (input_file) {
-        int in_fd = open(input_file, O_RDONLY);
-        if (in_fd < 0) {
-            fprintf(stderr, "terminator: %s: %s\n", input_file, strerror(errno));
-            return -1;
-        }
-        if (dup2(in_fd, STDIN_FILENO) < 0) {
-            perror("terminator: dup2 stdin failed");
-            close(in_fd);
-            return -1;
-        }
-        close(in_fd);
-    }
-
-    if (output_file) {
-        int out_fd = open(output_file, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-        if (out_fd < 0) {
-            fprintf(stderr, "terminator: %s: %s\n", output_file, strerror(errno));
-            return -1;
-        }
-        if (dup2(out_fd, STDOUT_FILENO) < 0) {
-            perror("terminator: dup2 stdout failed");
-            close(out_fd);
-            return -1;
-        }
-        close(out_fd);
-    }
-
-    return 0;
-}
-
 int setup_command_redirections(const Command *cmd) {
     if (!cmd) return 0;
     if (cmd->nredirs > 0) {
@@ -115,21 +83,10 @@ int setup_command_redirections(const Command *cmd) {
                     return -1;
                 }
                 close(fd);
-            } else if (r->type == REDIR_OUT) {
+            } else if (r->type == REDIR_OUT || r->type == REDIR_APPEND) {
                 int target = (r->fd > 0) ? r->fd : STDOUT_FILENO;
-                int fd = open(r->filename, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-                if (fd < 0) {
-                    fprintf(stderr, "terminator: %s: %s\n", r->filename, strerror(errno));
-                    return -1;
-                }
-                if (dup2(fd, target) < 0) {
-                    close(fd);
-                    return -1;
-                }
-                close(fd);
-            } else if (r->type == REDIR_APPEND) {
-                int target = (r->fd > 0) ? r->fd : STDOUT_FILENO;
-                int fd = open(r->filename, O_WRONLY | O_CREAT | O_APPEND, 0644);
+                int flags = O_WRONLY | O_CREAT | (r->type == REDIR_APPEND ? O_APPEND : O_TRUNC);
+                int fd = open(r->filename, flags, 0644);
                 if (fd < 0) {
                     fprintf(stderr, "terminator: %s: %s\n", r->filename, strerror(errno));
                     return -1;
@@ -140,14 +97,45 @@ int setup_command_redirections(const Command *cmd) {
                 }
                 close(fd);
             } else if (r->type == REDIR_DUP) {
-                if (dup2(r->dup_target, r->fd) < 0) {
-                    return -1;
-                }
+                if (dup2(r->dup_target, r->fd) < 0) return -1;
             }
         }
         return 0;
     }
-    return setup_redirections(cmd->input_file, cmd->output_file);
+
+    if (cmd->input_file) {
+        int in_fd = open(cmd->input_file, O_RDONLY);
+        if (in_fd < 0) {
+            fprintf(stderr, "terminator: %s: %s\n", cmd->input_file, strerror(errno));
+            return -1;
+        }
+        if (dup2(in_fd, STDIN_FILENO) < 0) {
+            close(in_fd);
+            return -1;
+        }
+        close(in_fd);
+    }
+    if (cmd->output_file) {
+        int out_fd = open(cmd->output_file, O_WRONLY | O_CREAT | (cmd->is_append ? O_APPEND : O_TRUNC), 0644);
+        if (out_fd < 0) {
+            fprintf(stderr, "terminator: %s: %s\n", cmd->output_file, strerror(errno));
+            return -1;
+        }
+        if (dup2(out_fd, STDOUT_FILENO) < 0) {
+            close(out_fd);
+            return -1;
+        }
+        close(out_fd);
+    }
+    return 0;
+}
+
+int setup_redirections(const char *input_file, const char *output_file) {
+    Command dummy;
+    memset(&dummy, 0, sizeof(dummy));
+    dummy.input_file = (char *)input_file;
+    dummy.output_file = (char *)output_file;
+    return setup_command_redirections(&dummy);
 }
 
 /**

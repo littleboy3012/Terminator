@@ -34,6 +34,12 @@ int parse_line(const char *line, const ShellContext *ctx, Pipeline *pipeline);
 int is_command_incomplete(const char *line);
 
 /**
+ * @brief Expands environment variables, "$?", "$0", "$#", "$1".."$9", or "${VAR}".
+ */
+int expand_variable(const char *str, char *out_buf, size_t max_len,
+                    const ShellContext *ctx, int *chars_consumed);
+
+/**
  * @brief Deallocates all dynamically allocated memory within a Pipeline structure.
  *
  * Must be called after executing a pipeline to avoid memory leaks.

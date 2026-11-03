@@ -196,14 +196,6 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
             close(in_fd);
             close(out_fd);
 
-            if (pipeline.num_commands == 1) {
-                Command *c = &pipeline.commands[0];
-                if (setup_redirections(c->input_file, c->output_file) != 0) _exit(1);
-                execvp(c->argv[0], c->argv);
-                fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
-                _exit(127);
-            }
-
             Pipeline exec_pl = pipeline;
             exec_pl.is_background = 0;
             int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
@@ -672,19 +664,6 @@ void tab_submit_command(GuiApp *app, Tab *tab) {
             if (devnull >= 0) {
                 dup2(devnull, STDIN_FILENO);
                 close(devnull);
-            }
-        }
-
-        if (pipeline.num_commands == 1) {
-            Command *c = &pipeline.commands[0];
-            if (setup_redirections(c->input_file, c->output_file) != 0) _exit(1);
-            if (is_builtin_command(c->argv[0])) {
-                int ret = execute_builtin(&tab->shell_ctx, c);
-                _exit(ret);
-            } else {
-                execvp(c->argv[0], c->argv);
-                fprintf(stderr, "terminator: %s: command not found\n", c->argv[0]);
-                _exit(127);
             }
         }
 

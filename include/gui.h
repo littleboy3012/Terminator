@@ -14,7 +14,6 @@
 #define MAX_TABS 8
 #define MAX_LINE_CHARS 1024
 #define MAX_BUFFER_LINES 2000
-#define MAX_TAB_HISTORY 1000
 #define TAB_BAR_HEIGHT 36
 
 /**

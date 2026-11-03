@@ -66,75 +66,14 @@ static void expand_test_tokens(ShellContext *ctx, const char *raw_expr, char **t
             }
 
             if (*p == '$' && qchar != '\'') {
-                /* Variable expansion */
-                p++;
-                if (*p == '{') {
-                    p++;
-                    char vname[256];
-                    int vi = 0;
-                    while (*p && *p != '}' && vi < 255) vname[vi++] = *p++;
-                    vname[vi] = '\0';
-                    if (*p == '}') p++;
-
-                    const char *val = NULL;
-                    char num_buf[32];
-                    if (vname[0] == '#' && vname[1] == '\0') {
-                        snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->script_argc : 0);
-                        val = num_buf;
-                    } else if (vname[0] == '0' && vname[1] == '\0') {
-                        val = (ctx && ctx->script_name[0]) ? ctx->script_name : "terminator";
-                    } else if (isdigit((unsigned char)vname[0]) && vname[1] == '\0') {
-                        int idx = vname[0] - '1';
-                        if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc) {
-                            val = ctx->script_argv[idx];
-                        }
-                    } else if (vname[0] == '?' && vname[1] == '\0') {
-                        snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->last_exit_status : 0);
-                        val = num_buf;
-                    } else {
-                        val = getenv(vname);
-                    }
-
-                    if (val) {
-                        for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) {
-                            buf[blen++] = val[k];
-                        }
-                    }
-                } else if (*p == '#') {
-                    p++;
-                    char num_buf[32];
-                    snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->script_argc : 0);
-                    for (int k = 0; num_buf[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = num_buf[k];
-                } else if (*p == '0') {
-                    p++;
-                    const char *val = (ctx && ctx->script_name[0]) ? ctx->script_name : "terminator";
-                    for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = val[k];
-                } else if (*p == '?') {
-                    p++;
-                    char num_buf[32];
-                    snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->last_exit_status : 0);
-                    for (int k = 0; num_buf[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = num_buf[k];
-                } else if (isdigit((unsigned char)*p)) {
-                    int idx = *p - '1';
-                    p++;
-                    if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc && ctx->script_argv[idx]) {
-                        const char *val = ctx->script_argv[idx];
-                        for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = val[k];
-                    }
-                } else {
-                    char vname[256];
-                    int vi = 0;
-                    while (*p && (isalnum((unsigned char)*p) || *p == '_') && vi < 255) {
-                        vname[vi++] = *p++;
-                    }
-                    vname[vi] = '\0';
-                    const char *val = getenv(vname);
-                    if (val) {
-                        for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) {
-                            buf[blen++] = val[k];
-                        }
-                    }
+                char exp_buf[1024];
+                int consumed = 0;
+                int elen = expand_variable(p, exp_buf, sizeof(exp_buf), ctx, &consumed);
+                for (int k = 0; k < elen && blen < (int)sizeof(buf) - 1; k++) {
+                    buf[blen++] = exp_buf[k];
                 }
+                p += (consumed > 0) ? consumed : 1;
+                continue;
             } else {
                 if (blen < (int)sizeof(buf) - 1) {
                     buf[blen++] = *p;

@@ -94,7 +94,7 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
         }
         return builtin_bg(ctx, cmd->argv);
     }
-    if (strcmp(name, "source") == 0) {
+    if (strcmp(name, "source") == 0 || strcmp(name, ".") == 0) {
         if (!cmd->argv[1]) {
             snprintf(out_buf, max_len, "terminator: source: not implemented yet\n");
             return 1;
@@ -106,7 +106,7 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
 
 int builtin_source(ShellContext *ctx, char **argv) {
     if (!ctx || !argv || !argv[1]) {
-        fprintf(stderr, "terminator: source: filename argument required\n");
+        fprintf(stderr, "terminator: %s: filename argument required\n", argv && argv[0] ? argv[0] : "source");
         return 1;
     }
     int argc = 0;
@@ -117,10 +117,13 @@ int builtin_source(ShellContext *ctx, char **argv) {
 int builtin_history(ShellContext *ctx, char **argv) {
     (void)ctx;
     (void)argv;
-    char hist_buf[65536];
-    int n = history_format_recent(hist_buf, sizeof(hist_buf), 1000);
-    if (n > 0) {
-        if (write(STDOUT_FILENO, hist_buf, n) < 0) {}
+    char *hist_buf = (char *)malloc(32768);
+    if (hist_buf) {
+        int n = history_format_recent(hist_buf, 32768, 1000);
+        if (n > 0) {
+            if (write(STDOUT_FILENO, hist_buf, n) < 0) {}
+        }
+        free(hist_buf);
     }
     return 0;
 }
