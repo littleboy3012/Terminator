@@ -71,6 +71,9 @@ typedef struct {
     JobTable job_table;   /**< Active background and stopped jobs in this shell session (Task 8) */
     pid_t foreground_pid; /**< Active foreground process PID (0 if idle) */
     char foreground_cmd[MAX_CMD_LEN]; /**< Command line string of active foreground process */
+    int script_argc;      /**< Positional parameter count ($#) for active bash script */
+    char **script_argv;   /**< Positional parameter array ($1..$9) for active bash script */
+    char script_name[PATH_MAX]; /**< Script name / path ($0) for active bash script */
 } ShellContext;
 
 /**

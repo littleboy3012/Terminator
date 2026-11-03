@@ -167,47 +167,6 @@ static inline void shared_unlock(Shared *sh) {
     pthread_mutex_unlock(&sh->mutex);
 }
 
-static inline size_t history_encode_line(const char *raw, char *enc, size_t max) {
-    if (!raw || !enc || max < 2) return 0;
-    size_t o = 0;
-    for (size_t i = 0; raw[i] && o + 3 < max; i++) {
-        if (raw[i] == '\\') {
-            enc[o++] = '\\';
-            enc[o++] = '\\';
-        } else if (raw[i] == '\n') {
-            enc[o++] = '\\';
-            enc[o++] = 'n';
-        } else {
-            enc[o++] = raw[i];
-        }
-    }
-    enc[o++] = '\n';
-    enc[o] = '\0';
-    return o;
-}
-
-static inline size_t history_decode_line(const char *enc, size_t len, char *dec, size_t max) {
-    if (!enc || !dec || max == 0) return 0;
-    size_t o = 0;
-    for (size_t i = 0; i < len && o + 1 < max; i++) {
-        if (enc[i] == '\\' && i + 1 < len) {
-            if (enc[i + 1] == 'n') {
-                dec[o++] = '\n';
-                i++;
-            } else if (enc[i + 1] == '\\') {
-                dec[o++] = '\\';
-                i++;
-            } else {
-                dec[o++] = enc[i];
-            }
-        } else if (enc[i] != '\n' && enc[i] != '\r') {
-            dec[o++] = enc[i];
-        }
-    }
-    dec[o] = '\0';
-    return o;
-}
-
 static inline Shared *shared_create(void) {
     Shared *sh = (Shared *)mmap(NULL, sizeof(Shared),
                                 PROT_READ | PROT_WRITE,
@@ -404,33 +363,6 @@ static inline int history_init_persistence(Shared *sh) {
     return 0;
 }
 
-typedef enum {
-    HIST_MATCH_NONE = 0,
-    HIST_MATCH_EXACT = 1,
-    HIST_MATCH_SUBSTRING = 2
-} HistMatchType;
-
-typedef struct {
-    HistMatchType match_type;
-    int match_len;
-    size_t count;
-    char **entries;
-} HistSearchResult;
-
-static inline void hist_search_result_free(HistSearchResult *res) {
-    if (!res) return;
-    if (res->entries) {
-        for (size_t i = 0; i < res->count; i++) {
-            free(res->entries[i]);
-        }
-        free(res->entries);
-        res->entries = NULL;
-    }
-    res->count = 0;
-    res->match_type = HIST_MATCH_NONE;
-    res->match_len = 0;
-}
-
 static inline int compute_lcs_len(const char *s1, const char *s2) {
     if (!s1 || !s2) return 0;
     int l1 = (int)strlen(s1);
@@ -456,7 +388,8 @@ static inline int compute_lcs_len(const char *s1, const char *s2) {
     return max_lcs;
 }
 
-static inline int history_search(Shared *sh, const char *term, HistSearchResult *res) {
+#define history_search(sh, term, res) harness_history_search(sh, term, res)
+static inline int harness_history_search(Shared *sh, const char *term, HistSearchResult *res) {
     if (!res) return -1;
     res->match_type = HIST_MATCH_NONE;
     res->match_len = 0;

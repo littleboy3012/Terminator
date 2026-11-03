@@ -2,6 +2,7 @@
 #include "multiwatch.h"
 #include "history.h"
 #include "parser.h"
+#include "script.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,7 +21,8 @@ int is_builtin_command(const char *name) {
             strcmp(name, "exit") == 0 || strcmp(name, "clear") == 0 ||
             strcasecmp(name, "multiWatch") == 0 || strcmp(name, "jobs") == 0 ||
             strcmp(name, "fg") == 0 || strcmp(name, "bg") == 0 ||
-            strcmp(name, "history") == 0 || strcmp(name, "source") == 0);
+            strcmp(name, "history") == 0 || strcmp(name, "source") == 0 ||
+            strcmp(name, ".") == 0);
 }
 
 /**
@@ -39,7 +41,7 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
     if (strcmp(name, "bg") == 0) return builtin_bg(ctx, cmd->argv);
     if (strcmp(name, "fg") == 0) return builtin_fg(ctx, cmd->argv);
     if (strcmp(name, "history") == 0) return builtin_history(ctx, cmd->argv);
-    if (strcmp(name, "source") == 0) return builtin_source(ctx, cmd->argv);
+    if (strcmp(name, "source") == 0 || strcmp(name, ".") == 0) return builtin_source(ctx, cmd->argv);
 
     return 1;
 }
@@ -104,29 +106,12 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
 
 int builtin_source(ShellContext *ctx, char **argv) {
     if (!ctx || !argv || !argv[1]) {
-        fprintf(stderr, "terminator: source: not implemented yet\n");
+        fprintf(stderr, "terminator: source: filename argument required\n");
         return 1;
     }
-    FILE *fp = fopen(argv[1], "r");
-    if (!fp) {
-        fprintf(stderr, "terminator: source: %s: %s\n", argv[1], strerror(errno));
-        return 1;
-    }
-    char line[4096];
-    int last_status = 0;
-    while (fgets(line, sizeof(line), fp)) {
-        size_t l = strlen(line);
-        while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
-        if (l == 0 || line[0] == '#') continue;
-        Pipeline pl;
-        if (parse_line(line, ctx, &pl) == 0) {
-            last_status = shell_execute_pipeline(ctx, &pl);
-            free_pipeline(&pl);
-        }
-    }
-    fclose(fp);
-    ctx->last_exit_status = last_status;
-    return last_status;
+    int argc = 0;
+    while (argv[argc]) argc++;
+    return script_run(ctx, argv[1], argc - 1, argv + 1);
 }
 
 int builtin_history(ShellContext *ctx, char **argv) {

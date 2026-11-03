@@ -1,0 +1,2396 @@
+diff --git a/DESIGN.md b/DESIGN.md
+index 79f0e08..d5e38d2 100644
+--- a/DESIGN.md
++++ b/DESIGN.md
+@@ -66,7 +66,9 @@ flowchart TD
+ | `src/shell.c` | `include/shell.h` | Pipeline orchestrator; I/O redirection; external process fork/exec; process group leader. | `shell_init()`, `shell_cleanup()`, `shell_execute_pipeline()`, `shell_execute_command()`, `setup_redirections()`<br>Structs: `ShellContext` |
+ | `src/builtins.c`| `include/builtins.h`| Built-in implementations affecting shell state; unified output capturing for GUI/pipes. | `is_builtin_command()`, `execute_builtin()`, `execute_builtin_captured()`, `builtin_cd()`, `builtin_exit()`, `builtin_clear()`, `builtin_jobs()`, `builtin_bg()`, `builtin_fg()`, `builtin_history()`, `builtin_source()` |
+ | `src/jobs.c` | `include/jobs.h` | POSIX job control table; process group tracking; asynchronous completion notifications. | `jobs_init()`, `jobs_add()`, `jobs_remove()`, `jobs_find_by_id()`, `jobs_find_by_pid()`, `jobs_check_status()`, `jobs_print()`, `jobs_builtin_bg()`, `jobs_builtin_fg()`, `jobs_kill_all()`, `jobs_get_current()`<br>Structs: `JobTable`, `Job`, `JobState` |
+-| `src/history.c` | `include/history.h` | Synchronized cross-tab command history ring buffer; POSIX shared memory; semaphores. | `history_init()`, `history_cleanup()`, `history_add()`, `history_get_relative()`, `history_count()`, `history_format_recent()`<br>Structs: `SharedHistory` |
++| `src/history.c` | `include/history.h` | Persistent 10,000-command history ring buffer; disk persistence (`~/.terminator_history`); compaction (>20,000); 3-tier LCS search engine. | `history_init()`, `history_cleanup()`, `history_add()`, `history_get_relative()`, `history_count()`, `history_format_recent()`, `history_search()`, `hist_search_result_free()`, `history_encode_line()`, `history_decode_line()`<br>Structs: `SharedHistory`, `HistSearchResult`, `HistMatchType` |
++| `src/completion.c` | `include/completion.h` | Context-aware Tab file-name auto-completion engine; word extraction with quote/escape handling; LCP computation; candidate formatter. | `complete_extract_word()`, `complete_unescape_word()`, `complete_escape_filename()`, `complete_decompose_word()`, `complete_compute_lcp()`, `complete_file_candidates()`, `complete_format_numbered_list()`, `completion_result_free()`<br>Structs: `CompletionResult` |
++| `src/script.c` | `include/script.h` | In-house bash script runner; control flow evaluator; conditional evaluator `[ ... ]`; positional parameter manager; recursion guard. | `script_run()`, `is_bash_script()`, `script_eval_test()`<br>Structs: `CondFrame` |
+ | `src/multiwatch.c`| `include/multiwatch.h`| Concurrent parallel command execution; 2.0s refresh timer; formatted banner rendering. | `builtin_multiwatch()`, `parse_multiwatch_commands()`, `spawn_watched_cmd()`, `print_formatted_output()`<br>Structs: `WatchedCmd` |
+ | `src/hotkeys.c` | `include/hotkeys.h` | Keybinding configuration reader (`~/.terminatorrc`); conflict detector; X11 KeySym mapper. | `hotkeys_init()`, `hotkeys_match()`, `check_and_resolve_conflicts()`, `parse_combo_string()`<br>Structs: `HotkeyConfig`, `HotkeyBinding`, `HotkeyAction` |
+ 
+@@ -500,36 +502,250 @@ sequenceDiagram
+ 
+ ---
+ 
+-### Task 9 — Shared Command History
++### Task 9 — Searchable and Persistent Command History
+ 
+ #### 1. Trigger & Input
+-- Every command executed via <kbd>Return</kbd>, Up/Down arrow keys, or `history` built-in command.
++- **Automatic Appending**: Every command executed via <kbd>Return</kbd> in interactive mode is committed to shared history.
++- **`history` Built-in Command**: Invoked by user command `history` (displays up to the last 1,000 commands formatted as `%5d  %s\n`).
++- **Interactive Reverse Search (`Ctrl+R`)**: User presses <kbd>Ctrl+R</kbd> in the GUI terminal. The prompt switches to `Enter search term: `, accepting user query input until <kbd>Return</kbd> (to search) or <kbd>Esc</kbd>/<kbd>Ctrl+C</kbd> (to cancel).
+ 
+ #### 2. Step-by-Step Execution Trace
+-1. **Appending Command (`history.c:history_add`)**:
++1. **Startup Loading & Compaction (`history.c:history_init`)**:
++   - Determines persistence file path from `TERMINATOR_HISTFILE` environment variable (default: `~/.terminator_history`).
++   - Acquires the shared semaphore `sem_wait(&g_shared_history->sem)`.
++   - Counts total lines in the persistence file. If lines exceed 20,000, enforces compaction: reads file, keeps only the most recent 10,000 lines, writes them atomically to a temporary file, and renames it over `~/.terminator_history`.
++   - Decodes stored lines using `history_decode_line()` (reversing `\n` and `\\` escape sequences) and loads up to 10,000 commands into the in-memory circular ring buffer `g_shared_history->commands`.
++   - Releases semaphore `sem_post(&g_shared_history->sem)`.
++2. **Appending Commands (`history.c:history_add`)**:
+    - Acquires semaphore: `sem_wait(&g_shared_history->sem)`.
+-   - Checks ring buffer bounds: if input is identical to most recent entry or empty, ignores it.
+-   - Copies string to `g_shared_history->commands[g_shared_history->head]`.
+-   - Strips trailing newlines.
+-   - Increments `head = (head + 1) % MAX_HISTORY_COMMANDS`.
+-   - Increments `count` up to `MAX_HISTORY_COMMANDS` (10,000).
+-   - Releases semaphore: `sem_post(&g_shared_history->sem)`.
+-2. **Relative History Lookup (`history.c:history_get_relative`)**:
+-   - Used by <kbd>Up</kbd> (`offset = 0, 1, ...`) and <kbd>Down</kbd> arrow keys.
+-   - Acquires semaphore: `sem_wait(&g_shared_history->sem)`.
+-   - Computes circular ring index:
+-     `idx = (head - 1 - offset + 2 * MAX_HISTORY_COMMANDS) % MAX_HISTORY_COMMANDS`.
+-   - Copies command string to output buffer.
+-   - Releases semaphore: `sem_post(&g_shared_history->sem)`.
+-3. **History Command Formatting (`history.c:history_format_recent`)**:
+-   - `builtin_history()` requests recent 1,000 entries.
+-   - Iterates through valid ring buffer slots, formatting numbered list:
+-     ```text
+-         1  echo first_command
+-         2  echo second_command
+-         3  history
+-     ```
+-   - Emits buffer to stdout or tab scrollback.
++   - Ignores empty commands or commands identical to the most recent entry (deduplication).
++   - Copies command string to `g_shared_history->commands[g_shared_history->head]`.
++   - Advances head pointer: `head = (head + 1) % MAX_HISTORY_COMMANDS` (10,000).
++   - Updates `count = count < 10000 ? count + 1 : 10000`.
++   - Encodes command via `history_encode_line()` and appends to disk file via `fopen(path, "a")`.
++   - Releases semaphore `sem_post(&g_shared_history->sem)`.
++3. **3-Tier Reverse Search Algorithm (`history.c:history_search`)**:
++   - **Tier 1 (Exact Match)**: Scans commands from newest to oldest (`offset = 0 ... count - 1`). If `strcmp(cand, term) == 0`, immediately populates `res->entries[0]` with `cand`, sets `match_type = HIST_MATCH_EXACT`, and returns.
++   - **Tier 2 (Maximal Longest Common Subsequence / Substring)**: If no exact match exists, computes LCS length between `term` and all stored commands using dynamic programming (`compute_lcs_len()`). Identifies maximal LCS length `best_lcs`. If `best_lcs > 2`, collects all commands tied for `best_lcs`, deduplicating identical entries, orders them most-recent-first, sets `match_type = HIST_MATCH_SUBSTRING`, and returns.
++   - **Tier 3 (No Match)**: If no exact match and `best_lcs <= 2`, sets `match_type = HIST_MATCH_NONE` and `count = 0`.
++4. **GUI Interactive Handling (`gui.c:gui_handle_key_press`)**:
++   - On <kbd>Ctrl+R</kbd>: sets `tab->is_searching_history = 1`, clears `tab->search_query`.
++   - While `is_searching_history == 1`:
++     - Displays red prompt `Enter search term: ` with green user query.
++     - On <kbd>Return</kbd>: appends `Enter search term: <query>\n` to scrollback, invokes `history_search()`. If matched, prints all matching commands, loads the most recent match directly into `tab->input_buffer`, resets search mode, and redraws terminal ready for editing or execution. If no match, prints `No match for search term in history\n`.
++     - On <kbd>Esc</kbd> or <kbd>Ctrl+C</kbd>: cancels search mode silently, restoring prompt.
++
++#### 3. Call Graph / Sequence Diagram
++```mermaid
++sequenceDiagram
++    autonumber
++    participant User
++    participant GUI as src/gui.c:gui_handle_key_press()
++    participant Hist as src/history.c:history_search()
++    participant DP as src/history.c:compute_lcs_len()
++    participant Canvas as src/gui.c:gui_redraw()
++
++    User->>GUI: KeyPress (Ctrl+R)
++    GUI->>GUI: Set is_searching_history = 1
++    GUI->>Canvas: Redraw prompt: "Enter search term: "
++    User->>GUI: Type search query + KeyPress (Return)
++    GUI->>Hist: history_search(query, &res)
++    alt Exact Match Found
++        Hist->>Hist: Set HIST_MATCH_EXACT
++    else LCS > 2 Found
++        loop For Each History Entry
++            Hist->>DP: compute_lcs_len(query, history_cmd)
++        end
++        Hist->>Hist: Filter max LCS entries & deduplicate
++    else No Match / LCS <= 2
++        Hist->>Hist: Set HIST_MATCH_NONE
++    end
++    Hist-->>GUI: Return match results
++    GUI->>GUI: tab_append_output(matches / "No match...")
++    GUI->>GUI: Set tab->input_buffer = res.entries[0]
++    GUI->>GUI: Reset is_searching_history = 0
++    GUI->>Canvas: Redraw standard prompt with matched command
++```
++
++#### 4. Error Handling & Edge Cases
++- **Blank Search String**: Empty or whitespace-only search queries safely yield `HIST_MATCH_NONE` with 0 allocations.
++- **Corrupt History File**: Malformed or oversized lines on disk are safely skipped during startup decode.
++- **Dead Process Mutex/Semaphore Recovery**: In Process Mode, semaphore/mutex state remains consistent across crashes via POSIX synchronization primitives.
++
++---
++
++### Task 10 — File-Name Auto-Completion
++
++#### 1. Trigger & Input
++- **<kbd>Tab</kbd> Key**: Pressed while typing a command path or argument in the active terminal input line.
++- **Digit Keys (`1`..`9`)**: Pressed when candidate selection mode (`is_completion_active == 1`) is awaiting choice selection.
++
++#### 2. Step-by-Step Execution Trace
++1. **Word Boundary Extraction (`completion.c:complete_extract_word`)**:
++   - Parses the input buffer backward from cursor position `cursor_pos`.
++   - Recognizes quotes (`'` and `"`) and backslash escapes (`\ `). Unescaped spaces, tabs, pipe symbols (`|`), and redirection operators (`<`, `>`) delineate argument boundaries.
++   - Computes `word_start` and `word_len`.
++2. **Word Decomposition (`completion.c:complete_decompose_word`)**:
++   - Locates the rightmost slash `/` in the word.
++   - Separates path into `dir_prefix` (e.g., `src/`, `~/subdir/`) and `file_prefix` (e.g., `te`, `prog`).
++   - Unescapes `dir_prefix` and expands `~` to `$HOME`. If no directory prefix is present, targets the tab's isolated `cwd`.
++3. **Candidate Gathering & LCP Computation (`completion.c:complete_file_candidates`)**:
++   - Opens directory via `opendir(search_dir)`.
++   - Scans directory entries via `readdir()`. Ignores `.` and `..`. Ignores hidden files (`.*`) unless `file_prefix` explicitly begins with `.`.
++   - Matches entries prefixed with `file_prefix`.
++   - For each match, checks `stat(full_path, &st)`: if `S_ISDIR(st.st_mode)`, appends a trailing `/`; otherwise appends filename as-is.
++   - Sorts candidate array alphabetically using `qsort()`.
++   - Computes Longest Common Prefix (LCP) across all matching candidates using `complete_compute_lcp()`.
++4. **Completion Resolution (`gui.c:gui_handle_key_press`)**:
++   - **Single Match (`count == 1`)**:
++     - Escapes shell metacharacters in candidate using `complete_escape_filename()`.
++     - Appends trailing `/` if directory, or space `' '` if regular file.
++     - Calls `tab_delete_range()` to remove prefix, then `tab_insert_char()` to insert completed filename inline.
++   - **Multiple Matches (`count > 1`)**:
++     - If LCP extends beyond current word, extends text inline up to LCP.
++     - Formats candidates into a numbered list via `complete_format_numbered_list()`:
++       `1. abc.txt   2. abcd.txt`
++     - Commits active prompt line to scrollback buffer, prints numbered list, and preserves active input on the next line.
++     - Saves top candidate choices in `tab->completion_choices`, sets `tab->is_completion_active = 1`.
++   - **Numbered Selection**:
++     - User presses digit key (`'1'`..`'9'`).
++     - Terminal replaces word prefix with chosen candidate `tab->completion_choices[idx]`, appends `' '` for files, frees completion state, and resumes normal input mode.
++     - Any other key immediately dismisses candidate selection mode and processes keystroke normally.
++
++#### 3. Call Graph / Sequence Diagram
++```mermaid
++sequenceDiagram
++    autonumber
++    participant User
++    participant GUI as src/gui.c:gui_handle_key_press()
++    participant Comp as src/completion.c:complete_file_candidates()
++    participant FS as Linux VFS (opendir / readdir / stat)
++    participant Canvas as src/gui.c:gui_redraw()
++
++    User->>GUI: KeyPress (Tab)
++    GUI->>Comp: complete_file_candidates(input_buffer, cursor_pos, tab->cwd)
++    Comp->>Comp: complete_extract_word() + complete_decompose_word()
++    Comp->>FS: opendir(dir_prefix) + readdir()
++    FS-->>Comp: Directory entries
++    Comp->>Comp: Filter prefix matches + stat() for is_dir
++    Comp->>Comp: qsort() + complete_compute_lcp()
++    Comp-->>GUI: Return CompletionResult (count, items, lcp)
++    alt count == 1 (Single Match)
++        GUI->>GUI: Replace range with item + trailing '/' or ' '
++        GUI->>Canvas: Redraw updated input line
++    else count > 1 (Multiple Matches)
++        opt LCP > Current Word
++            GUI->>GUI: Extend input line inline to LCP
++        end
++        GUI->>GUI: Format & append numbered list to terminal lines
++        GUI->>GUI: Store choices in tab->completion_choices (1-9)
++        GUI->>GUI: Set tab->is_completion_active = 1
++        GUI->>Canvas: Redraw prompt with numbered candidates visible
++        User->>GUI: KeyPress ('1'..'9')
++        GUI->>GUI: Replace word with candidate[digit-1]
++        GUI->>GUI: Set tab->is_completion_active = 0
++        GUI->>Canvas: Redraw completed input line
++    else count == 0 (No Match)
++        GUI->>GUI: Silent no-op
++    end
++```
++
++#### 4. Error Handling & Edge Cases
++- **No Match**: Silent no-op without altering cursor or printing error messages.
++- **Spaces in Filenames**: Handled cleanly via `complete_escape_filename()`, prepending `\` to spaces and shell metacharacters.
++- **Mid-Line Completion**: Only replaces `[word_start, word_start + word_len]`, preserving suffix characters after the cursor.
++- **Per-Tab CWD Isolation**: Evaluates completion relative to `tab->cwd`, ensuring independent results per workspace tab.
++
++---
++
++### Task 11 — Running Bash Scripts
++
++#### 1. Trigger & Input
++- **Direct Execution**: `./script.sh [args...]` or `/path/to/script.sh [args...]`.
++- **Interpreter Invocation**: `bash script.sh [args...]`.
++- **Built-in Sourcing**: `source script.sh [args...]` or `. script.sh [args...]`.
++
++#### 2. Step-by-Step Execution Trace
++1. **Script Interception (`shell.c:shell_execute_command`)**:
++   - Before forking, inspects `cmd->argv[0]`.
++   - If command is `bash`, or matches `is_bash_script(cmd->argv[0])` (checking executable status, `.sh` extension, or `#!` shebang), execution is intercepted.
++   - Forbids delegation to `/bin/bash` or `system()`; dispatches directly to the internal interpreter `script_run()`.
++2. **Pre-Execution Syntax Validation (`script.c:validate_script_syntax`)**:
++   - Reads script file line-by-line.
++   - Tracks nesting depth of `if` statements and matching `fi` statements.
++   - If an unbalanced `if` without `fi` or stray `fi` is detected, halts before executing any lines, prints `terminator: <script>: syntax error: unexpected end of file (missing 'fi')`, and sets exit status `2`.
++3. **Execution Environment Setup (`script.c:script_run`)**:
++   - Saves existing positional parameter state (`old_argc`, `old_argv`, `old_name`).
++   - Configures script positional parameters:
++     - `ctx->script_name` = script path (`$0`).
++     - `ctx->script_argc` = argument count (`$#`).
++     - `ctx->script_argv` = argument vector (`$1`..`$9`).
++4. **Line-by-Line Execution & Control Flow**:
++   - **Comments & Blank Lines**: Lines beginning with `#` (ignoring leading whitespace) or empty lines are skipped.
++   - **Variable Assignments**: Statements matching `NAME=value` assign environment variables via `setenv(NAME, value, 1)`. In `source` mode, these persist in the parent tab context.
++   - **Condition Stack Management (`CondFrame`)**:
++     - Manages nested conditionals up to depth 32.
++     - `if [ ... ]; then`: Evaluates test condition using `script_eval_test()`. If true, branches into `COND_THEN` (executes body); if false, skips body until matching `elif`, `else`, or `fi`.
++     - `elif [ ... ]; then`: Evaluated only if preceding `if`/`elif` branches were false.
++     - `else`: Executed only if no previous branch in the current `if` frame evaluated to true.
++     - `fi`: Pops the active `CondFrame` from the condition stack.
++   - **Test Operator Evaluation (`script.c:script_eval_test`)**:
++     - Unary file tests: `-f` (regular file), `-d` (directory), `-e` (exists), `-s` (size > 0), `-r` (readable), `-w` (writable), `-x` (executable).
++     - String tests: `=` / `==` (equality), `!=` (inequality), `-z` (empty string), `-n` (non-empty string).
++     - Numeric tests: `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`.
++     - Logical negation: `!` prefix inverts condition truth value.
++   - **Pipelines & Redirections**:
++     - When condition frame permits execution, lines are expanded via `parse_line()` (resolving `$VAR`, `${VAR}`, `$0`..`$9`, `$#`, `$?`) and executed via `shell_execute_pipeline()`.
++   - **Exit Termination**:
++     - `exit [n]` immediately terminates script execution, returning status code `n` (defaulting to current `$?`).
++5. **Teardown & Parameter Restoration**:
++   - Restores parent positional parameters: `ctx->script_argc = old_argc`, `ctx->script_argv = old_argv`, `ctx->script_name = old_name`.
++   - Closes open file handles and frees allocated line buffers.
++
++#### 3. Call Graph / Sequence Diagram
++```mermaid
++sequenceDiagram
++    autonumber
++    participant Shell as src/shell.c:shell_execute_command()
++    participant Engine as src/script.c:script_run()
++    participant Val as src/script.c:validate_script_syntax()
++    participant Eval as src/script.c:script_eval_test()
++    participant Pipe as src/shell.c:shell_execute_pipeline()
++
++    Shell->>Engine: script_run(ctx, script_path, argc, argv)
++    Engine->>Val: validate_script_syntax(file)
++    alt Syntax Error (Unbalanced if...fi)
++        Val-->>Engine: Syntax Error (missing 'fi')
++        Engine-->>Shell: Return 2 (Syntax Error)
++    else Syntax Valid
++        Val-->>Engine: Validation Passed
++    end
++    Engine->>Engine: Configure $0, $#, $1..$9
++    loop For Each Line in Script
++        alt Comment (#) or Blank
++            Engine->>Engine: Skip line
++        else if / elif / else / fi
++            Engine->>Eval: script_eval_test(test_expression)
++            Eval-->>Engine: 0 (True) or 1 (False)
++            Engine->>Engine: Push/Update CondFrame state
++        else Variable Assignment (VAR=val)
++            Engine->>Engine: setenv("VAR", "val", 1)
++        else Command / Pipeline (Active Block)
++            Engine->>Pipe: shell_execute_pipeline(ctx, &pipeline)
++            Pipe-->>Engine: Return exit status ($?)
++        else exit [n]
++            Engine->>Engine: Break loop with status n
++        end
++    end
++    Engine->>Engine: Restore previous $0, $#, $1..$9
++    Engine-->>Shell: Return final exit status
++```
++
++#### 4. Error Handling & Edge Cases
++- **Forbidden Subshell Delegation**: Never delegates execution to `/bin/bash` or `system()`; pure in-house interpretation guarantees assignment compliance.
++- **Unbalanced Conditional Blocks**: Caught before executing statement 1, preventing partial side effects.
++- **Positional Parameter Scope**: When a script is sourced (`source script.sh`), environment variables persist, but positional parameters (`$1`..`$9`) revert cleanly to prior values.
++- **Recursion & Nesting**: Supports arbitrary conditional nesting up to depth 32 with bound checks preventing stack overflows.
+ 
+ ---
+ 
+@@ -611,5 +827,8 @@ sequenceDiagram
+ | **Signal Delivery** | `src/gui.c:gui_handle_key_press` | `kill(-pgid, SIGINT)`, `kill(-pgid, SIGTSTP)` | `tab->running_pid`, `tab->is_running_cmd` | `gui.c`, `signal.h` |
+ | **Background Job** | `src/shell.c:shell_execute_pipeline` | `fork`, `setpgid`, `jobs_add` | `ctx->job_table.jobs[]`, `Job` | `shell.c`, `jobs.c` |
+ | **Job Resumption** | `src/jobs.c:jobs_builtin_bg` | `jobs_find_by_id`, `kill(SIGCONT)` | `Job.state`, `job_table.current_job_id` | `jobs.c`, `builtins.c` |
+-| **Shared History** | `src/history.c:history_add`| `sem_wait`, `sem_post` | `SharedHistory.commands[][]`, `head`, `count` | `history.c`, `semaphore.h` |
++| **Shared History & Persistence** | `src/history.c:history_add`| `sem_wait`, `sem_post`, `history_encode_line`, `fopen` | `SharedHistory.commands[][]`, `head`, `count`, `~/.terminator_history` | `history.c`, `semaphore.h` |
++| **History Reverse Search (`Ctrl+R`)** | `src/gui.c:gui_handle_key_press` | `history_search`, `compute_lcs_len`, `hist_search_result_free` | `tab->is_searching_history`, `tab->search_query`, `HistSearchResult` | `history.c`, `gui.c` |
++| **File-Name Auto-Completion (`Tab`)** | `src/gui.c:gui_handle_key_press` | `complete_file_candidates`, `complete_compute_lcp`, `complete_format_numbered_list` | `tab->is_completion_active`, `tab->completion_choices[]`, `CompletionResult` | `completion.c`, `gui.c`, `<dirent.h>` |
++| **Bash Script Interpretation** | `src/shell.c:shell_execute_command` | `script_run`, `validate_script_syntax`, `script_eval_test`, `shell_execute_pipeline` | `ctx->script_argc`, `ctx->script_argv`, `ctx->script_name`, `CondFrame` | `script.c`, `shell.c`, `parser.c` |
+ | **System Teardown** | `src/gui.c:gui_cleanup` | `XFreeGC`, `XFreePixmap`, `XCloseDisplay`, `history_cleanup` | `GuiApp`, `SharedHistory` | `gui.c`, `history.c` |
+diff --git a/Makefile b/Makefile
+index 5e54336..0983416 100644
+--- a/Makefile
++++ b/Makefile
+@@ -24,7 +24,9 @@ SRCS = $(SRC_DIR)/main.c \
+        $(SRC_DIR)/hotkeys.c \
+        $(SRC_DIR)/multiwatch.c \
+        $(SRC_DIR)/jobs.c \
+-       $(SRC_DIR)/history.c
++       $(SRC_DIR)/history.c \
++       $(SRC_DIR)/completion.c \
++       $(SRC_DIR)/script.c
+ 
+ OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
+ 
+@@ -43,17 +45,23 @@ $(HARNESS): harness.c tests/harness_compat.h $(HARNESS_OBJS)
+ $(TARGET): $(OBJS)
+ 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+ 
+-$(TEST_RUNNER): tests/test_shell_runner.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o
++$(TEST_RUNNER): tests/test_shell_runner.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o $(BUILD_DIR)/completion.o $(BUILD_DIR)/script.o
+ 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+ 
+ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
++TEST_SCRIPT_RUNNER = $(BUILD_DIR)/test_task11_scripts
++
++$(TEST_SCRIPT_RUNNER): tests/test_task11_scripts.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o $(BUILD_DIR)/completion.o $(BUILD_DIR)/script.o
++	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
++
+ $(BUILD_DIR):
+ 	mkdir -p $(BUILD_DIR)
+ 
+ clean:
+-	rm -rf $(BUILD_DIR) $(TARGET)
++	rm -rf $(BUILD_DIR) $(TARGET) $(HARNESS)
+ 
+-test: $(TARGET) $(TEST_RUNNER)
++test: $(TARGET) $(TEST_RUNNER) $(TEST_SCRIPT_RUNNER)
++	./$(TEST_SCRIPT_RUNNER)
+ 	python3 tests/test_modes_and_history.py
+diff --git a/include/completion.h b/include/completion.h
+new file mode 100644
+index 0000000..681a7f8
+--- /dev/null
++++ b/include/completion.h
+@@ -0,0 +1,78 @@
++#ifndef COMPLETION_H
++#define COMPLETION_H
++
++#include <stddef.h>
++#include <stdbool.h>
++
++#define COMPLETE_MAX_WORD 1024
++
++/**
++ * @brief Auto-completion candidates result structure for Task 10.
++ */
++typedef struct {
++    size_t count;                       /**< Number of matching candidates */
++    char **items;                       /**< Array of candidate filenames */
++    char lcp[COMPLETE_MAX_WORD];        /**< Longest Common Prefix of all candidates */
++    size_t word_start;                  /**< Start index of the word in line */
++    size_t word_len;                    /**< Length of the word in line */
++    char dir_prefix[COMPLETE_MAX_WORD]; /**< Directory prefix path if any (e.g. "subdir/") */
++} CompletionResult;
++
++/**
++ * @brief Frees allocated CompletionResult items.
++ */
++void completion_result_free(CompletionResult *cr);
++
++/**
++ * @brief Extracts the word ending at cursor position, honoring quotes and backslash escapes.
++ *
++ * @param[in] line Input string.
++ * @param[in] cursor Cursor position.
++ * @param[out] out_len Length of extracted word.
++ * @return Start index of the word in line.
++ */
++size_t complete_extract_word(const char *line, size_t cursor, size_t *out_len);
++
++/**
++ * @brief Strips escaping backslashes from a word.
++ */
++void complete_unescape_word(const char *in, size_t len, char *out, size_t osize);
++
++/**
++ * @brief Escapes shell metacharacters and spaces in a filename candidate.
++ */
++void complete_escape_filename(const char *in, char *out, size_t osize);
++
++/**
++ * @brief Decomposes word into directory prefix and filename prefix.
++ */
++void complete_decompose_word(const char *word, size_t len,
++                             char *dir_pre, size_t dsize,
++                             char *file_pre, size_t fsize);
++
++/**
++ * @brief Computes the Longest Common Prefix (LCP) across candidate items.
++ */
++void complete_compute_lcp(char * const *items, size_t count, char *out, size_t osize);
++
++/**
++ * @brief Collects candidate filename matches from the directory matching the word before cursor.
++ *
++ * @param[in] line Full input line.
++ * @param[in] cursor Cursor position.
++ * @param[in] cwd Tab's current working directory.
++ * @param[out] cr Populated completion results.
++ * @return 0 on success.
++ */
++int complete_file_candidates(const char *line, size_t cursor, const char *cwd, CompletionResult *cr);
++
++/**
++ * @brief Formats multiple candidates as a numbered list: "1. abc.txt   2. abcd.txt".
++ *
++ * @param[in] cr CompletionResult structure.
++ * @param[in] width Available display width.
++ * @return Heap-allocated string that the caller must free().
++ */
++char *complete_format_numbered_list(const CompletionResult *cr, size_t width);
++
++#endif /* COMPLETION_H */
+diff --git a/include/gui.h b/include/gui.h
+index bf0f2fb..3db9cfe 100644
+--- a/include/gui.h
++++ b/include/gui.h
+@@ -68,6 +68,15 @@ typedef struct {
+     char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */
+     int history_pos;                        /**< Active position when browsing history (-1 when at bottom prompt) */
+     char saved_input[MAX_LINE_CHARS];       /**< Preserves in-progress typed text when browsing history */
++    int is_searching_history;               /**< 1 if in Ctrl+R reverse search mode */
++    char search_query[MAX_LINE_CHARS];      /**< Query string entered for Ctrl+R search */
++    int search_query_len;                   /**< Length of search_query */
++    int is_completion_active;               /**< 1 if awaiting candidate selection digit */
++    char *completion_choices[16];           /**< Candidate choices (1-9) */
++    int num_completion_choices;             /**< Number of candidate choices */
++    size_t completion_word_start;           /**< Start index of word being completed */
++    size_t completion_word_len;             /**< Length of word prefix */
++    char completion_dir_prefix[PATH_MAX];   /**< Directory prefix to prepend to candidate */
+ } Tab;
+ 
+ /**
+diff --git a/include/history.h b/include/history.h
+index db42883..70c10b3 100644
+--- a/include/history.h
++++ b/include/history.h
+@@ -3,10 +3,30 @@
+ 
+ #include <stddef.h>
+ #include <semaphore.h>
++#include <stdint.h>
+ 
+ #define MAX_HISTORY_COMMANDS 10000
+ #define MAX_HISTORY_CMD_LEN 1024
+ 
++/**
++ * @brief Match classification for Task 9 reverse history search.
++ */
++typedef enum {
++    HIST_MATCH_NONE = 0,
++    HIST_MATCH_EXACT = 1,
++    HIST_MATCH_SUBSTRING = 2
++} HistMatchType;
++
++/**
++ * @brief Result set returned by history_search().
++ */
++typedef struct {
++    HistMatchType match_type;   /**< Exact match, substring match, or none */
++    int match_len;              /**< Length of matching substring / string */
++    size_t count;               /**< Number of matched command entries */
++    char **entries;             /**< Array of matched command strings */
++} HistSearchResult;
++
+ /**
+  * @brief Layout of the shared history structure.
+  *
+@@ -35,7 +55,7 @@ int history_init(int use_process_mode);
+ void history_cleanup(void);
+ 
+ /**
+- * @brief Adds a command to the shared history ring buffer.
++ * @brief Adds a command to the shared history ring buffer and appends to persistent file.
+  *
+  * Automatically skips consecutive identical commands.
+  *
+@@ -68,4 +88,34 @@ int history_count(void);
+  */
+ int history_format_recent(char *out_buf, size_t max_len, int max_cmds);
+ 
++/**
++ * @brief Performs Task 9 3-tier reverse history search.
++ *
++ * 1. Exact match (most recent).
++ * 2. Longest Common Substring (LCS) match if length > 2 characters.
++ * 3. No match otherwise.
++ *
++ * @param[in] term Search term.
++ * @param[out] res Result structure populated with matches.
++ * @return 0 on success.
++ */
++int history_search(const char *term, HistSearchResult *res);
++
++/**
++ * @brief Frees dynamically allocated results from history_search().
++ *
++ * @param[in,out] res Pointer to HistSearchResult to free.
++ */
++void hist_search_result_free(HistSearchResult *res);
++
++/**
++ * @brief Encodes raw command with newlines into a single-line representation.
++ */
++size_t history_encode_line(const char *raw, char *enc, size_t max);
++
++/**
++ * @brief Decodes single-line representation back into raw command.
++ */
++size_t history_decode_line(const char *enc, size_t len, char *dec, size_t max);
++
+ #endif /* HISTORY_H */
+diff --git a/include/script.h b/include/script.h
+new file mode 100644
+index 0000000..7d0ee9b
+--- /dev/null
++++ b/include/script.h
+@@ -0,0 +1,37 @@
++#ifndef SCRIPT_H
++#define SCRIPT_H
++
++#include "shell.h"
++
++/**
++ * @brief Checks if a given file path is a bash script that Terminator should interpret.
++ *
++ * @param[in] path File path.
++ * @return 1 if it is a script file, 0 otherwise.
++ */
++int is_bash_script(const char *path);
++
++/**
++ * @brief Interprets and executes a bash script file internally without /bin/bash.
++ *
++ * Supports comments, variables, positional parameters ($0, $1..$9, $#), last exit status ($?),
++ * nested if/elif/else/fi with [ ... ] tests, pipelines, redirections, and exit [n].
++ *
++ * @param[in,out] ctx Pointer to the active ShellContext.
++ * @param[in] script_path Path to the script file.
++ * @param[in] argc Number of arguments (including script path).
++ * @param[in] argv Argument vector (argv[0]=script_path, argv[1..]=parameters).
++ * @return Exit status of the script.
++ */
++int script_run(ShellContext *ctx, const char *script_path, int argc, char **argv);
++
++/**
++ * @brief Evaluates a '[ ... ]' test expression string.
++ *
++ * @param[in] ctx Pointer to the active ShellContext for variable expansion.
++ * @param[in] expr Expression string between '[' and ']'.
++ * @return 0 if true (success in bash), 1 if false, 2 on syntax error.
++ */
++int script_eval_test(ShellContext *ctx, const char *expr);
++
++#endif /* SCRIPT_H */
+diff --git a/include/shell.h b/include/shell.h
+index 28226ac..7ad5abc 100644
+--- a/include/shell.h
++++ b/include/shell.h
+@@ -71,6 +71,9 @@ typedef struct {
+     JobTable job_table;   /**< Active background and stopped jobs in this shell session (Task 8) */
+     pid_t foreground_pid; /**< Active foreground process PID (0 if idle) */
+     char foreground_cmd[MAX_CMD_LEN]; /**< Command line string of active foreground process */
++    int script_argc;      /**< Positional parameter count ($#) for active bash script */
++    char **script_argv;   /**< Positional parameter array ($1..$9) for active bash script */
++    char script_name[PATH_MAX]; /**< Script name / path ($0) for active bash script */
+ } ShellContext;
+ 
+ /**
+diff --git a/src/builtins.c b/src/builtins.c
+index 33753a4..918873f 100644
+--- a/src/builtins.c
++++ b/src/builtins.c
+@@ -2,6 +2,7 @@
+ #include "multiwatch.h"
+ #include "history.h"
+ #include "parser.h"
++#include "script.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -20,7 +21,8 @@ int is_builtin_command(const char *name) {
+             strcmp(name, "exit") == 0 || strcmp(name, "clear") == 0 ||
+             strcasecmp(name, "multiWatch") == 0 || strcmp(name, "jobs") == 0 ||
+             strcmp(name, "fg") == 0 || strcmp(name, "bg") == 0 ||
+-            strcmp(name, "history") == 0 || strcmp(name, "source") == 0);
++            strcmp(name, "history") == 0 || strcmp(name, "source") == 0 ||
++            strcmp(name, ".") == 0);
+ }
+ 
+ /**
+@@ -39,7 +41,7 @@ int execute_builtin(ShellContext *ctx, const Command *cmd) {
+     if (strcmp(name, "bg") == 0) return builtin_bg(ctx, cmd->argv);
+     if (strcmp(name, "fg") == 0) return builtin_fg(ctx, cmd->argv);
+     if (strcmp(name, "history") == 0) return builtin_history(ctx, cmd->argv);
+-    if (strcmp(name, "source") == 0) return builtin_source(ctx, cmd->argv);
++    if (strcmp(name, "source") == 0 || strcmp(name, ".") == 0) return builtin_source(ctx, cmd->argv);
+ 
+     return 1;
+ }
+@@ -104,29 +106,12 @@ int execute_builtin_captured(ShellContext *ctx, const Command *cmd, char *out_bu
+ 
+ int builtin_source(ShellContext *ctx, char **argv) {
+     if (!ctx || !argv || !argv[1]) {
+-        fprintf(stderr, "terminator: source: not implemented yet\n");
++        fprintf(stderr, "terminator: source: filename argument required\n");
+         return 1;
+     }
+-    FILE *fp = fopen(argv[1], "r");
+-    if (!fp) {
+-        fprintf(stderr, "terminator: source: %s: %s\n", argv[1], strerror(errno));
+-        return 1;
+-    }
+-    char line[4096];
+-    int last_status = 0;
+-    while (fgets(line, sizeof(line), fp)) {
+-        size_t l = strlen(line);
+-        while (l > 0 && (line[l-1] == '\n' || line[l-1] == '\r')) line[--l] = '\0';
+-        if (l == 0 || line[0] == '#') continue;
+-        Pipeline pl;
+-        if (parse_line(line, ctx, &pl) == 0) {
+-            last_status = shell_execute_pipeline(ctx, &pl);
+-            free_pipeline(&pl);
+-        }
+-    }
+-    fclose(fp);
+-    ctx->last_exit_status = last_status;
+-    return last_status;
++    int argc = 0;
++    while (argv[argc]) argc++;
++    return script_run(ctx, argv[1], argc - 1, argv + 1);
+ }
+ 
+ int builtin_history(ShellContext *ctx, char **argv) {
+diff --git a/src/completion.c b/src/completion.c
+new file mode 100644
+index 0000000..daa3e1a
+--- /dev/null
++++ b/src/completion.c
+@@ -0,0 +1,280 @@
++#include "completion.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <dirent.h>
++#include <sys/stat.h>
++#include <ctype.h>
++#include <limits.h>
++
++void completion_result_free(CompletionResult *cr) {
++    if (!cr) return;
++    if (cr->items) {
++        for (size_t i = 0; i < cr->count; i++) {
++            free(cr->items[i]);
++        }
++        free(cr->items);
++        cr->items = NULL;
++    }
++    cr->count = 0;
++    cr->lcp[0] = '\0';
++    cr->dir_prefix[0] = '\0';
++}
++
++size_t complete_extract_word(const char *line, size_t cursor, size_t *out_len) {
++    if (!line || cursor == 0) {
++        if (out_len) *out_len = 0;
++        return 0;
++    }
++
++    size_t start = cursor;
++    bool in_single = false;
++    bool in_double = false;
++    for (size_t i = 0; i < cursor; i++) {
++        if (line[i] == '\\' && !in_single) {
++            i++;
++            continue;
++        }
++        if (line[i] == '\'' && !in_double) {
++            in_single = !in_single;
++        } else if (line[i] == '"' && !in_single) {
++            in_double = !in_double;
++        }
++    }
++
++    if (in_single) {
++        ssize_t s = (ssize_t)cursor - 1;
++        while (s >= 0 && line[s] != '\'') s--;
++        start = (s >= 0) ? (size_t)(s + 1) : 0;
++        if (out_len) *out_len = cursor - start;
++        return start;
++    }
++
++    if (in_double) {
++        ssize_t s = (ssize_t)cursor - 1;
++        while (s >= 0 && (line[s] != '"' || (s > 0 && line[s - 1] == '\\'))) s--;
++        start = (s >= 0) ? (size_t)(s + 1) : 0;
++        if (out_len) *out_len = cursor - start;
++        return start;
++    }
++
++    ssize_t idx = (ssize_t)cursor - 1;
++    while (idx >= 0) {
++        char c = line[idx];
++        if (c == ' ' || c == '\t' || c == '|' || c == '<' || c == '>' || c == '&' || c == ';') {
++            size_t slashes = 0;
++            ssize_t b = idx - 1;
++            while (b >= 0 && line[b] == '\\') {
++                slashes++;
++                b--;
++            }
++            if ((slashes % 2) == 0) {
++                break;
++            }
++        }
++        idx--;
++    }
++
++    start = (size_t)(idx + 1);
++    if (out_len) *out_len = cursor - start;
++    return start;
++}
++
++void complete_unescape_word(const char *in, size_t len, char *out, size_t osize) {
++    if (!out || osize == 0) return;
++    size_t o = 0;
++    for (size_t i = 0; i < len && o + 1 < osize; i++) {
++        if (in[i] == '\\' && i + 1 < len) {
++            i++;
++        }
++        out[o++] = in[i];
++    }
++    out[o] = '\0';
++}
++
++void complete_escape_filename(const char *in, char *out, size_t osize) {
++    if (!in || !out || osize == 0) return;
++    size_t o = 0;
++    size_t len = strlen(in);
++    for (size_t i = 0; i < len && o + 2 < osize; i++) {
++        char c = in[i];
++        if (c == '/' && i == len - 1) {
++            out[o++] = c;
++        } else if (c == ' ' || c == '$' || c == '&' || c == ';' ||
++                   c == '*' || c == '?' || c == '(' || c == ')' ||
++                   c == '\\' || c == '\'' || c == '"') {
++            out[o++] = '\\';
++            out[o++] = c;
++        } else {
++            out[o++] = c;
++        }
++    }
++    out[o] = '\0';
++}
++
++void complete_decompose_word(const char *word, size_t len,
++                             char *dir_pre, size_t dsize,
++                             char *file_pre, size_t fsize) {
++    if (!dir_pre || !file_pre) return;
++    dir_pre[0] = '\0';
++    file_pre[0] = '\0';
++    if (!word || len == 0) return;
++
++    ssize_t slash_pos = -1;
++    for (ssize_t i = (ssize_t)len - 1; i >= 0; i--) {
++        if (word[i] == '/' && (i == 0 || word[i - 1] != '\\')) {
++            slash_pos = i;
++            break;
++        }
++    }
++
++    if (slash_pos >= 0) {
++        size_t dlen = (size_t)(slash_pos + 1);
++        if (dlen >= dsize) dlen = dsize - 1;
++        memcpy(dir_pre, word, dlen);
++        dir_pre[dlen] = '\0';
++
++        complete_unescape_word(word + slash_pos + 1, len - (slash_pos + 1), file_pre, fsize);
++    } else {
++        complete_unescape_word(word, len, file_pre, fsize);
++    }
++}
++
++void complete_compute_lcp(char * const *items, size_t count, char *out, size_t osize) {
++    if (!out || osize == 0) return;
++    out[0] = '\0';
++    if (!items || count == 0) return;
++    if (count == 1) {
++        strncpy(out, items[0], osize - 1);
++        out[osize - 1] = '\0';
++        return;
++    }
++
++    size_t idx = 0;
++    while (idx + 1 < osize) {
++        char c = items[0][idx];
++        if (c == '\0') break;
++        bool match = true;
++        for (size_t i = 1; i < count; i++) {
++            if (items[i][idx] != c) {
++                match = false;
++                break;
++            }
++        }
++        if (!match) break;
++        out[idx++] = c;
++    }
++    out[idx] = '\0';
++}
++
++static int compare_strings(const void *a, const void *b) {
++    return strcmp(*(const char **)a, *(const char **)b);
++}
++
++int complete_file_candidates(const char *line, size_t cursor, const char *cwd, CompletionResult *cr) {
++    if (!cr) return -1;
++    cr->count = 0;
++    cr->items = NULL;
++    cr->lcp[0] = '\0';
++    cr->dir_prefix[0] = '\0';
++
++    size_t wlen = 0;
++    size_t wstart = complete_extract_word(line, cursor, &wlen);
++    cr->word_start = wstart;
++    cr->word_len = wlen;
++
++    char word[COMPLETE_MAX_WORD];
++    if (wlen >= sizeof(word)) wlen = sizeof(word) - 1;
++    if (wlen > 0) memcpy(word, line + wstart, wlen);
++    word[wlen] = '\0';
++
++    char dir_pre[COMPLETE_MAX_WORD] = {0};
++    char file_pre[COMPLETE_MAX_WORD] = {0};
++    complete_decompose_word(word, wlen, dir_pre, sizeof(dir_pre), file_pre, sizeof(file_pre));
++    snprintf(cr->dir_prefix, sizeof(cr->dir_prefix), "%s", dir_pre);
++
++    char search_dir[PATH_MAX * 2];
++    if (dir_pre[0] == '\0') {
++        snprintf(search_dir, sizeof(search_dir), "%s", cwd ? cwd : ".");
++    } else {
++        char unesc_dir[PATH_MAX];
++        complete_unescape_word(dir_pre, strlen(dir_pre), unesc_dir, sizeof(unesc_dir));
++        if (unesc_dir[0] == '~') {
++            const char *home = getenv("HOME");
++            snprintf(search_dir, sizeof(search_dir), "%s%s", home ? home : "", unesc_dir + 1);
++        } else if (unesc_dir[0] == '/') {
++            snprintf(search_dir, sizeof(search_dir), "%s", unesc_dir);
++        } else {
++            snprintf(search_dir, sizeof(search_dir), "%s/%s", cwd ? cwd : ".", unesc_dir);
++        }
++    }
++
++    DIR *d = opendir(search_dir);
++    if (!d) {
++        return 0;
++    }
++
++    size_t cap = 128;
++    cr->items = (char **)malloc(sizeof(char *) * cap);
++    if (!cr->items) {
++        closedir(d);
++        return 0;
++    }
++
++    size_t match_count = 0;
++    size_t fpre_len = strlen(file_pre);
++    bool show_hidden = (file_pre[0] == '.');
++
++    struct dirent *ent;
++    while ((ent = readdir(d)) != NULL) {
++        if (strcmp(ent->d_name, ".") == 0 || strcmp(ent->d_name, "..") == 0) continue;
++        if (!show_hidden && ent->d_name[0] == '.') continue;
++        if (strncmp(ent->d_name, file_pre, fpre_len) == 0) {
++            char full_path[PATH_MAX * 4];
++            snprintf(full_path, sizeof(full_path), "%s/%s", search_dir, ent->d_name);
++            struct stat st;
++            bool is_dir = false;
++            if (stat(full_path, &st) == 0 && S_ISDIR(st.st_mode)) {
++                is_dir = true;
++            }
++
++            char item[COMPLETE_MAX_WORD];
++            if (is_dir) {
++                snprintf(item, sizeof(item), "%s/", ent->d_name);
++            } else {
++                snprintf(item, sizeof(item), "%s", ent->d_name);
++            }
++
++            if (match_count >= cap) {
++                cap *= 2;
++                char **new_items = (char **)realloc(cr->items, sizeof(char *) * cap);
++                if (!new_items) break;
++                cr->items = new_items;
++            }
++            cr->items[match_count++] = strdup(item);
++        }
++    }
++    closedir(d);
++
++    cr->count = match_count;
++    if (match_count > 0) {
++        qsort(cr->items, match_count, sizeof(char *), compare_strings);
++        complete_compute_lcp(cr->items, match_count, cr->lcp, sizeof(cr->lcp));
++    }
++    return 0;
++}
++
++char *complete_format_numbered_list(const CompletionResult *cr, size_t width) {
++    (void)width;
++    if (!cr || cr->count == 0) return NULL;
++    char *out = (char *)malloc(65536);
++    if (!out) return NULL;
++    out[0] = '\0';
++    for (size_t i = 0; i < cr->count; i++) {
++        char item_buf[512];
++        snprintf(item_buf, sizeof(item_buf), "%zu. %s   ", i + 1, cr->items[i]);
++        strncat(out, item_buf, 65535 - strlen(out));
++    }
++    return out;
++}
+diff --git a/src/gui.c b/src/gui.c
+index 7824bae..cdacc4e 100644
+--- a/src/gui.c
++++ b/src/gui.c
+@@ -2,6 +2,7 @@
+ #include "parser.h"
+ #include "builtins.h"
+ #include "history.h"
++#include "completion.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -343,6 +344,9 @@ void gui_cleanup(GuiApp *app) {
+                 }
+             }
+             jobs_kill_all(&tab->shell_ctx.job_table);
++            for (int k = 0; k < tab->num_completion_choices; k++) {
++                if (tab->completion_choices[k]) free(tab->completion_choices[k]);
++            }
+             free(tab);
+         }
+     }
+@@ -470,6 +474,9 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
+         }
+     }
+     jobs_kill_all(&tab->shell_ctx.job_table);
++    for (int k = 0; k < tab->num_completion_choices; k++) {
++        if (tab->completion_choices[k]) free(tab->completion_choices[k]);
++    }
+     free(tab);
+ 
+     for (int i = tab_idx; i < app->num_tabs - 1; i++) {
+@@ -724,6 +731,169 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
+     int is_ctrl = (event->state & ControlMask);
+     int is_shift = (event->state & ShiftMask);
+ 
++    /* Task 9 Ctrl+R Interactive History Search Mode */
++    if (tab->is_searching_history) {
++        if (keysym == XK_Return || keysym == XK_KP_Enter) {
++            char line[MAX_LINE_CHARS + 64];
++            snprintf(line, sizeof(line), "Enter search term: %s\n", tab->search_query);
++            tab_append_output(tab, line, (int)strlen(line));
++
++            HistSearchResult res;
++            history_search(tab->search_query, &res);
++            if (res.match_type == HIST_MATCH_NONE || res.count == 0) {
++                tab_append_output(tab, "No match for search term in history\n", 36);
++            } else {
++                for (size_t i = 0; i < res.count; i++) {
++                    char entry_line[MAX_LINE_CHARS + 2];
++                    snprintf(entry_line, sizeof(entry_line), "%s\n", res.entries[i]);
++                    tab_append_output(tab, entry_line, (int)strlen(entry_line));
++                }
++                /* Load the best / most recent match into prompt input */
++                snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", res.entries[0]);
++                tab->input_len = (int)strlen(tab->input_buffer);
++                tab->cursor_pos = tab->input_len;
++            }
++            hist_search_result_free(&res);
++            tab->is_searching_history = 0;
++            tab->search_query[0] = '\0';
++            tab->search_query_len = 0;
++            gui_redraw(app);
++            return;
++        }
++        if (keysym == XK_Escape || (is_ctrl && (keysym == XK_c || keysym == XK_C))) {
++            tab->is_searching_history = 0;
++            tab->search_query[0] = '\0';
++            tab->search_query_len = 0;
++            gui_redraw(app);
++            return;
++        }
++        if (keysym == XK_BackSpace) {
++            if (tab->search_query_len > 0) {
++                tab->search_query[--tab->search_query_len] = '\0';
++                gui_redraw(app);
++            }
++            return;
++        }
++        if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
++            if (tab->search_query_len < (int)sizeof(tab->search_query) - 1) {
++                tab->search_query[tab->search_query_len++] = buffer[0];
++                tab->search_query[tab->search_query_len] = '\0';
++                gui_redraw(app);
++            }
++            return;
++        }
++        return;
++    }
++
++    if (is_ctrl && !is_shift && (keysym == XK_R || keysym == XK_r)) {
++        tab->is_searching_history = 1;
++        tab->search_query[0] = '\0';
++        tab->search_query_len = 0;
++        gui_redraw(app);
++        return;
++    }
++
++    /* Task 10 Numbered Candidate Selection Mode */
++    if (tab->is_completion_active) {
++        if (!is_ctrl && count > 0 && buffer[0] >= '1' && buffer[0] <= '9') {
++            int sel = buffer[0] - '1';
++            if (sel < tab->num_completion_choices && tab->completion_choices[sel]) {
++                const char *chosen = tab->completion_choices[sel];
++                char esc[COMPLETE_MAX_WORD * 2];
++                complete_escape_filename(chosen, esc, sizeof(esc));
++                char repl[PATH_MAX + COMPLETE_MAX_WORD * 2];
++                snprintf(repl, sizeof(repl), "%s%s", tab->completion_dir_prefix, esc);
++                size_t rlen = strlen(repl);
++                if (repl[rlen - 1] != '/') {
++                    if (rlen + 1 < sizeof(repl)) {
++                        repl[rlen++] = ' ';
++                        repl[rlen] = '\0';
++                    }
++                }
++                tab_delete_range(tab, (int)tab->completion_word_start,
++                                 (int)(tab->completion_word_start + tab->completion_word_len));
++                for (size_t i = 0; i < rlen; i++) {
++                    tab_insert_char(tab, repl[i]);
++                }
++            }
++            for (int i = 0; i < tab->num_completion_choices; i++) {
++                if (tab->completion_choices[i]) free(tab->completion_choices[i]);
++                tab->completion_choices[i] = NULL;
++            }
++            tab->num_completion_choices = 0;
++            tab->is_completion_active = 0;
++            gui_redraw(app);
++            return;
++        }
++        /* Any other key dismisses candidate selection mode and falls through */
++        for (int i = 0; i < tab->num_completion_choices; i++) {
++            if (tab->completion_choices[i]) free(tab->completion_choices[i]);
++            tab->completion_choices[i] = NULL;
++        }
++        tab->num_completion_choices = 0;
++        tab->is_completion_active = 0;
++    }
++
++    /* Task 10 Tab File-Name Auto-Completion */
++    if (keysym == XK_Tab) {
++        CompletionResult cr;
++        if (complete_file_candidates(tab->input_buffer, (size_t)tab->cursor_pos, tab->cwd, &cr) == 0) {
++            if (cr.count == 1) {
++                char esc[COMPLETE_MAX_WORD * 2];
++                complete_escape_filename(cr.items[0], esc, sizeof(esc));
++                char repl[PATH_MAX + COMPLETE_MAX_WORD * 2];
++                snprintf(repl, sizeof(repl), "%s%s", cr.dir_prefix, esc);
++                size_t rlen = strlen(repl);
++                if (repl[rlen - 1] != '/') {
++                    if (rlen + 1 < sizeof(repl)) {
++                        repl[rlen++] = ' ';
++                        repl[rlen] = '\0';
++                    }
++                }
++                tab_delete_range(tab, (int)cr.word_start, (int)(cr.word_start + cr.word_len));
++                for (size_t i = 0; i < rlen; i++) {
++                    tab_insert_char(tab, repl[i]);
++                }
++            } else if (cr.count > 1) {
++                char esc_lcp[COMPLETE_MAX_WORD * 2];
++                complete_escape_filename(cr.lcp, esc_lcp, sizeof(esc_lcp));
++                char lcp_repl[PATH_MAX + COMPLETE_MAX_WORD * 2];
++                snprintf(lcp_repl, sizeof(lcp_repl), "%s%s", cr.dir_prefix, esc_lcp);
++                size_t lcp_len = strlen(lcp_repl);
++                size_t cur_word_len = cr.word_len;
++
++                if (lcp_len > cur_word_len) {
++                    tab_delete_range(tab, (int)cr.word_start, (int)(cr.word_start + cr.word_len));
++                    for (size_t i = 0; i < lcp_len; i++) {
++                        tab_insert_char(tab, lcp_repl[i]);
++                    }
++                    cur_word_len = lcp_len;
++                }
++
++                char *list_str = complete_format_numbered_list(&cr, 80);
++                if (list_str) {
++                    const char *p_used = tab->is_multiline ? "> " : PROMPT_STRING;
++                    tab_record_prompt_input(app, tab, p_used, (int)strlen(p_used));
++                    tab_append_output(tab, list_str, (int)strlen(list_str));
++                    tab_append_output(tab, "\n", 1);
++                    free(list_str);
++                }
++
++                tab->num_completion_choices = cr.count > 9 ? 9 : (int)cr.count;
++                for (int i = 0; i < tab->num_completion_choices; i++) {
++                    tab->completion_choices[i] = strdup(cr.items[i]);
++                }
++                tab->completion_word_start = cr.word_start;
++                tab->completion_word_len = cur_word_len;
++                snprintf(tab->completion_dir_prefix, sizeof(tab->completion_dir_prefix), "%s", cr.dir_prefix);
++                tab->is_completion_active = 1;
++            }
++            completion_result_free(&cr);
++            gui_redraw(app);
++        }
++        return;
++    }
++
+     /* Tab Creation / Closure shortcuts */
+     if (is_ctrl && (keysym == XK_T || keysym == XK_t)) {
+         gui_create_tab(app, tab->cwd);
+@@ -1066,13 +1236,18 @@ void gui_redraw(GuiApp *app) {
+ 
+     /* Content Area & Dimensions */
+     int cols = get_term_cols(app);
+-    const char *active_p = tab->is_multiline ? "> " : PROMPT_STRING;
++    const char *active_p = tab->is_searching_history ? "Enter search term: " :
++                           (tab->is_multiline ? "> " : PROMPT_STRING);
+     int p_len = (int)strlen(active_p);
+     int first_cap = get_first_line_capacity(app, p_len);
+ 
++    const char *cur_input_buf = tab->is_searching_history ? tab->search_query : tab->input_buffer;
++    int cur_input_len = tab->is_searching_history ? tab->search_query_len : tab->input_len;
++    int cur_cursor_pos = tab->is_searching_history ? tab->search_query_len : tab->cursor_pos;
++
+     int active_rows = 1;
+-    if (tab->input_len > first_cap) {
+-        active_rows = 1 + (tab->input_len - first_cap + cols - 1) / cols;
++    if (cur_input_len > first_cap) {
++        active_rows = 1 + (cur_input_len - first_cap + cols - 1) / cols;
+     }
+ 
+     int content_top = TAB_BAR_HEIGHT + 10;
+@@ -1108,19 +1283,19 @@ void gui_redraw(GuiApp *app) {
+ 
+     /* Active Input & Wrapped Lines */
+     XDrawString(app->display, app->back_buffer, app->gc_prompt, 10, cur_y, active_p, p_len);
+-    int line0_chars = tab->input_len < first_cap ? tab->input_len : first_cap;
++    int line0_chars = cur_input_len < first_cap ? cur_input_len : first_cap;
+     if (line0_chars > 0) {
+         XDrawString(app->display, app->back_buffer, app->gc_input,
+-                    10 + (p_len * app->font_width), cur_y, tab->input_buffer, line0_chars);
++                    10 + (p_len * app->font_width), cur_y, cur_input_buf, line0_chars);
+     }
+ 
+-    if (tab->input_len > first_cap) {
++    if (cur_input_len > first_cap) {
+         int off = first_cap;
+         int row = 1;
+-        while (off < tab->input_len) {
+-            int chunk = tab->input_len - off > cols ? cols : tab->input_len - off;
++        while (off < cur_input_len) {
++            int chunk = cur_input_len - off > cols ? cols : cur_input_len - off;
+             XDrawString(app->display, app->back_buffer, app->gc_input,
+-                        10, cur_y + (row * app->font_height), tab->input_buffer + off, chunk);
++                        10, cur_y + (row * app->font_height), cur_input_buf + off, chunk);
+             off += chunk;
+             row++;
+         }
+@@ -1128,11 +1303,11 @@ void gui_redraw(GuiApp *app) {
+ 
+     /* Unified Block Cursor Calculation */
+     int c_row = 0, c_col = 0;
+-    if (tab->cursor_pos <= first_cap) {
++    if (cur_cursor_pos <= first_cap) {
+         c_row = 0;
+-        c_col = p_len + tab->cursor_pos;
++        c_col = p_len + cur_cursor_pos;
+     } else {
+-        int rel = tab->cursor_pos - first_cap;
++        int rel = cur_cursor_pos - first_cap;
+         c_row = 1 + (rel / cols);
+         c_col = rel % cols;
+     }
+diff --git a/src/history.c b/src/history.c
+index cd1018a..3f4294f 100644
+--- a/src/history.c
++++ b/src/history.c
+@@ -7,17 +7,135 @@
+ #include <sys/mman.h>
+ #include <sys/stat.h>
+ #include <errno.h>
++#include <ctype.h>
+ 
+ static SharedHistory *g_shared_history = NULL;
+ static int g_is_process_mode = 0;
+ static char g_shm_name[64] = "";
++static char g_hist_file[1024] = "";
++
++static void resolve_histfile_path(char *out_path, size_t max_len) {
++    const char *hf = getenv("TERMINATOR_HISTFILE");
++    if (hf && hf[0] != '\0') {
++        snprintf(out_path, max_len, "%s", hf);
++        return;
++    }
++    const char *home = getenv("HOME");
++    snprintf(out_path, max_len, "%s/.terminator_history", home ? home : "/tmp");
++}
++
++size_t history_encode_line(const char *raw, char *enc, size_t max) {
++    if (!raw || !enc || max < 2) return 0;
++    size_t o = 0;
++    for (size_t i = 0; raw[i] && o + 3 < max; i++) {
++        if (raw[i] == '\\') {
++            enc[o++] = '\\';
++            enc[o++] = '\\';
++        } else if (raw[i] == '\n') {
++            enc[o++] = '\\';
++            enc[o++] = 'n';
++        } else {
++            enc[o++] = raw[i];
++        }
++    }
++    enc[o++] = '\n';
++    enc[o] = '\0';
++    return o;
++}
++
++size_t history_decode_line(const char *enc, size_t len, char *dec, size_t max) {
++    if (!enc || !dec || max == 0) return 0;
++    size_t o = 0;
++    for (size_t i = 0; i < len && o + 1 < max; i++) {
++        if (enc[i] == '\\' && i + 1 < len) {
++            if (enc[i + 1] == 'n') {
++                dec[o++] = '\n';
++                i++;
++            } else if (enc[i + 1] == '\\') {
++                dec[o++] = '\\';
++                i++;
++            } else {
++                dec[o++] = enc[i];
++            }
++        } else if (enc[i] != '\n' && enc[i] != '\r') {
++            dec[o++] = enc[i];
++        }
++    }
++    dec[o] = '\0';
++    return o;
++}
++
++static void history_load_from_disk(void) {
++    if (!g_shared_history || g_hist_file[0] == '\0') return;
++
++    int fd = open(g_hist_file, O_CREAT | O_RDWR, 0600);
++    if (fd < 0) return;
++    fchmod(fd, 0600);
++
++    FILE *fp = fdopen(fd, "r+");
++    if (!fp) {
++        close(fd);
++        return;
++    }
++
++    char *line = NULL;
++    size_t linecap = 0;
++    ssize_t linelen;
++    size_t total_lines = 0;
++
++    while ((linelen = getline(&line, &linecap, fp)) > 0) {
++        total_lines++;
++    }
++
++    rewind(fp);
++    size_t skip = 0;
++    if (total_lines > 20000) {
++        skip = total_lines - 10000;
++    }
++
++    size_t cur_line = 0;
++    char dec[MAX_HISTORY_CMD_LEN];
++    while ((linelen = getline(&line, &linecap, fp)) > 0) {
++        cur_line++;
++        if (cur_line <= skip) continue;
++        history_decode_line(line, (size_t)linelen, dec, sizeof(dec));
++        if (dec[0] == '\0') continue;
++
++        int slot = g_shared_history->head;
++        snprintf(g_shared_history->commands[slot], MAX_HISTORY_CMD_LEN, "%s", dec);
++        g_shared_history->head = (g_shared_history->head + 1) % MAX_HISTORY_COMMANDS;
++        if (g_shared_history->count < MAX_HISTORY_COMMANDS) {
++            g_shared_history->count++;
++        }
++    }
++    free(line);
++
++    if (total_lines > 20000) {
++        char tmp_path[1200];
++        snprintf(tmp_path, sizeof(tmp_path), "%s.compact_tmp", g_hist_file);
++        FILE *tfp = fopen(tmp_path, "w");
++        if (tfp) {
++            fchmod(fileno(tfp), 0600);
++            for (int i = 0; i < g_shared_history->count; i++) {
++                int idx = (g_shared_history->head - g_shared_history->count + i + (2 * MAX_HISTORY_COMMANDS)) % MAX_HISTORY_COMMANDS;
++                char enc[MAX_HISTORY_CMD_LEN * 2];
++                size_t elen = history_encode_line(g_shared_history->commands[idx], enc, sizeof(enc));
++                fwrite(enc, 1, elen, tfp);
++            }
++            fclose(tfp);
++            rename(tmp_path, g_hist_file);
++        }
++    }
++
++    fclose(fp);
++}
+ 
+ int history_init(int use_process_mode) {
+     g_is_process_mode = use_process_mode;
++    resolve_histfile_path(g_hist_file, sizeof(g_hist_file));
+ 
+     if (use_process_mode) {
+         snprintf(g_shm_name, sizeof(g_shm_name), "/terminator_shm_%d", (int)getpid());
+-        /* Remove any stale SHM object with same name */
+         shm_unlink(g_shm_name);
+ 
+         int fd = shm_open(g_shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
+@@ -53,7 +171,6 @@ int history_init(int use_process_mode) {
+             return -1;
+         }
+     } else {
+-        /* Thread Mode: allocate in shared process memory with thread-shared semaphore */
+         g_shared_history = malloc(sizeof(SharedHistory));
+         if (!g_shared_history) {
+             perror("terminator: malloc for SharedHistory failed");
+@@ -71,6 +188,8 @@ int history_init(int use_process_mode) {
+ 
+     g_shared_history->count = 0;
+     g_shared_history->head = 0;
++
++    history_load_from_disk();
+     return 0;
+ }
+ 
+@@ -94,15 +213,14 @@ void history_cleanup(void) {
+ void history_add(const char *cmd) {
+     if (!g_shared_history || !cmd || cmd[0] == '\0') return;
+ 
+-    /* Trim leading and trailing whitespace */
+-    while (*cmd && (*cmd == ' ' || *cmd == '\t' || *cmd == '\n' || *cmd == '\r')) {
+-        cmd++;
++    const char *p = cmd;
++    while (*p && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r')) {
++        p++;
+     }
+-    if (cmd[0] == '\0') return;
++    if (*p == '\0') return;
+ 
+     sem_wait(&g_shared_history->sem);
+ 
+-    /* Do not insert consecutive identical commands */
+     if (g_shared_history->count > 0) {
+         int prev_idx = (g_shared_history->head - 1 + MAX_HISTORY_COMMANDS) % MAX_HISTORY_COMMANDS;
+         if (strncmp(g_shared_history->commands[prev_idx], cmd, MAX_HISTORY_CMD_LEN - 1) == 0) {
+@@ -115,7 +233,6 @@ void history_add(const char *cmd) {
+     strncpy(g_shared_history->commands[slot], cmd, MAX_HISTORY_CMD_LEN - 1);
+     g_shared_history->commands[slot][MAX_HISTORY_CMD_LEN - 1] = '\0';
+ 
+-    /* Strip trailing newlines */
+     size_t len = strlen(g_shared_history->commands[slot]);
+     while (len > 0 && (g_shared_history->commands[slot][len - 1] == '\n' ||
+                        g_shared_history->commands[slot][len - 1] == '\r')) {
+@@ -127,6 +244,16 @@ void history_add(const char *cmd) {
+         g_shared_history->count++;
+     }
+ 
++    if (g_hist_file[0] != '\0') {
++        int fd = open(g_hist_file, O_WRONLY | O_CREAT | O_APPEND, 0600);
++        if (fd >= 0) {
++            char enc[MAX_HISTORY_CMD_LEN * 2];
++            size_t elen = history_encode_line(cmd, enc, sizeof(enc));
++            if (write(fd, enc, elen) < 0) {}
++            close(fd);
++        }
++    }
++
+     sem_post(&g_shared_history->sem);
+ }
+ 
+@@ -163,7 +290,7 @@ int history_format_recent(char *out_buf, size_t max_len, int max_cmds) {
+ 
+     int total = g_shared_history->count;
+     int show_count = total < max_cmds ? total : max_cmds;
+-    int start_offset = show_count - 1; /* from oldest to newest */
++    int start_offset = show_count - 1;
+ 
+     size_t written = 0;
+     out_buf[0] = '\0';
+@@ -181,3 +308,128 @@ int history_format_recent(char *out_buf, size_t max_len, int max_cmds) {
+     sem_post(&g_shared_history->sem);
+     return (int)written;
+ }
++
++static int compute_lcs_len(const char *s1, const char *s2) {
++    if (!s1 || !s2) return 0;
++    int l1 = (int)strlen(s1);
++    int l2 = (int)strlen(s2);
++    if (l1 == 0 || l2 == 0) return 0;
++
++    int max_lcs = 0;
++    static int dp[2][MAX_HISTORY_CMD_LEN + 1];
++    memset(dp, 0, sizeof(dp));
++
++    for (int i = 1; i <= l1; i++) {
++        int cur = i % 2;
++        int prev = (i - 1) % 2;
++        for (int j = 1; j <= l2 && j <= MAX_HISTORY_CMD_LEN; j++) {
++            if (s1[i - 1] == s2[j - 1]) {
++                dp[cur][j] = dp[prev][j - 1] + 1;
++                if (dp[cur][j] > max_lcs) max_lcs = dp[cur][j];
++            } else {
++                dp[cur][j] = 0;
++            }
++        }
++    }
++    return max_lcs;
++}
++
++void hist_search_result_free(HistSearchResult *res) {
++    if (!res) return;
++    if (res->entries) {
++        for (size_t i = 0; i < res->count; i++) {
++            free(res->entries[i]);
++        }
++        free(res->entries);
++        res->entries = NULL;
++    }
++    res->count = 0;
++    res->match_type = HIST_MATCH_NONE;
++    res->match_len = 0;
++}
++
++int history_search(const char *term, HistSearchResult *res) {
++    if (!res) return -1;
++    res->match_type = HIST_MATCH_NONE;
++    res->match_len = 0;
++    res->count = 0;
++    res->entries = NULL;
++
++    if (!g_shared_history || !term) return 0;
++    while (*term && isspace((unsigned char)*term)) term++;
++    if (*term == '\0') return 0;
++
++    sem_wait(&g_shared_history->sem);
++    if (g_shared_history->count == 0) {
++        sem_post(&g_shared_history->sem);
++        return 0;
++    }
++
++    /* Rule (a): Exact match (most recent) */
++    for (int i = 0; i < g_shared_history->count; i++) {
++        int idx = (g_shared_history->head - 1 - i + (2 * MAX_HISTORY_COMMANDS)) % MAX_HISTORY_COMMANDS;
++        if (strcmp(g_shared_history->commands[idx], term) == 0) {
++            res->match_type = HIST_MATCH_EXACT;
++            res->match_len = (int)strlen(term);
++            res->count = 1;
++            res->entries = (char **)malloc(sizeof(char *));
++            if (res->entries) {
++                res->entries[0] = strdup(g_shared_history->commands[idx]);
++            }
++            sem_post(&g_shared_history->sem);
++            return 0;
++        }
++    }
++
++    /* Rule (b): Longest Common Substring > 2 */
++    if (g_shared_history->count <= 0) {
++        sem_post(&g_shared_history->sem);
++        return 0;
++    }
++    size_t total = (size_t)g_shared_history->count;
++    int best_lcs = 0;
++    int *lcs_arr = (int *)malloc(sizeof(int) * total);
++    if (!lcs_arr) {
++        sem_post(&g_shared_history->sem);
++        return 0;
++    }
++
++    for (size_t i = 0; i < total; i++) {
++        int idx = (g_shared_history->head - 1 - (int)i + (2 * MAX_HISTORY_COMMANDS)) % MAX_HISTORY_COMMANDS;
++        int lcs = compute_lcs_len(term, g_shared_history->commands[idx]);
++        lcs_arr[i] = lcs;
++        if (lcs > best_lcs) best_lcs = lcs;
++    }
++
++    if (best_lcs > 2) {
++        res->match_type = HIST_MATCH_SUBSTRING;
++        res->match_len = best_lcs;
++        res->entries = (char **)malloc(sizeof(char *) * total);
++        if (res->entries) {
++            size_t o = 0;
++            for (size_t i = 0; i < total; i++) {
++                if (lcs_arr[i] == best_lcs) {
++                    int idx = (g_shared_history->head - 1 - (int)i + (2 * MAX_HISTORY_COMMANDS)) % MAX_HISTORY_COMMANDS;
++                    const char *cand = g_shared_history->commands[idx];
++                    bool dup = false;
++                    for (size_t k = 0; k < o; k++) {
++                        if (strcmp(res->entries[k], cand) == 0) {
++                            dup = true;
++                            break;
++                        }
++                    }
++                    if (!dup) {
++                        res->entries[o++] = strdup(cand);
++                    }
++                }
++            }
++            res->count = o;
++        }
++    } else {
++        res->match_type = HIST_MATCH_NONE;
++    }
++
++    free(lcs_arr);
++    sem_post(&g_shared_history->sem);
++    return 0;
++}
+diff --git a/src/parser.c b/src/parser.c
+index 1c5f8d4..3043076 100644
+--- a/src/parser.c
++++ b/src/parser.c
+@@ -195,12 +195,24 @@ static int expand_variable(const char *str, char *out_buf, size_t max_len,
+ 
+     if (str[1] == '#') {
+         *chars_consumed = 2;
+-        return snprintf(out_buf, max_len, "0");
++        int count = ctx ? ctx->script_argc : 0;
++        return snprintf(out_buf, max_len, "%d", count);
+     }
+ 
+     if (str[1] == '0') {
+         *chars_consumed = 2;
+-        return snprintf(out_buf, max_len, "terminator");
++        const char *s0 = (ctx && ctx->script_name[0] != '\0') ? ctx->script_name : "terminator";
++        return snprintf(out_buf, max_len, "%s", s0);
++    }
++
++    if (isdigit((unsigned char)str[1])) {
++        *chars_consumed = 2;
++        int idx = str[1] - '1';
++        if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc && ctx->script_argv[idx]) {
++            return snprintf(out_buf, max_len, "%s", ctx->script_argv[idx]);
++        }
++        out_buf[0] = '\0';
++        return 0;
+     }
+ 
+     if (str[1] == '{') {
+@@ -213,6 +225,22 @@ static int expand_variable(const char *str, char *out_buf, size_t max_len,
+             memcpy(var_name, str + 2, vlen);
+             var_name[vlen] = '\0';
+             *chars_consumed = i + 1;
++            if (var_name[0] == '#' && var_name[1] == '\0') {
++                int count = ctx ? ctx->script_argc : 0;
++                return snprintf(out_buf, max_len, "%d", count);
++            }
++            if (var_name[0] == '0' && var_name[1] == '\0') {
++                const char *s0 = (ctx && ctx->script_name[0] != '\0') ? ctx->script_name : "terminator";
++                return snprintf(out_buf, max_len, "%s", s0);
++            }
++            if (isdigit((unsigned char)var_name[0]) && var_name[1] == '\0') {
++                int idx = var_name[0] - '1';
++                if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc && ctx->script_argv[idx]) {
++                    return snprintf(out_buf, max_len, "%s", ctx->script_argv[idx]);
++                }
++                out_buf[0] = '\0';
++                return 0;
++            }
+             const char *val = getenv(var_name);
+             if (val) {
+                 return snprintf(out_buf, max_len, "%s", val);
+diff --git a/src/script.c b/src/script.c
+new file mode 100644
+index 0000000..1a18705
+--- /dev/null
++++ b/src/script.c
+@@ -0,0 +1,462 @@
++#include "script.h"
++#include "parser.h"
++#include "shell.h"
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <sys/stat.h>
++#include <ctype.h>
++#include <errno.h>
++
++int is_bash_script(const char *path) {
++    if (!path || path[0] == '\0') return 0;
++    if (strcmp(path, "bash") == 0) return 0;
++
++    struct stat st;
++    if (stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
++        return 0;
++    }
++
++    /* Has .sh extension */
++    const char *dot = strrchr(path, '.');
++    if (dot && strcmp(dot, ".sh") == 0) {
++        return 1;
++    }
++
++    /* Check for shebang '#!' at the beginning of the file */
++    FILE *fp = fopen(path, "r");
++    if (!fp) return 0;
++    char magic[2] = {0};
++    size_t nr = fread(magic, 1, 2, fp);
++    fclose(fp);
++
++    if (nr == 2 && magic[0] == '#' && magic[1] == '!') {
++        return 1;
++    }
++
++    return 0;
++}
++
++static void expand_test_tokens(ShellContext *ctx, const char *raw_expr, char **tokens, int *num_tokens, int max_tokens) {
++    *num_tokens = 0;
++    if (!raw_expr) return;
++
++    const char *p = raw_expr;
++    while (*p && *num_tokens < max_tokens) {
++        while (*p && isspace((unsigned char)*p)) p++;
++        if (*p == '\0') break;
++
++        char buf[1024];
++        int blen = 0;
++        bool in_quotes = false;
++        char qchar = '\0';
++
++        while (*p && (in_quotes || !isspace((unsigned char)*p))) {
++            if (!in_quotes && (*p == '\'' || *p == '"')) {
++                in_quotes = true;
++                qchar = *p++;
++                continue;
++            }
++            if (in_quotes && *p == qchar) {
++                in_quotes = false;
++                qchar = '\0';
++                p++;
++                continue;
++            }
++
++            if (*p == '$' && qchar != '\'') {
++                /* Variable expansion */
++                p++;
++                if (*p == '{') {
++                    p++;
++                    char vname[256];
++                    int vi = 0;
++                    while (*p && *p != '}' && vi < 255) vname[vi++] = *p++;
++                    vname[vi] = '\0';
++                    if (*p == '}') p++;
++
++                    const char *val = NULL;
++                    char num_buf[32];
++                    if (vname[0] == '#' && vname[1] == '\0') {
++                        snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->script_argc : 0);
++                        val = num_buf;
++                    } else if (vname[0] == '0' && vname[1] == '\0') {
++                        val = (ctx && ctx->script_name[0]) ? ctx->script_name : "terminator";
++                    } else if (isdigit((unsigned char)vname[0]) && vname[1] == '\0') {
++                        int idx = vname[0] - '1';
++                        if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc) {
++                            val = ctx->script_argv[idx];
++                        }
++                    } else if (vname[0] == '?' && vname[1] == '\0') {
++                        snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->last_exit_status : 0);
++                        val = num_buf;
++                    } else {
++                        val = getenv(vname);
++                    }
++
++                    if (val) {
++                        for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) {
++                            buf[blen++] = val[k];
++                        }
++                    }
++                } else if (*p == '#') {
++                    p++;
++                    char num_buf[32];
++                    snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->script_argc : 0);
++                    for (int k = 0; num_buf[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = num_buf[k];
++                } else if (*p == '0') {
++                    p++;
++                    const char *val = (ctx && ctx->script_name[0]) ? ctx->script_name : "terminator";
++                    for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = val[k];
++                } else if (*p == '?') {
++                    p++;
++                    char num_buf[32];
++                    snprintf(num_buf, sizeof(num_buf), "%d", ctx ? ctx->last_exit_status : 0);
++                    for (int k = 0; num_buf[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = num_buf[k];
++                } else if (isdigit((unsigned char)*p)) {
++                    int idx = *p - '1';
++                    p++;
++                    if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc && ctx->script_argv[idx]) {
++                        const char *val = ctx->script_argv[idx];
++                        for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) buf[blen++] = val[k];
++                    }
++                } else {
++                    char vname[256];
++                    int vi = 0;
++                    while (*p && (isalnum((unsigned char)*p) || *p == '_') && vi < 255) {
++                        vname[vi++] = *p++;
++                    }
++                    vname[vi] = '\0';
++                    const char *val = getenv(vname);
++                    if (val) {
++                        for (int k = 0; val[k] && blen < (int)sizeof(buf) - 1; k++) {
++                            buf[blen++] = val[k];
++                        }
++                    }
++                }
++            } else {
++                if (blen < (int)sizeof(buf) - 1) {
++                    buf[blen++] = *p;
++                }
++                p++;
++            }
++        }
++
++        buf[blen] = '\0';
++        tokens[(*num_tokens)++] = strdup(buf);
++    }
++}
++
++int script_eval_test(ShellContext *ctx, const char *expr) {
++    if (!expr) return 1;
++
++    char *tokens[64];
++    int ntokens = 0;
++    expand_test_tokens(ctx, expr, tokens, &ntokens, 64);
++
++    if (ntokens == 0) {
++        return 1; /* Empty test evaluates to false */
++    }
++
++    bool invert = false;
++    int cur = 0;
++    if (strcmp(tokens[0], "!") == 0) {
++        invert = true;
++        cur++;
++    }
++
++    int remaining = ntokens - cur;
++    int result = 1; /* 0 = true, 1 = false */
++
++    if (remaining == 1) {
++        /* [ string ]: true if non-empty */
++        result = (tokens[cur][0] != '\0') ? 0 : 1;
++    } else if (remaining == 2) {
++        const char *op = tokens[cur];
++        const char *arg = tokens[cur + 1];
++
++        if (strcmp(op, "-z") == 0) {
++            result = (arg[0] == '\0') ? 0 : 1;
++        } else if (strcmp(op, "-n") == 0) {
++            result = (arg[0] != '\0') ? 0 : 1;
++        } else if (strcmp(op, "-f") == 0) {
++            struct stat st;
++            result = (stat(arg, &st) == 0 && S_ISREG(st.st_mode)) ? 0 : 1;
++        } else if (strcmp(op, "-d") == 0) {
++            struct stat st;
++            result = (stat(arg, &st) == 0 && S_ISDIR(st.st_mode)) ? 0 : 1;
++        } else if (strcmp(op, "-e") == 0) {
++            result = (access(arg, F_OK) == 0) ? 0 : 1;
++        } else if (strcmp(op, "-s") == 0) {
++            struct stat st;
++            result = (stat(arg, &st) == 0 && st.st_size > 0) ? 0 : 1;
++        } else if (strcmp(op, "-r") == 0) {
++            result = (access(arg, R_OK) == 0) ? 0 : 1;
++        } else if (strcmp(op, "-w") == 0) {
++            result = (access(arg, W_OK) == 0) ? 0 : 1;
++        } else if (strcmp(op, "-x") == 0) {
++            result = (access(arg, X_OK) == 0) ? 0 : 1;
++        }
++    } else if (remaining == 3) {
++        const char *arg1 = tokens[cur];
++        const char *op = tokens[cur + 1];
++        const char *arg2 = tokens[cur + 2];
++
++        if (strcmp(op, "=") == 0 || strcmp(op, "==") == 0) {
++            result = (strcmp(arg1, arg2) == 0) ? 0 : 1;
++        } else if (strcmp(op, "!=") == 0) {
++            result = (strcmp(arg1, arg2) != 0) ? 0 : 1;
++        } else if (strcmp(op, "-eq") == 0) {
++            result = (atol(arg1) == atol(arg2)) ? 0 : 1;
++        } else if (strcmp(op, "-ne") == 0) {
++            result = (atol(arg1) != atol(arg2)) ? 0 : 1;
++        } else if (strcmp(op, "-lt") == 0) {
++            result = (atol(arg1) < atol(arg2)) ? 0 : 1;
++        } else if (strcmp(op, "-le") == 0) {
++            result = (atol(arg1) <= atol(arg2)) ? 0 : 1;
++        } else if (strcmp(op, "-gt") == 0) {
++            result = (atol(arg1) > atol(arg2)) ? 0 : 1;
++        } else if (strcmp(op, "-ge") == 0) {
++            result = (atol(arg1) >= atol(arg2)) ? 0 : 1;
++        }
++    }
++
++    for (int i = 0; i < ntokens; i++) {
++        free(tokens[i]);
++    }
++
++    if (invert) {
++        result = (result == 0) ? 1 : 0;
++    }
++    return result;
++}
++
++static char *extract_bracket_expr(const char *line) {
++    const char *open_b = strchr(line, '[');
++    if (!open_b) return NULL;
++    const char *close_b = strrchr(open_b, ']');
++    if (!close_b || close_b <= open_b) return NULL;
++
++    size_t len = (size_t)(close_b - open_b - 1);
++    char *expr = (char *)malloc(len + 1);
++    if (!expr) return NULL;
++    memcpy(expr, open_b + 1, len);
++    expr[len] = '\0';
++    return expr;
++}
++
++typedef struct {
++    bool parent_active;
++    bool branch_matched;
++    bool active;
++} CondFrame;
++
++int script_run(ShellContext *ctx, const char *script_path, int argc, char **argv) {
++    if (!ctx || !script_path) return 1;
++
++    FILE *fp = fopen(script_path, "r");
++    if (!fp) {
++        fprintf(stderr, "terminator: %s: %s\n", script_path, strerror(errno));
++        ctx->last_exit_status = 127;
++        return 127;
++    }
++
++    /* Read all lines into memory for pre-validation and sequential execution */
++    char **lines = NULL;
++    size_t num_lines = 0;
++    size_t cap_lines = 64;
++    lines = (char **)malloc(sizeof(char *) * cap_lines);
++
++    char *buf = NULL;
++    size_t buflen = 0;
++    ssize_t nread;
++    while ((nread = getline(&buf, &buflen, fp)) != -1) {
++        if (num_lines >= cap_lines) {
++            cap_lines *= 2;
++            char **new_lines = (char **)realloc(lines, sizeof(char *) * cap_lines);
++            if (!new_lines) break;
++            lines = new_lines;
++        }
++        lines[num_lines++] = strdup(buf);
++    }
++    free(buf);
++    fclose(fp);
++
++    /* Pre-validation: ensure balanced if / fi */
++    int if_count = 0, fi_count = 0;
++    for (size_t i = 0; i < num_lines; i++) {
++        const char *p = lines[i];
++        while (*p && isspace((unsigned char)*p)) p++;
++        if (*p == '#' || *p == '\0') continue;
++
++        if (strncmp(p, "if ", 3) == 0 || strncmp(p, "if[", 3) == 0 || strcmp(p, "if") == 0) {
++            if_count++;
++        } else if (strncmp(p, "fi", 2) == 0 && (p[2] == '\0' || isspace((unsigned char)p[2]) || p[2] == ';')) {
++            fi_count++;
++        }
++    }
++
++    if (if_count != fi_count) {
++        fprintf(stderr, "terminator: %s: syntax error: unexpected end of file (missing 'fi')\n", script_path);
++        for (size_t i = 0; i < num_lines; i++) free(lines[i]);
++        free(lines);
++        ctx->last_exit_status = 2;
++        return 2;
++    }
++
++    /* Save and set positional parameters */
++    int old_argc = ctx->script_argc;
++    char **old_argv = ctx->script_argv;
++    char old_name[PATH_MAX];
++    strncpy(old_name, ctx->script_name, sizeof(old_name));
++
++    ctx->script_name[sizeof(ctx->script_name) - 1] = '\0';
++    strncpy(ctx->script_name, script_path, sizeof(ctx->script_name) - 1);
++    ctx->script_argc = (argc > 1) ? (argc - 1) : 0;
++    ctx->script_argv = (argc > 1) ? (argv + 1) : NULL;
++
++    CondFrame stack[64];
++    int depth = 0;
++
++    int last_status = 0;
++    bool exit_script = false;
++
++    for (size_t line_idx = 0; line_idx < num_lines && !exit_script; line_idx++) {
++        char *line = lines[line_idx];
++        size_t l = strlen(line);
++        while (l > 0 && (line[l - 1] == '\n' || line[l - 1] == '\r')) line[--l] = '\0';
++
++        char *p = line;
++        while (*p && isspace((unsigned char)*p)) p++;
++        if (*p == '#' || *p == '\0') continue;
++
++        /* Conditionals */
++        if (strncmp(p, "if ", 3) == 0 || strncmp(p, "if[", 3) == 0) {
++            bool parent_act = (depth == 0) ? true : stack[depth - 1].active;
++            bool condition_met = false;
++            if (parent_act) {
++                char *expr = extract_bracket_expr(p);
++                if (expr) {
++                    condition_met = (script_eval_test(ctx, expr) == 0);
++                    free(expr);
++                }
++            }
++
++            stack[depth].parent_active = parent_act;
++            stack[depth].branch_matched = condition_met;
++            stack[depth].active = parent_act && condition_met;
++            depth++;
++            continue;
++        }
++
++        if (strncmp(p, "elif ", 5) == 0 || strncmp(p, "elif[", 5) == 0) {
++            if (depth > 0) {
++                CondFrame *f = &stack[depth - 1];
++                if (f->parent_active && !f->branch_matched) {
++                    char *expr = extract_bracket_expr(p);
++                    bool condition_met = false;
++                    if (expr) {
++                        condition_met = (script_eval_test(ctx, expr) == 0);
++                        free(expr);
++                    }
++                    if (condition_met) {
++                        f->branch_matched = true;
++                        f->active = true;
++                    } else {
++                        f->active = false;
++                    }
++                } else {
++                    f->active = false;
++                }
++            }
++            continue;
++        }
++
++        if (strncmp(p, "else", 4) == 0 && (p[4] == '\0' || isspace((unsigned char)p[4]) || p[4] == ';')) {
++            if (depth > 0) {
++                CondFrame *f = &stack[depth - 1];
++                if (f->parent_active && !f->branch_matched) {
++                    f->active = true;
++                    f->branch_matched = true;
++                } else {
++                    f->active = false;
++                }
++            }
++            continue;
++        }
++
++        if (strncmp(p, "fi", 2) == 0 && (p[2] == '\0' || isspace((unsigned char)p[2]) || p[2] == ';')) {
++            if (depth > 0) depth--;
++            continue;
++        }
++
++        if (strncmp(p, "then", 4) == 0 && (p[4] == '\0' || isspace((unsigned char)p[4]) || p[4] == ';')) {
++            continue;
++        }
++
++        /* Check if currently active in conditional execution */
++        bool is_active = (depth == 0) || stack[depth - 1].active;
++        if (!is_active) continue;
++
++        /* Variable assignment: NAME=value (starts with letter/_, followed by [A-Za-z0-9_]*=) */
++        char *eq = strchr(p, '=');
++        if (eq && eq > p && !strchr(p, ' ') && !strchr(p, '\t')) {
++            bool valid_ident = (isalpha((unsigned char)p[0]) || p[0] == '_');
++            for (char *c = p; c < eq && valid_ident; c++) {
++                if (!isalnum((unsigned char)*c) && *c != '_') valid_ident = false;
++            }
++            if (valid_ident) {
++                *eq = '\0';
++                const char *val_raw = eq + 1;
++                char val_clean[1024];
++                if ((val_raw[0] == '"' && val_raw[strlen(val_raw) - 1] == '"') ||
++                    (val_raw[0] == '\'' && val_raw[strlen(val_raw) - 1] == '\'')) {
++                    size_t vlen = strlen(val_raw) - 2;
++                    strncpy(val_clean, val_raw + 1, vlen);
++                    val_clean[vlen] = '\0';
++                } else {
++                    strncpy(val_clean, val_raw, sizeof(val_clean) - 1);
++                    val_clean[sizeof(val_clean) - 1] = '\0';
++                }
++                setenv(p, val_clean, 1);
++                continue;
++            }
++        }
++
++        /* exit [n] command */
++        if (strncmp(p, "exit", 4) == 0 && (p[4] == '\0' || isspace((unsigned char)p[4]))) {
++            const char *arg = p + 4;
++            while (*arg && isspace((unsigned char)*arg)) arg++;
++            int code = ctx->last_exit_status;
++            if (*arg != '\0') {
++                code = atoi(arg);
++            }
++            last_status = code;
++            ctx->last_exit_status = code;
++            exit_script = true;
++            break;
++        }
++
++        /* Normal command / pipeline */
++        Pipeline pl;
++        if (parse_line(p, ctx, &pl) == 0) {
++            last_status = shell_execute_pipeline(ctx, &pl);
++            ctx->last_exit_status = last_status;
++            free_pipeline(&pl);
++        }
++    }
++
++    for (size_t i = 0; i < num_lines; i++) {
++        free(lines[i]);
++    }
++    free(lines);
++
++    /* Restore previous positional parameters */
++    ctx->script_argc = old_argc;
++    ctx->script_argv = old_argv;
++    snprintf(ctx->script_name, sizeof(ctx->script_name), "%s", old_name);
++
++    ctx->last_exit_status = last_status;
++    return last_status;
++}
+diff --git a/src/shell.c b/src/shell.c
+index 4fa3eec..6743f0f 100644
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -1,5 +1,6 @@
+ #include "shell.h"
+ #include "builtins.h"
++#include "script.h"
+ #include <stdio.h>
+ #include <stdlib.h>
+ #include <string.h>
+@@ -29,6 +30,9 @@ int shell_init(ShellContext *ctx) {
+     jobs_init(&ctx->job_table);
+     ctx->foreground_pid = 0;
+     ctx->foreground_cmd[0] = '\0';
++    ctx->script_argc = 0;
++    ctx->script_argv = NULL;
++    ctx->script_name[0] = '\0';
+ 
+     if (getcwd(ctx->cwd, sizeof(ctx->cwd)) == NULL) {
+         perror("terminator: shell_init: getcwd failed");
+@@ -203,6 +207,36 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+         return status;
+     }
+ 
++    /* Check for Task 11 bash script execution (bash script.sh or ./script.sh) */
++    if ((strcmp(cmd->argv[0], "bash") == 0 && cmd->argc >= 2) || is_bash_script(cmd->argv[0])) {
++        const char *spath = (strcmp(cmd->argv[0], "bash") == 0) ? cmd->argv[1] : cmd->argv[0];
++        int s_argc = (strcmp(cmd->argv[0], "bash") == 0) ? (cmd->argc - 1) : cmd->argc;
++        char **s_argv = (strcmp(cmd->argv[0], "bash") == 0) ? (cmd->argv + 1) : cmd->argv;
++
++        int saved_stdin = dup(STDIN_FILENO);
++        int saved_stdout = dup(STDOUT_FILENO);
++        int saved_stderr = dup(STDERR_FILENO);
++
++        if (setup_command_redirections(cmd) != 0) {
++            ctx->last_exit_status = 1;
++            close(saved_stdin);
++            close(saved_stdout);
++            close(saved_stderr);
++            return 1;
++        }
++
++        int status = script_run(ctx, spath, s_argc, s_argv);
++        ctx->last_exit_status = status;
++
++        dup2(saved_stdin, STDIN_FILENO);
++        dup2(saved_stdout, STDOUT_FILENO);
++        dup2(saved_stderr, STDERR_FILENO);
++        close(saved_stdin);
++        close(saved_stdout);
++        close(saved_stderr);
++        return status;
++    }
++
+     /* External command: fork and exec */
+     pid_t pid = fork();
+     if (pid < 0) {
+diff --git a/tests/harness_compat.h b/tests/harness_compat.h
+index 0230d6e..a89b6c0 100644
+--- a/tests/harness_compat.h
++++ b/tests/harness_compat.h
+@@ -167,47 +167,6 @@ static inline void shared_unlock(Shared *sh) {
+     pthread_mutex_unlock(&sh->mutex);
+ }
+ 
+-static inline size_t history_encode_line(const char *raw, char *enc, size_t max) {
+-    if (!raw || !enc || max < 2) return 0;
+-    size_t o = 0;
+-    for (size_t i = 0; raw[i] && o + 3 < max; i++) {
+-        if (raw[i] == '\\') {
+-            enc[o++] = '\\';
+-            enc[o++] = '\\';
+-        } else if (raw[i] == '\n') {
+-            enc[o++] = '\\';
+-            enc[o++] = 'n';
+-        } else {
+-            enc[o++] = raw[i];
+-        }
+-    }
+-    enc[o++] = '\n';
+-    enc[o] = '\0';
+-    return o;
+-}
+-
+-static inline size_t history_decode_line(const char *enc, size_t len, char *dec, size_t max) {
+-    if (!enc || !dec || max == 0) return 0;
+-    size_t o = 0;
+-    for (size_t i = 0; i < len && o + 1 < max; i++) {
+-        if (enc[i] == '\\' && i + 1 < len) {
+-            if (enc[i + 1] == 'n') {
+-                dec[o++] = '\n';
+-                i++;
+-            } else if (enc[i + 1] == '\\') {
+-                dec[o++] = '\\';
+-                i++;
+-            } else {
+-                dec[o++] = enc[i];
+-            }
+-        } else if (enc[i] != '\n' && enc[i] != '\r') {
+-            dec[o++] = enc[i];
+-        }
+-    }
+-    dec[o] = '\0';
+-    return o;
+-}
+-
+ static inline Shared *shared_create(void) {
+     Shared *sh = (Shared *)mmap(NULL, sizeof(Shared),
+                                 PROT_READ | PROT_WRITE,
+@@ -404,33 +363,6 @@ static inline int history_init_persistence(Shared *sh) {
+     return 0;
+ }
+ 
+-typedef enum {
+-    HIST_MATCH_NONE = 0,
+-    HIST_MATCH_EXACT = 1,
+-    HIST_MATCH_SUBSTRING = 2
+-} HistMatchType;
+-
+-typedef struct {
+-    HistMatchType match_type;
+-    int match_len;
+-    size_t count;
+-    char **entries;
+-} HistSearchResult;
+-
+-static inline void hist_search_result_free(HistSearchResult *res) {
+-    if (!res) return;
+-    if (res->entries) {
+-        for (size_t i = 0; i < res->count; i++) {
+-            free(res->entries[i]);
+-        }
+-        free(res->entries);
+-        res->entries = NULL;
+-    }
+-    res->count = 0;
+-    res->match_type = HIST_MATCH_NONE;
+-    res->match_len = 0;
+-}
+-
+ static inline int compute_lcs_len(const char *s1, const char *s2) {
+     if (!s1 || !s2) return 0;
+     int l1 = (int)strlen(s1);
+@@ -456,7 +388,8 @@ static inline int compute_lcs_len(const char *s1, const char *s2) {
+     return max_lcs;
+ }
+ 
+-static inline int history_search(Shared *sh, const char *term, HistSearchResult *res) {
++#define history_search(sh, term, res) harness_history_search(sh, term, res)
++static inline int harness_history_search(Shared *sh, const char *term, HistSearchResult *res) {
+     if (!res) return -1;
+     res->match_type = HIST_MATCH_NONE;
+     res->match_len = 0;
+diff --git a/tests/test_task11_scripts.c b/tests/test_task11_scripts.c
+new file mode 100644
+index 0000000..5e871a2
+--- /dev/null
++++ b/tests/test_task11_scripts.c
+@@ -0,0 +1,174 @@
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include <assert.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include "shell.h"
++#include "parser.h"
++#include "builtins.h"
++#include "script.h"
++#include "history.h"
++
++static void create_file(const char *path, const char *content, mode_t mode) {
++    FILE *f = fopen(path, "w");
++    assert(f != NULL);
++    fputs(content, f);
++    fclose(f);
++    chmod(path, mode);
++}
++
++static void test_script_validation(void) {
++    printf("  [11.1] Testing Syntax Validation (balanced if...fi)...\n");
++    ShellContext ctx;
++    shell_init(&ctx);
++
++    /* Unbalanced if (missing fi) */
++    create_file("/tmp/bad_script1.sh", "if [ 1 -eq 1 ]; then\n echo yes\n", 0755);
++    int rc = script_run(&ctx, "/tmp/bad_script1.sh", 0, NULL);
++    assert(rc != 0);
++    unlink("/tmp/bad_script1.sh");
++
++    /* Stray fi without if */
++    create_file("/tmp/bad_script2.sh", "echo hello\nfi\n", 0755);
++    rc = script_run(&ctx, "/tmp/bad_script2.sh", 0, NULL);
++    assert(rc != 0);
++    unlink("/tmp/bad_script2.sh");
++
++    printf("    Syntax validation passed!\n");
++}
++
++static void test_script_variables_and_posargs(void) {
++    printf("  [11.2] Testing Script Variables & Positional Arguments ($0, $#, $1..$9)...\n");
++    ShellContext ctx;
++    shell_init(&ctx);
++
++    const char *script_text =
++        "#!/bin/bash\n"
++        "# Comment line\n"
++        "MY_VAR=terminator\n"
++        "echo \"var=$MY_VAR\"\n"
++        "echo \"arg0=$0\"\n"
++        "echo \"argc=$#\"\n"
++        "echo \"arg1=$1\"\n"
++        "echo \"arg2=$2\"\n";
++
++    create_file("/tmp/pos_script.sh", script_text, 0755);
++
++    char *argv[] = { "pos_script.sh", "first", "second_arg", NULL };
++    int rc = script_run(&ctx, "/tmp/pos_script.sh", 3, argv);
++    assert(rc == 0);
++    assert(ctx.last_exit_status == 0);
++
++    unlink("/tmp/pos_script.sh");
++    printf("    Variables and positional arguments passed!\n");
++}
++
++static void test_script_conditionals(void) {
++    printf("  [11.3] Testing Script Conditionals (if, elif, else, [ ... ] tests)...\n");
++    ShellContext ctx;
++    shell_init(&ctx);
++
++    create_file("/tmp/test_target.txt", "sample content\n", 0644);
++
++    const char *cond_script =
++        "#!/bin/bash\n"
++        "TARGET=/tmp/test_target.txt\n"
++        "if [ -f \"$TARGET\" ]; then\n"
++        "    echo \"file exists\"\n"
++        "    RES=1\n"
++        "else\n"
++        "    echo \"file missing\"\n"
++        "    RES=0\n"
++        "fi\n"
++        "\n"
++        "if [ ! -d \"$TARGET\" ]; then\n"
++        "    echo \"not a directory\"\n"
++        "fi\n"
++        "\n"
++        "NUM=42\n"
++        "if [ $NUM -lt 10 ]; then\n"
++        "    VAL=low\n"
++        "elif [ $NUM -eq 42 ]; then\n"
++        "    VAL=correct\n"
++        "else\n"
++        "    VAL=high\n"
++        "fi\n"
++        "exit 5\n";
++
++    create_file("/tmp/cond_script.sh", cond_script, 0755);
++
++    int rc = script_run(&ctx, "/tmp/cond_script.sh", 0, NULL);
++    assert(rc == 5);
++    assert(ctx.last_exit_status == 5);
++
++    unlink("/tmp/test_target.txt");
++    unlink("/tmp/cond_script.sh");
++    printf("    Conditionals and exit codes passed!\n");
++}
++
++static void test_script_pipelines_and_redirection(void) {
++    printf("  [11.4] Testing Script Pipelines and Redirections...\n");
++    ShellContext ctx;
++    shell_init(&ctx);
++
++    const char *pipe_script =
++        "#!/bin/bash\n"
++        "echo \"apple banana cherry\" | tr ' ' '\\n' | sort | head -2 > /tmp/script_out.txt\n";
++
++    create_file("/tmp/pipe_script.sh", pipe_script, 0755);
++
++    int rc = script_run(&ctx, "/tmp/pipe_script.sh", 0, NULL);
++    assert(rc == 0);
++
++    FILE *f = fopen("/tmp/script_out.txt", "r");
++    assert(f != NULL);
++    char buf[128];
++    assert(fgets(buf, sizeof(buf), f) != NULL);
++    assert(strcmp(buf, "apple\n") == 0);
++    assert(fgets(buf, sizeof(buf), f) != NULL);
++    assert(strcmp(buf, "banana\n") == 0);
++    fclose(f);
++
++    unlink("/tmp/pipe_script.sh");
++    unlink("/tmp/script_out.txt");
++    printf("    Pipelines and redirections inside scripts passed!\n");
++}
++
++static void test_script_source_and_interception(void) {
++    printf("  [11.5] Testing source / . built-in and shell execution interception...\n");
++    ShellContext ctx;
++    shell_init(&ctx);
++
++    const char *src_script =
++        "SOURCED_VAR=sourced_value\n";
++    create_file("/tmp/source_test.sh", src_script, 0644);
++
++    Pipeline pl;
++    int rc = parse_line("source /tmp/source_test.sh", &ctx, &pl);
++    assert(rc == 0);
++    assert(pl.num_commands == 1);
++    rc = builtin_source(&ctx, pl.commands[0].argv);
++    assert(rc == 0);
++    free_pipeline(&pl);
++
++    /* Verify SOURCED_VAR persisted into environment */
++    const char *val = getenv("SOURCED_VAR");
++    assert(val != NULL);
++    assert(strcmp(val, "sourced_value") == 0);
++
++    unlink("/tmp/source_test.sh");
++    printf("    source and variable persistence passed!\n");
++}
++
++int main(void) {
++    printf("=== Task 11 Bash Script Interpreter Unit Tests ===\n");
++    test_script_validation();
++    test_script_variables_and_posargs();
++    test_script_conditionals();
++    test_script_pipelines_and_redirection();
++    test_script_source_and_interception();
++    printf("=== ALL TASK 11 TESTS PASSED SUCCESSFULLY! ===\n");
++    return 0;
++}

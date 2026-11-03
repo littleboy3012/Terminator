@@ -68,6 +68,15 @@ typedef struct {
     char multiline_accum[MAX_LINE_CHARS * 4]; /**< Accumulated multi-line command string before execution */
     int history_pos;                        /**< Active position when browsing history (-1 when at bottom prompt) */
     char saved_input[MAX_LINE_CHARS];       /**< Preserves in-progress typed text when browsing history */
+    int is_searching_history;               /**< 1 if in Ctrl+R reverse search mode */
+    char search_query[MAX_LINE_CHARS];      /**< Query string entered for Ctrl+R search */
+    int search_query_len;                   /**< Length of search_query */
+    int is_completion_active;               /**< 1 if awaiting candidate selection digit */
+    char *completion_choices[16];           /**< Candidate choices (1-9) */
+    int num_completion_choices;             /**< Number of candidate choices */
+    size_t completion_word_start;           /**< Start index of word being completed */
+    size_t completion_word_len;             /**< Length of word prefix */
+    char completion_dir_prefix[PATH_MAX];   /**< Directory prefix to prepend to candidate */
 } Tab;
 
 /**

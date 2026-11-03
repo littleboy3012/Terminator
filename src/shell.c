@@ -1,5 +1,6 @@
 #include "shell.h"
 #include "builtins.h"
+#include "script.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -29,6 +30,9 @@ int shell_init(ShellContext *ctx) {
     jobs_init(&ctx->job_table);
     ctx->foreground_pid = 0;
     ctx->foreground_cmd[0] = '\0';
+    ctx->script_argc = 0;
+    ctx->script_argv = NULL;
+    ctx->script_name[0] = '\0';
 
     if (getcwd(ctx->cwd, sizeof(ctx->cwd)) == NULL) {
         perror("terminator: shell_init: getcwd failed");
@@ -200,6 +204,36 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
 
         int status = execute_builtin(ctx, cmd);
         ctx->last_exit_status = status;
+        return status;
+    }
+
+    /* Check for Task 11 bash script execution (bash script.sh or ./script.sh) */
+    if ((strcmp(cmd->argv[0], "bash") == 0 && cmd->argc >= 2) || is_bash_script(cmd->argv[0])) {
+        const char *spath = (strcmp(cmd->argv[0], "bash") == 0) ? cmd->argv[1] : cmd->argv[0];
+        int s_argc = (strcmp(cmd->argv[0], "bash") == 0) ? (cmd->argc - 1) : cmd->argc;
+        char **s_argv = (strcmp(cmd->argv[0], "bash") == 0) ? (cmd->argv + 1) : cmd->argv;
+
+        int saved_stdin = dup(STDIN_FILENO);
+        int saved_stdout = dup(STDOUT_FILENO);
+        int saved_stderr = dup(STDERR_FILENO);
+
+        if (setup_command_redirections(cmd) != 0) {
+            ctx->last_exit_status = 1;
+            close(saved_stdin);
+            close(saved_stdout);
+            close(saved_stderr);
+            return 1;
+        }
+
+        int status = script_run(ctx, spath, s_argc, s_argv);
+        ctx->last_exit_status = status;
+
+        dup2(saved_stdin, STDIN_FILENO);
+        dup2(saved_stdout, STDOUT_FILENO);
+        dup2(saved_stderr, STDERR_FILENO);
+        close(saved_stdin);
+        close(saved_stdout);
+        close(saved_stderr);
         return status;
     }
 

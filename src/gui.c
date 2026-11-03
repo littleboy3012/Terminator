@@ -2,6 +2,7 @@
 #include "parser.h"
 #include "builtins.h"
 #include "history.h"
+#include "completion.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -343,6 +344,9 @@ void gui_cleanup(GuiApp *app) {
                 }
             }
             jobs_kill_all(&tab->shell_ctx.job_table);
+            for (int k = 0; k < tab->num_completion_choices; k++) {
+                if (tab->completion_choices[k]) free(tab->completion_choices[k]);
+            }
             free(tab);
         }
     }
@@ -470,6 +474,9 @@ void gui_close_tab(GuiApp *app, int tab_idx) {
         }
     }
     jobs_kill_all(&tab->shell_ctx.job_table);
+    for (int k = 0; k < tab->num_completion_choices; k++) {
+        if (tab->completion_choices[k]) free(tab->completion_choices[k]);
+    }
     free(tab);
 
     for (int i = tab_idx; i < app->num_tabs - 1; i++) {
@@ -723,6 +730,169 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
 
     int is_ctrl = (event->state & ControlMask);
     int is_shift = (event->state & ShiftMask);
+
+    /* Task 9 Ctrl+R Interactive History Search Mode */
+    if (tab->is_searching_history) {
+        if (keysym == XK_Return || keysym == XK_KP_Enter) {
+            char line[MAX_LINE_CHARS + 64];
+            snprintf(line, sizeof(line), "Enter search term: %s\n", tab->search_query);
+            tab_append_output(tab, line, (int)strlen(line));
+
+            HistSearchResult res;
+            history_search(tab->search_query, &res);
+            if (res.match_type == HIST_MATCH_NONE || res.count == 0) {
+                tab_append_output(tab, "No match for search term in history\n", 36);
+            } else {
+                for (size_t i = 0; i < res.count; i++) {
+                    char entry_line[MAX_LINE_CHARS + 2];
+                    snprintf(entry_line, sizeof(entry_line), "%s\n", res.entries[i]);
+                    tab_append_output(tab, entry_line, (int)strlen(entry_line));
+                }
+                /* Load the best / most recent match into prompt input */
+                snprintf(tab->input_buffer, sizeof(tab->input_buffer), "%s", res.entries[0]);
+                tab->input_len = (int)strlen(tab->input_buffer);
+                tab->cursor_pos = tab->input_len;
+            }
+            hist_search_result_free(&res);
+            tab->is_searching_history = 0;
+            tab->search_query[0] = '\0';
+            tab->search_query_len = 0;
+            gui_redraw(app);
+            return;
+        }
+        if (keysym == XK_Escape || (is_ctrl && (keysym == XK_c || keysym == XK_C))) {
+            tab->is_searching_history = 0;
+            tab->search_query[0] = '\0';
+            tab->search_query_len = 0;
+            gui_redraw(app);
+            return;
+        }
+        if (keysym == XK_BackSpace) {
+            if (tab->search_query_len > 0) {
+                tab->search_query[--tab->search_query_len] = '\0';
+                gui_redraw(app);
+            }
+            return;
+        }
+        if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
+            if (tab->search_query_len < (int)sizeof(tab->search_query) - 1) {
+                tab->search_query[tab->search_query_len++] = buffer[0];
+                tab->search_query[tab->search_query_len] = '\0';
+                gui_redraw(app);
+            }
+            return;
+        }
+        return;
+    }
+
+    if (is_ctrl && !is_shift && (keysym == XK_R || keysym == XK_r)) {
+        tab->is_searching_history = 1;
+        tab->search_query[0] = '\0';
+        tab->search_query_len = 0;
+        gui_redraw(app);
+        return;
+    }
+
+    /* Task 10 Numbered Candidate Selection Mode */
+    if (tab->is_completion_active) {
+        if (!is_ctrl && count > 0 && buffer[0] >= '1' && buffer[0] <= '9') {
+            int sel = buffer[0] - '1';
+            if (sel < tab->num_completion_choices && tab->completion_choices[sel]) {
+                const char *chosen = tab->completion_choices[sel];
+                char esc[COMPLETE_MAX_WORD * 2];
+                complete_escape_filename(chosen, esc, sizeof(esc));
+                char repl[PATH_MAX + COMPLETE_MAX_WORD * 2];
+                snprintf(repl, sizeof(repl), "%s%s", tab->completion_dir_prefix, esc);
+                size_t rlen = strlen(repl);
+                if (repl[rlen - 1] != '/') {
+                    if (rlen + 1 < sizeof(repl)) {
+                        repl[rlen++] = ' ';
+                        repl[rlen] = '\0';
+                    }
+                }
+                tab_delete_range(tab, (int)tab->completion_word_start,
+                                 (int)(tab->completion_word_start + tab->completion_word_len));
+                for (size_t i = 0; i < rlen; i++) {
+                    tab_insert_char(tab, repl[i]);
+                }
+            }
+            for (int i = 0; i < tab->num_completion_choices; i++) {
+                if (tab->completion_choices[i]) free(tab->completion_choices[i]);
+                tab->completion_choices[i] = NULL;
+            }
+            tab->num_completion_choices = 0;
+            tab->is_completion_active = 0;
+            gui_redraw(app);
+            return;
+        }
+        /* Any other key dismisses candidate selection mode and falls through */
+        for (int i = 0; i < tab->num_completion_choices; i++) {
+            if (tab->completion_choices[i]) free(tab->completion_choices[i]);
+            tab->completion_choices[i] = NULL;
+        }
+        tab->num_completion_choices = 0;
+        tab->is_completion_active = 0;
+    }
+
+    /* Task 10 Tab File-Name Auto-Completion */
+    if (keysym == XK_Tab) {
+        CompletionResult cr;
+        if (complete_file_candidates(tab->input_buffer, (size_t)tab->cursor_pos, tab->cwd, &cr) == 0) {
+            if (cr.count == 1) {
+                char esc[COMPLETE_MAX_WORD * 2];
+                complete_escape_filename(cr.items[0], esc, sizeof(esc));
+                char repl[PATH_MAX + COMPLETE_MAX_WORD * 2];
+                snprintf(repl, sizeof(repl), "%s%s", cr.dir_prefix, esc);
+                size_t rlen = strlen(repl);
+                if (repl[rlen - 1] != '/') {
+                    if (rlen + 1 < sizeof(repl)) {
+                        repl[rlen++] = ' ';
+                        repl[rlen] = '\0';
+                    }
+                }
+                tab_delete_range(tab, (int)cr.word_start, (int)(cr.word_start + cr.word_len));
+                for (size_t i = 0; i < rlen; i++) {
+                    tab_insert_char(tab, repl[i]);
+                }
+            } else if (cr.count > 1) {
+                char esc_lcp[COMPLETE_MAX_WORD * 2];
+                complete_escape_filename(cr.lcp, esc_lcp, sizeof(esc_lcp));
+                char lcp_repl[PATH_MAX + COMPLETE_MAX_WORD * 2];
+                snprintf(lcp_repl, sizeof(lcp_repl), "%s%s", cr.dir_prefix, esc_lcp);
+                size_t lcp_len = strlen(lcp_repl);
+                size_t cur_word_len = cr.word_len;
+
+                if (lcp_len > cur_word_len) {
+                    tab_delete_range(tab, (int)cr.word_start, (int)(cr.word_start + cr.word_len));
+                    for (size_t i = 0; i < lcp_len; i++) {
+                        tab_insert_char(tab, lcp_repl[i]);
+                    }
+                    cur_word_len = lcp_len;
+                }
+
+                char *list_str = complete_format_numbered_list(&cr, 80);
+                if (list_str) {
+                    const char *p_used = tab->is_multiline ? "> " : PROMPT_STRING;
+                    tab_record_prompt_input(app, tab, p_used, (int)strlen(p_used));
+                    tab_append_output(tab, list_str, (int)strlen(list_str));
+                    tab_append_output(tab, "\n", 1);
+                    free(list_str);
+                }
+
+                tab->num_completion_choices = cr.count > 9 ? 9 : (int)cr.count;
+                for (int i = 0; i < tab->num_completion_choices; i++) {
+                    tab->completion_choices[i] = strdup(cr.items[i]);
+                }
+                tab->completion_word_start = cr.word_start;
+                tab->completion_word_len = cur_word_len;
+                snprintf(tab->completion_dir_prefix, sizeof(tab->completion_dir_prefix), "%s", cr.dir_prefix);
+                tab->is_completion_active = 1;
+            }
+            completion_result_free(&cr);
+            gui_redraw(app);
+        }
+        return;
+    }
 
     /* Tab Creation / Closure shortcuts */
     if (is_ctrl && (keysym == XK_T || keysym == XK_t)) {
@@ -1066,13 +1236,18 @@ void gui_redraw(GuiApp *app) {
 
     /* Content Area & Dimensions */
     int cols = get_term_cols(app);
-    const char *active_p = tab->is_multiline ? "> " : PROMPT_STRING;
+    const char *active_p = tab->is_searching_history ? "Enter search term: " :
+                           (tab->is_multiline ? "> " : PROMPT_STRING);
     int p_len = (int)strlen(active_p);
     int first_cap = get_first_line_capacity(app, p_len);
 
+    const char *cur_input_buf = tab->is_searching_history ? tab->search_query : tab->input_buffer;
+    int cur_input_len = tab->is_searching_history ? tab->search_query_len : tab->input_len;
+    int cur_cursor_pos = tab->is_searching_history ? tab->search_query_len : tab->cursor_pos;
+
     int active_rows = 1;
-    if (tab->input_len > first_cap) {
-        active_rows = 1 + (tab->input_len - first_cap + cols - 1) / cols;
+    if (cur_input_len > first_cap) {
+        active_rows = 1 + (cur_input_len - first_cap + cols - 1) / cols;
     }
 
     int content_top = TAB_BAR_HEIGHT + 10;
@@ -1108,19 +1283,19 @@ void gui_redraw(GuiApp *app) {
 
     /* Active Input & Wrapped Lines */
     XDrawString(app->display, app->back_buffer, app->gc_prompt, 10, cur_y, active_p, p_len);
-    int line0_chars = tab->input_len < first_cap ? tab->input_len : first_cap;
+    int line0_chars = cur_input_len < first_cap ? cur_input_len : first_cap;
     if (line0_chars > 0) {
         XDrawString(app->display, app->back_buffer, app->gc_input,
-                    10 + (p_len * app->font_width), cur_y, tab->input_buffer, line0_chars);
+                    10 + (p_len * app->font_width), cur_y, cur_input_buf, line0_chars);
     }
 
-    if (tab->input_len > first_cap) {
+    if (cur_input_len > first_cap) {
         int off = first_cap;
         int row = 1;
-        while (off < tab->input_len) {
-            int chunk = tab->input_len - off > cols ? cols : tab->input_len - off;
+        while (off < cur_input_len) {
+            int chunk = cur_input_len - off > cols ? cols : cur_input_len - off;
             XDrawString(app->display, app->back_buffer, app->gc_input,
-                        10, cur_y + (row * app->font_height), tab->input_buffer + off, chunk);
+                        10, cur_y + (row * app->font_height), cur_input_buf + off, chunk);
             off += chunk;
             row++;
         }
@@ -1128,11 +1303,11 @@ void gui_redraw(GuiApp *app) {
 
     /* Unified Block Cursor Calculation */
     int c_row = 0, c_col = 0;
-    if (tab->cursor_pos <= first_cap) {
+    if (cur_cursor_pos <= first_cap) {
         c_row = 0;
-        c_col = p_len + tab->cursor_pos;
+        c_col = p_len + cur_cursor_pos;
     } else {
-        int rel = tab->cursor_pos - first_cap;
+        int rel = cur_cursor_pos - first_cap;
         c_row = 1 + (rel / cols);
         c_col = rel % cols;
     }

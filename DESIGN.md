@@ -66,7 +66,9 @@ flowchart TD
 | `src/shell.c` | `include/shell.h` | Pipeline orchestrator; I/O redirection; external process fork/exec; process group leader. | `shell_init()`, `shell_cleanup()`, `shell_execute_pipeline()`, `shell_execute_command()`, `setup_redirections()`<br>Structs: `ShellContext` |
 | `src/builtins.c`| `include/builtins.h`| Built-in implementations affecting shell state; unified output capturing for GUI/pipes. | `is_builtin_command()`, `execute_builtin()`, `execute_builtin_captured()`, `builtin_cd()`, `builtin_exit()`, `builtin_clear()`, `builtin_jobs()`, `builtin_bg()`, `builtin_fg()`, `builtin_history()`, `builtin_source()` |
 | `src/jobs.c` | `include/jobs.h` | POSIX job control table; process group tracking; asynchronous completion notifications. | `jobs_init()`, `jobs_add()`, `jobs_remove()`, `jobs_find_by_id()`, `jobs_find_by_pid()`, `jobs_check_status()`, `jobs_print()`, `jobs_builtin_bg()`, `jobs_builtin_fg()`, `jobs_kill_all()`, `jobs_get_current()`<br>Structs: `JobTable`, `Job`, `JobState` |
-| `src/history.c` | `include/history.h` | Synchronized cross-tab command history ring buffer; POSIX shared memory; semaphores. | `history_init()`, `history_cleanup()`, `history_add()`, `history_get_relative()`, `history_count()`, `history_format_recent()`<br>Structs: `SharedHistory` |
+| `src/history.c` | `include/history.h` | Persistent 10,000-command history ring buffer; disk persistence (`~/.terminator_history`); compaction (>20,000); 3-tier LCS search engine. | `history_init()`, `history_cleanup()`, `history_add()`, `history_get_relative()`, `history_count()`, `history_format_recent()`, `history_search()`, `hist_search_result_free()`, `history_encode_line()`, `history_decode_line()`<br>Structs: `SharedHistory`, `HistSearchResult`, `HistMatchType` |
+| `src/completion.c` | `include/completion.h` | Context-aware Tab file-name auto-completion engine; word extraction with quote/escape handling; LCP computation; candidate formatter. | `complete_extract_word()`, `complete_unescape_word()`, `complete_escape_filename()`, `complete_decompose_word()`, `complete_compute_lcp()`, `complete_file_candidates()`, `complete_format_numbered_list()`, `completion_result_free()`<br>Structs: `CompletionResult` |
+| `src/script.c` | `include/script.h` | In-house bash script runner; control flow evaluator; conditional evaluator `[ ... ]`; positional parameter manager; recursion guard. | `script_run()`, `is_bash_script()`, `script_eval_test()`<br>Structs: `CondFrame` |
 | `src/multiwatch.c`| `include/multiwatch.h`| Concurrent parallel command execution; 2.0s refresh timer; formatted banner rendering. | `builtin_multiwatch()`, `parse_multiwatch_commands()`, `spawn_watched_cmd()`, `print_formatted_output()`<br>Structs: `WatchedCmd` |
 | `src/hotkeys.c` | `include/hotkeys.h` | Keybinding configuration reader (`~/.terminatorrc`); conflict detector; X11 KeySym mapper. | `hotkeys_init()`, `hotkeys_match()`, `check_and_resolve_conflicts()`, `parse_combo_string()`<br>Structs: `HotkeyConfig`, `HotkeyBinding`, `HotkeyAction` |
 
@@ -500,36 +502,250 @@ sequenceDiagram
 
 ---
 
-### Task 9 — Shared Command History
+### Task 9 — Searchable and Persistent Command History
 
 #### 1. Trigger & Input
-- Every command executed via <kbd>Return</kbd>, Up/Down arrow keys, or `history` built-in command.
+- **Automatic Appending**: Every command executed via <kbd>Return</kbd> in interactive mode is committed to shared history.
+- **`history` Built-in Command**: Invoked by user command `history` (displays up to the last 1,000 commands formatted as `%5d  %s\n`).
+- **Interactive Reverse Search (`Ctrl+R`)**: User presses <kbd>Ctrl+R</kbd> in the GUI terminal. The prompt switches to `Enter search term: `, accepting user query input until <kbd>Return</kbd> (to search) or <kbd>Esc</kbd>/<kbd>Ctrl+C</kbd> (to cancel).
 
 #### 2. Step-by-Step Execution Trace
-1. **Appending Command (`history.c:history_add`)**:
+1. **Startup Loading & Compaction (`history.c:history_init`)**:
+   - Determines persistence file path from `TERMINATOR_HISTFILE` environment variable (default: `~/.terminator_history`).
+   - Acquires the shared semaphore `sem_wait(&g_shared_history->sem)`.
+   - Counts total lines in the persistence file. If lines exceed 20,000, enforces compaction: reads file, keeps only the most recent 10,000 lines, writes them atomically to a temporary file, and renames it over `~/.terminator_history`.
+   - Decodes stored lines using `history_decode_line()` (reversing `\n` and `\\` escape sequences) and loads up to 10,000 commands into the in-memory circular ring buffer `g_shared_history->commands`.
+   - Releases semaphore `sem_post(&g_shared_history->sem)`.
+2. **Appending Commands (`history.c:history_add`)**:
    - Acquires semaphore: `sem_wait(&g_shared_history->sem)`.
-   - Checks ring buffer bounds: if input is identical to most recent entry or empty, ignores it.
-   - Copies string to `g_shared_history->commands[g_shared_history->head]`.
-   - Strips trailing newlines.
-   - Increments `head = (head + 1) % MAX_HISTORY_COMMANDS`.
-   - Increments `count` up to `MAX_HISTORY_COMMANDS` (10,000).
-   - Releases semaphore: `sem_post(&g_shared_history->sem)`.
-2. **Relative History Lookup (`history.c:history_get_relative`)**:
-   - Used by <kbd>Up</kbd> (`offset = 0, 1, ...`) and <kbd>Down</kbd> arrow keys.
-   - Acquires semaphore: `sem_wait(&g_shared_history->sem)`.
-   - Computes circular ring index:
-     `idx = (head - 1 - offset + 2 * MAX_HISTORY_COMMANDS) % MAX_HISTORY_COMMANDS`.
-   - Copies command string to output buffer.
-   - Releases semaphore: `sem_post(&g_shared_history->sem)`.
-3. **History Command Formatting (`history.c:history_format_recent`)**:
-   - `builtin_history()` requests recent 1,000 entries.
-   - Iterates through valid ring buffer slots, formatting numbered list:
-     ```text
-         1  echo first_command
-         2  echo second_command
-         3  history
-     ```
-   - Emits buffer to stdout or tab scrollback.
+   - Ignores empty commands or commands identical to the most recent entry (deduplication).
+   - Copies command string to `g_shared_history->commands[g_shared_history->head]`.
+   - Advances head pointer: `head = (head + 1) % MAX_HISTORY_COMMANDS` (10,000).
+   - Updates `count = count < 10000 ? count + 1 : 10000`.
+   - Encodes command via `history_encode_line()` and appends to disk file via `fopen(path, "a")`.
+   - Releases semaphore `sem_post(&g_shared_history->sem)`.
+3. **3-Tier Reverse Search Algorithm (`history.c:history_search`)**:
+   - **Tier 1 (Exact Match)**: Scans commands from newest to oldest (`offset = 0 ... count - 1`). If `strcmp(cand, term) == 0`, immediately populates `res->entries[0]` with `cand`, sets `match_type = HIST_MATCH_EXACT`, and returns.
+   - **Tier 2 (Maximal Longest Common Subsequence / Substring)**: If no exact match exists, computes LCS length between `term` and all stored commands using dynamic programming (`compute_lcs_len()`). Identifies maximal LCS length `best_lcs`. If `best_lcs > 2`, collects all commands tied for `best_lcs`, deduplicating identical entries, orders them most-recent-first, sets `match_type = HIST_MATCH_SUBSTRING`, and returns.
+   - **Tier 3 (No Match)**: If no exact match and `best_lcs <= 2`, sets `match_type = HIST_MATCH_NONE` and `count = 0`.
+4. **GUI Interactive Handling (`gui.c:gui_handle_key_press`)**:
+   - On <kbd>Ctrl+R</kbd>: sets `tab->is_searching_history = 1`, clears `tab->search_query`.
+   - While `is_searching_history == 1`:
+     - Displays red prompt `Enter search term: ` with green user query.
+     - On <kbd>Return</kbd>: appends `Enter search term: <query>\n` to scrollback, invokes `history_search()`. If matched, prints all matching commands, loads the most recent match directly into `tab->input_buffer`, resets search mode, and redraws terminal ready for editing or execution. If no match, prints `No match for search term in history\n`.
+     - On <kbd>Esc</kbd> or <kbd>Ctrl+C</kbd>: cancels search mode silently, restoring prompt.
+
+#### 3. Call Graph / Sequence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant GUI as src/gui.c:gui_handle_key_press()
+    participant Hist as src/history.c:history_search()
+    participant DP as src/history.c:compute_lcs_len()
+    participant Canvas as src/gui.c:gui_redraw()
+
+    User->>GUI: KeyPress (Ctrl+R)
+    GUI->>GUI: Set is_searching_history = 1
+    GUI->>Canvas: Redraw prompt: "Enter search term: "
+    User->>GUI: Type search query + KeyPress (Return)
+    GUI->>Hist: history_search(query, &res)
+    alt Exact Match Found
+        Hist->>Hist: Set HIST_MATCH_EXACT
+    else LCS > 2 Found
+        loop For Each History Entry
+            Hist->>DP: compute_lcs_len(query, history_cmd)
+        end
+        Hist->>Hist: Filter max LCS entries & deduplicate
+    else No Match / LCS <= 2
+        Hist->>Hist: Set HIST_MATCH_NONE
+    end
+    Hist-->>GUI: Return match results
+    GUI->>GUI: tab_append_output(matches / "No match...")
+    GUI->>GUI: Set tab->input_buffer = res.entries[0]
+    GUI->>GUI: Reset is_searching_history = 0
+    GUI->>Canvas: Redraw standard prompt with matched command
+```
+
+#### 4. Error Handling & Edge Cases
+- **Blank Search String**: Empty or whitespace-only search queries safely yield `HIST_MATCH_NONE` with 0 allocations.
+- **Corrupt History File**: Malformed or oversized lines on disk are safely skipped during startup decode.
+- **Dead Process Mutex/Semaphore Recovery**: In Process Mode, semaphore/mutex state remains consistent across crashes via POSIX synchronization primitives.
+
+---
+
+### Task 10 — File-Name Auto-Completion
+
+#### 1. Trigger & Input
+- **<kbd>Tab</kbd> Key**: Pressed while typing a command path or argument in the active terminal input line.
+- **Digit Keys (`1`..`9`)**: Pressed when candidate selection mode (`is_completion_active == 1`) is awaiting choice selection.
+
+#### 2. Step-by-Step Execution Trace
+1. **Word Boundary Extraction (`completion.c:complete_extract_word`)**:
+   - Parses the input buffer backward from cursor position `cursor_pos`.
+   - Recognizes quotes (`'` and `"`) and backslash escapes (`\ `). Unescaped spaces, tabs, pipe symbols (`|`), and redirection operators (`<`, `>`) delineate argument boundaries.
+   - Computes `word_start` and `word_len`.
+2. **Word Decomposition (`completion.c:complete_decompose_word`)**:
+   - Locates the rightmost slash `/` in the word.
+   - Separates path into `dir_prefix` (e.g., `src/`, `~/subdir/`) and `file_prefix` (e.g., `te`, `prog`).
+   - Unescapes `dir_prefix` and expands `~` to `$HOME`. If no directory prefix is present, targets the tab's isolated `cwd`.
+3. **Candidate Gathering & LCP Computation (`completion.c:complete_file_candidates`)**:
+   - Opens directory via `opendir(search_dir)`.
+   - Scans directory entries via `readdir()`. Ignores `.` and `..`. Ignores hidden files (`.*`) unless `file_prefix` explicitly begins with `.`.
+   - Matches entries prefixed with `file_prefix`.
+   - For each match, checks `stat(full_path, &st)`: if `S_ISDIR(st.st_mode)`, appends a trailing `/`; otherwise appends filename as-is.
+   - Sorts candidate array alphabetically using `qsort()`.
+   - Computes Longest Common Prefix (LCP) across all matching candidates using `complete_compute_lcp()`.
+4. **Completion Resolution (`gui.c:gui_handle_key_press`)**:
+   - **Single Match (`count == 1`)**:
+     - Escapes shell metacharacters in candidate using `complete_escape_filename()`.
+     - Appends trailing `/` if directory, or space `' '` if regular file.
+     - Calls `tab_delete_range()` to remove prefix, then `tab_insert_char()` to insert completed filename inline.
+   - **Multiple Matches (`count > 1`)**:
+     - If LCP extends beyond current word, extends text inline up to LCP.
+     - Formats candidates into a numbered list via `complete_format_numbered_list()`:
+       `1. abc.txt   2. abcd.txt`
+     - Commits active prompt line to scrollback buffer, prints numbered list, and preserves active input on the next line.
+     - Saves top candidate choices in `tab->completion_choices`, sets `tab->is_completion_active = 1`.
+   - **Numbered Selection**:
+     - User presses digit key (`'1'`..`'9'`).
+     - Terminal replaces word prefix with chosen candidate `tab->completion_choices[idx]`, appends `' '` for files, frees completion state, and resumes normal input mode.
+     - Any other key immediately dismisses candidate selection mode and processes keystroke normally.
+
+#### 3. Call Graph / Sequence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User
+    participant GUI as src/gui.c:gui_handle_key_press()
+    participant Comp as src/completion.c:complete_file_candidates()
+    participant FS as Linux VFS (opendir / readdir / stat)
+    participant Canvas as src/gui.c:gui_redraw()
+
+    User->>GUI: KeyPress (Tab)
+    GUI->>Comp: complete_file_candidates(input_buffer, cursor_pos, tab->cwd)
+    Comp->>Comp: complete_extract_word() + complete_decompose_word()
+    Comp->>FS: opendir(dir_prefix) + readdir()
+    FS-->>Comp: Directory entries
+    Comp->>Comp: Filter prefix matches + stat() for is_dir
+    Comp->>Comp: qsort() + complete_compute_lcp()
+    Comp-->>GUI: Return CompletionResult (count, items, lcp)
+    alt count == 1 (Single Match)
+        GUI->>GUI: Replace range with item + trailing '/' or ' '
+        GUI->>Canvas: Redraw updated input line
+    else count > 1 (Multiple Matches)
+        opt LCP > Current Word
+            GUI->>GUI: Extend input line inline to LCP
+        end
+        GUI->>GUI: Format & append numbered list to terminal lines
+        GUI->>GUI: Store choices in tab->completion_choices (1-9)
+        GUI->>GUI: Set tab->is_completion_active = 1
+        GUI->>Canvas: Redraw prompt with numbered candidates visible
+        User->>GUI: KeyPress ('1'..'9')
+        GUI->>GUI: Replace word with candidate[digit-1]
+        GUI->>GUI: Set tab->is_completion_active = 0
+        GUI->>Canvas: Redraw completed input line
+    else count == 0 (No Match)
+        GUI->>GUI: Silent no-op
+    end
+```
+
+#### 4. Error Handling & Edge Cases
+- **No Match**: Silent no-op without altering cursor or printing error messages.
+- **Spaces in Filenames**: Handled cleanly via `complete_escape_filename()`, prepending `\` to spaces and shell metacharacters.
+- **Mid-Line Completion**: Only replaces `[word_start, word_start + word_len]`, preserving suffix characters after the cursor.
+- **Per-Tab CWD Isolation**: Evaluates completion relative to `tab->cwd`, ensuring independent results per workspace tab.
+
+---
+
+### Task 11 — Running Bash Scripts
+
+#### 1. Trigger & Input
+- **Direct Execution**: `./script.sh [args...]` or `/path/to/script.sh [args...]`.
+- **Interpreter Invocation**: `bash script.sh [args...]`.
+- **Built-in Sourcing**: `source script.sh [args...]` or `. script.sh [args...]`.
+
+#### 2. Step-by-Step Execution Trace
+1. **Script Interception (`shell.c:shell_execute_command`)**:
+   - Before forking, inspects `cmd->argv[0]`.
+   - If command is `bash`, or matches `is_bash_script(cmd->argv[0])` (checking executable status, `.sh` extension, or `#!` shebang), execution is intercepted.
+   - Forbids delegation to `/bin/bash` or `system()`; dispatches directly to the internal interpreter `script_run()`.
+2. **Pre-Execution Syntax Validation (`script.c:validate_script_syntax`)**:
+   - Reads script file line-by-line.
+   - Tracks nesting depth of `if` statements and matching `fi` statements.
+   - If an unbalanced `if` without `fi` or stray `fi` is detected, halts before executing any lines, prints `terminator: <script>: syntax error: unexpected end of file (missing 'fi')`, and sets exit status `2`.
+3. **Execution Environment Setup (`script.c:script_run`)**:
+   - Saves existing positional parameter state (`old_argc`, `old_argv`, `old_name`).
+   - Configures script positional parameters:
+     - `ctx->script_name` = script path (`$0`).
+     - `ctx->script_argc` = argument count (`$#`).
+     - `ctx->script_argv` = argument vector (`$1`..`$9`).
+4. **Line-by-Line Execution & Control Flow**:
+   - **Comments & Blank Lines**: Lines beginning with `#` (ignoring leading whitespace) or empty lines are skipped.
+   - **Variable Assignments**: Statements matching `NAME=value` assign environment variables via `setenv(NAME, value, 1)`. In `source` mode, these persist in the parent tab context.
+   - **Condition Stack Management (`CondFrame`)**:
+     - Manages nested conditionals up to depth 32.
+     - `if [ ... ]; then`: Evaluates test condition using `script_eval_test()`. If true, branches into `COND_THEN` (executes body); if false, skips body until matching `elif`, `else`, or `fi`.
+     - `elif [ ... ]; then`: Evaluated only if preceding `if`/`elif` branches were false.
+     - `else`: Executed only if no previous branch in the current `if` frame evaluated to true.
+     - `fi`: Pops the active `CondFrame` from the condition stack.
+   - **Test Operator Evaluation (`script.c:script_eval_test`)**:
+     - Unary file tests: `-f` (regular file), `-d` (directory), `-e` (exists), `-s` (size > 0), `-r` (readable), `-w` (writable), `-x` (executable).
+     - String tests: `=` / `==` (equality), `!=` (inequality), `-z` (empty string), `-n` (non-empty string).
+     - Numeric tests: `-eq`, `-ne`, `-lt`, `-le`, `-gt`, `-ge`.
+     - Logical negation: `!` prefix inverts condition truth value.
+   - **Pipelines & Redirections**:
+     - When condition frame permits execution, lines are expanded via `parse_line()` (resolving `$VAR`, `${VAR}`, `$0`..`$9`, `$#`, `$?`) and executed via `shell_execute_pipeline()`.
+   - **Exit Termination**:
+     - `exit [n]` immediately terminates script execution, returning status code `n` (defaulting to current `$?`).
+5. **Teardown & Parameter Restoration**:
+   - Restores parent positional parameters: `ctx->script_argc = old_argc`, `ctx->script_argv = old_argv`, `ctx->script_name = old_name`.
+   - Closes open file handles and frees allocated line buffers.
+
+#### 3. Call Graph / Sequence Diagram
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Shell as src/shell.c:shell_execute_command()
+    participant Engine as src/script.c:script_run()
+    participant Val as src/script.c:validate_script_syntax()
+    participant Eval as src/script.c:script_eval_test()
+    participant Pipe as src/shell.c:shell_execute_pipeline()
+
+    Shell->>Engine: script_run(ctx, script_path, argc, argv)
+    Engine->>Val: validate_script_syntax(file)
+    alt Syntax Error (Unbalanced if...fi)
+        Val-->>Engine: Syntax Error (missing 'fi')
+        Engine-->>Shell: Return 2 (Syntax Error)
+    else Syntax Valid
+        Val-->>Engine: Validation Passed
+    end
+    Engine->>Engine: Configure $0, $#, $1..$9
+    loop For Each Line in Script
+        alt Comment (#) or Blank
+            Engine->>Engine: Skip line
+        else if / elif / else / fi
+            Engine->>Eval: script_eval_test(test_expression)
+            Eval-->>Engine: 0 (True) or 1 (False)
+            Engine->>Engine: Push/Update CondFrame state
+        else Variable Assignment (VAR=val)
+            Engine->>Engine: setenv("VAR", "val", 1)
+        else Command / Pipeline (Active Block)
+            Engine->>Pipe: shell_execute_pipeline(ctx, &pipeline)
+            Pipe-->>Engine: Return exit status ($?)
+        else exit [n]
+            Engine->>Engine: Break loop with status n
+        end
+    end
+    Engine->>Engine: Restore previous $0, $#, $1..$9
+    Engine-->>Shell: Return final exit status
+```
+
+#### 4. Error Handling & Edge Cases
+- **Forbidden Subshell Delegation**: Never delegates execution to `/bin/bash` or `system()`; pure in-house interpretation guarantees assignment compliance.
+- **Unbalanced Conditional Blocks**: Caught before executing statement 1, preventing partial side effects.
+- **Positional Parameter Scope**: When a script is sourced (`source script.sh`), environment variables persist, but positional parameters (`$1`..`$9`) revert cleanly to prior values.
+- **Recursion & Nesting**: Supports arbitrary conditional nesting up to depth 32 with bound checks preventing stack overflows.
 
 ---
 
@@ -611,5 +827,8 @@ sequenceDiagram
 | **Signal Delivery** | `src/gui.c:gui_handle_key_press` | `kill(-pgid, SIGINT)`, `kill(-pgid, SIGTSTP)` | `tab->running_pid`, `tab->is_running_cmd` | `gui.c`, `signal.h` |
 | **Background Job** | `src/shell.c:shell_execute_pipeline` | `fork`, `setpgid`, `jobs_add` | `ctx->job_table.jobs[]`, `Job` | `shell.c`, `jobs.c` |
 | **Job Resumption** | `src/jobs.c:jobs_builtin_bg` | `jobs_find_by_id`, `kill(SIGCONT)` | `Job.state`, `job_table.current_job_id` | `jobs.c`, `builtins.c` |
-| **Shared History** | `src/history.c:history_add`| `sem_wait`, `sem_post` | `SharedHistory.commands[][]`, `head`, `count` | `history.c`, `semaphore.h` |
+| **Shared History & Persistence** | `src/history.c:history_add`| `sem_wait`, `sem_post`, `history_encode_line`, `fopen` | `SharedHistory.commands[][]`, `head`, `count`, `~/.terminator_history` | `history.c`, `semaphore.h` |
+| **History Reverse Search (`Ctrl+R`)** | `src/gui.c:gui_handle_key_press` | `history_search`, `compute_lcs_len`, `hist_search_result_free` | `tab->is_searching_history`, `tab->search_query`, `HistSearchResult` | `history.c`, `gui.c` |
+| **File-Name Auto-Completion (`Tab`)** | `src/gui.c:gui_handle_key_press` | `complete_file_candidates`, `complete_compute_lcp`, `complete_format_numbered_list` | `tab->is_completion_active`, `tab->completion_choices[]`, `CompletionResult` | `completion.c`, `gui.c`, `<dirent.h>` |
+| **Bash Script Interpretation** | `src/shell.c:shell_execute_command` | `script_run`, `validate_script_syntax`, `script_eval_test`, `shell_execute_pipeline` | `ctx->script_argc`, `ctx->script_argv`, `ctx->script_name`, `CondFrame` | `script.c`, `shell.c`, `parser.c` |
 | **System Teardown** | `src/gui.c:gui_cleanup` | `XFreeGC`, `XFreePixmap`, `XCloseDisplay`, `history_cleanup` | `GuiApp`, `SharedHistory` | `gui.c`, `history.c` |

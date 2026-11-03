@@ -3,9 +3,29 @@
 
 #include <stddef.h>
 #include <semaphore.h>
+#include <stdint.h>
 
 #define MAX_HISTORY_COMMANDS 10000
 #define MAX_HISTORY_CMD_LEN 1024
+
+/**
+ * @brief Match classification for Task 9 reverse history search.
+ */
+typedef enum {
+    HIST_MATCH_NONE = 0,
+    HIST_MATCH_EXACT = 1,
+    HIST_MATCH_SUBSTRING = 2
+} HistMatchType;
+
+/**
+ * @brief Result set returned by history_search().
+ */
+typedef struct {
+    HistMatchType match_type;   /**< Exact match, substring match, or none */
+    int match_len;              /**< Length of matching substring / string */
+    size_t count;               /**< Number of matched command entries */
+    char **entries;             /**< Array of matched command strings */
+} HistSearchResult;
 
 /**
  * @brief Layout of the shared history structure.
@@ -35,7 +55,7 @@ int history_init(int use_process_mode);
 void history_cleanup(void);
 
 /**
- * @brief Adds a command to the shared history ring buffer.
+ * @brief Adds a command to the shared history ring buffer and appends to persistent file.
  *
  * Automatically skips consecutive identical commands.
  *
@@ -67,5 +87,35 @@ int history_count(void);
  * @return Number of bytes written.
  */
 int history_format_recent(char *out_buf, size_t max_len, int max_cmds);
+
+/**
+ * @brief Performs Task 9 3-tier reverse history search.
+ *
+ * 1. Exact match (most recent).
+ * 2. Longest Common Substring (LCS) match if length > 2 characters.
+ * 3. No match otherwise.
+ *
+ * @param[in] term Search term.
+ * @param[out] res Result structure populated with matches.
+ * @return 0 on success.
+ */
+int history_search(const char *term, HistSearchResult *res);
+
+/**
+ * @brief Frees dynamically allocated results from history_search().
+ *
+ * @param[in,out] res Pointer to HistSearchResult to free.
+ */
+void hist_search_result_free(HistSearchResult *res);
+
+/**
+ * @brief Encodes raw command with newlines into a single-line representation.
+ */
+size_t history_encode_line(const char *raw, char *enc, size_t max);
+
+/**
+ * @brief Decodes single-line representation back into raw command.
+ */
+size_t history_decode_line(const char *enc, size_t len, char *dec, size_t max);
 
 #endif /* HISTORY_H */

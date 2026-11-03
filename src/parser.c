@@ -195,12 +195,24 @@ static int expand_variable(const char *str, char *out_buf, size_t max_len,
 
     if (str[1] == '#') {
         *chars_consumed = 2;
-        return snprintf(out_buf, max_len, "0");
+        int count = ctx ? ctx->script_argc : 0;
+        return snprintf(out_buf, max_len, "%d", count);
     }
 
     if (str[1] == '0') {
         *chars_consumed = 2;
-        return snprintf(out_buf, max_len, "terminator");
+        const char *s0 = (ctx && ctx->script_name[0] != '\0') ? ctx->script_name : "terminator";
+        return snprintf(out_buf, max_len, "%s", s0);
+    }
+
+    if (isdigit((unsigned char)str[1])) {
+        *chars_consumed = 2;
+        int idx = str[1] - '1';
+        if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc && ctx->script_argv[idx]) {
+            return snprintf(out_buf, max_len, "%s", ctx->script_argv[idx]);
+        }
+        out_buf[0] = '\0';
+        return 0;
     }
 
     if (str[1] == '{') {
@@ -213,6 +225,22 @@ static int expand_variable(const char *str, char *out_buf, size_t max_len,
             memcpy(var_name, str + 2, vlen);
             var_name[vlen] = '\0';
             *chars_consumed = i + 1;
+            if (var_name[0] == '#' && var_name[1] == '\0') {
+                int count = ctx ? ctx->script_argc : 0;
+                return snprintf(out_buf, max_len, "%d", count);
+            }
+            if (var_name[0] == '0' && var_name[1] == '\0') {
+                const char *s0 = (ctx && ctx->script_name[0] != '\0') ? ctx->script_name : "terminator";
+                return snprintf(out_buf, max_len, "%s", s0);
+            }
+            if (isdigit((unsigned char)var_name[0]) && var_name[1] == '\0') {
+                int idx = var_name[0] - '1';
+                if (ctx && ctx->script_argv && idx >= 0 && idx < ctx->script_argc && ctx->script_argv[idx]) {
+                    return snprintf(out_buf, max_len, "%s", ctx->script_argv[idx]);
+                }
+                out_buf[0] = '\0';
+                return 0;
+            }
             const char *val = getenv(var_name);
             if (val) {
                 return snprintf(out_buf, max_len, "%s", val);
