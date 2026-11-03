@@ -69,7 +69,7 @@ flowchart TD
 | `src/history.c` | `include/history.h` | Persistent 10,000-command history ring buffer; disk persistence (`~/.terminator_history`); compaction (>20,000); 3-tier LCS search engine. | `history_init()`, `history_cleanup()`, `history_add()`, `history_get_relative()`, `history_count()`, `history_format_recent()`, `history_search()`, `hist_search_result_free()`, `history_encode_line()`, `history_decode_line()`<br>Structs: `SharedHistory`, `HistSearchResult`, `HistMatchType` |
 | `src/completion.c` | `include/completion.h` | Context-aware Tab file-name auto-completion engine; word extraction with quote/escape handling; LCP computation; candidate formatter. | `complete_extract_word()`, `complete_unescape_word()`, `complete_escape_filename()`, `complete_decompose_word()`, `complete_compute_lcp()`, `complete_file_candidates()`, `complete_format_numbered_list()`, `completion_result_free()`<br>Structs: `CompletionResult` |
 | `src/script.c` | `include/script.h` | In-house bash script runner; control flow evaluator; conditional evaluator `[ ... ]`; positional parameter manager; recursion guard. | `script_run()`, `is_bash_script()`, `script_eval_test()`<br>Structs: `CondFrame` |
-| `src/multiwatch.c`| `include/multiwatch.h`| Concurrent parallel command execution; 2.0s refresh timer; formatted banner rendering. | `builtin_multiwatch()`, `parse_multiwatch_commands()`, `spawn_watched_cmd()`, `print_formatted_output()`<br>Structs: `WatchedCmd` |
+| `src/multiwatch.c`| `include/multiwatch.h`| Concurrent parallel command execution; 2.0s refresh timer; formatted banner rendering to GUI pipe/stdout. | `builtin_multiwatch()`, `builtin_multiwatch_fd()`, `parse_multiwatch_commands()`, `spawn_watched_cmd()`, `print_formatted_output()`<br>Structs: `WatchedCmd` |
 | `src/hotkeys.c` | `include/hotkeys.h` | Keybinding configuration reader (`~/.terminatorrc`); conflict detector; X11 KeySym mapper. | `hotkeys_init()`, `hotkeys_match()`, `check_and_resolve_conflicts()`, `parse_combo_string()`<br>Structs: `HotkeyConfig`, `HotkeyBinding`, `HotkeyAction` |
 
 ---
@@ -214,17 +214,18 @@ flowchart TD
    - Splits tokens on whitespace, recognizing single quotes `'`, double quotes `"`, and redirections `<`, `>`.
    - Populates `Pipeline` containing an array of `Command` structs.
 3. **Built-in Execution Path**:
+   - Evaluates early terminal controls (`exit`, `clear`) in `tab_submit_command` before execution mode dispatch:
+     - `exit`: calls `gui_close_tab(app, cur_idx)` and immediate `gui_redraw(app)`. In Process Mode, EOF on tab pipe also closes the tab container.
+     - `clear`: wipes `tab->num_lines = 0; tab->scroll_offset = 0;` and triggers immediate `gui_redraw(app)`.
    - Checks `builtins.c:is_builtin_command(cmd->argv[0])`.
-   - If true: calls `builtins.c:execute_builtin_captured(&tab->shell_ctx, cmd, out_buf, sizeof(out_buf))`.
+   - For instantaneous shell built-ins: calls `builtins.c:execute_builtin_captured(&tab->shell_ctx, cmd, out_buf, sizeof(out_buf))`.
      - `cd`: calls `builtin_cd()` $\rightarrow$ expands `~` to `$HOME` $\rightarrow$ calls `chdir()` $\rightarrow$ calls `getcwd()` updating `ctx->cwd`.
-     - `exit`: calls `gui_close_tab(app, app->active_tab_idx)`.
-     - `clear`: wipes `tab->num_lines = 0; tab->scroll_offset = 0;`.
      - `jobs`: calls `jobs_print()` formatting background table into `out_buf`.
      - `bg`: calls `jobs_builtin_bg()` $\rightarrow$ sends `kill(-pgid, SIGCONT)` $\rightarrow$ sets state `Running`.
      - `fg`: calls `jobs_builtin_fg()` $\rightarrow$ sends `kill(-pgid, SIGCONT)` $\rightarrow$ connects pipe to foreground view in GUI.
      - `history`: calls `history.c:history_format_recent()` $\rightarrow$ dumps recent 1,000 commands.
      - `source`: calls `builtin_source()` $\rightarrow$ opens file via `fopen()` $\rightarrow$ executes each line in shell context.
-     - `multiWatch`: dispatches parallel execution engine (`builtin_multiwatch`).
+   - For `multiWatch`: Bypasses synchronous `execute_builtin_captured()` to prevent blocking the GUI thread. Instead, dispatches via a dedicated child pipeline wired to the tab's non-blocking read pipe, streaming live output into the X11 canvas every 2 seconds.
    - Appends `out_buf` to tab scrollback via `tab_append_output()`.
 4. **External Command Execution Path (`gui.c:tab_submit_command` / `shell.c:shell_execute_command`)**:
    - Creates communication pipe `pipe(pipefds)`.
@@ -403,16 +404,18 @@ flowchart LR
      - When child finishes (`waitpid(cmd->pid, &status, WNOHANG) > 0`):
        - Drains remaining bytes from pipe, closes pipe descriptor.
        - Records finish timestamp `cmd->last_finish_time = time(NULL)`.
-       - Calls `print_formatted_output()`:
+       - Calls `print_formatted_output(&cmds[i], out_fd)` using `dprintf(out_fd, ...)` directly to the GUI tab pipe descriptor (`out_fd` / `STDOUT_FILENO`):
          ```text
          "cmd", <timestamp>:
          ----------------------------------------------------
          <output>
          ----------------------------------------------------
          ```
+       - The central `gui_run_loop()` polls the pipe, dynamically appending text to the active tab scrollback and redrawing the X11 canvas without UI lockup.
        - Resets `output_buf` for subsequent execution cycles.
 4. **Interruption & Teardown**:
-   - When user presses `Ctrl+C`: `g_mw_interrupted` flag becomes 1.
+   - When user presses `Ctrl+C` in the X11 window: `gui_handle_key_press()` forwards `SIGINT` to the running command process group.
+   - `g_mw_interrupted` flag becomes 1 via `mw_sigint_handler()`.
    - Iterates through active commands, sending `kill(-cmd->pid, SIGTERM)` and `kill(cmd->pid, SIGTERM)`.
    - Closes open pipes and reaps processes via `waitpid(cmd->pid, NULL, WNOHANG)`.
    - Restores original `sigaction(SIGINT)` handler and returns to prompt.
@@ -816,13 +819,13 @@ sequenceDiagram
 | **X11 Event Loop** | `src/gui.c:gui_run_loop` | `poll`, `gui_redraw`, `gui_handle_key_press`, `tab_append_output` | `GuiApp`, `struct pollfd[]` | `gui.c`, `Xlib` |
 | **Double-Buffered Draw**| `src/gui.c:gui_redraw` | `XFillRectangle`, `XDrawString`, `XCopyArea` | `app->back_buffer`, `tab->lines` | `gui.c`, `Xlib` |
 | **Tab Creation** | `src/gui.c:gui_create_tab` | `pthread_create` (Thread) / `pipe` + `fork` (Process) | `app->tabs[]`, `app->num_tabs`, `Tab` | `gui.c`, `pthread`, `unistd` |
-| **Tab Destruction** | `src/gui.c:gui_close_tab` | `pthread_cancel` / `kill(SIGTERM)`, `close`, `free` | `app->tabs[]`, `app->num_tabs` | `gui.c`, `jobs.c` |
+| **Tab Destruction** | `src/gui.c:gui_close_tab` | `pthread_cancel` / `kill(SIGTERM+SIGKILL)`, `close`, `free` | `app->tabs[]`, `app->num_tabs`, `app->active_tab_idx` | `gui.c`, `jobs.c` |
 | **Built-in Dispatch**| `src/builtins.c:execute_builtin_captured` | `builtin_cd`, `builtin_exit`, `builtin_jobs`, `builtin_source` | `ctx->cwd`, `ctx->should_exit`, `ctx->last_exit_status` | `builtins.c`, `jobs.c` |
 | **External Command** | `src/shell.c:shell_execute_command` | `fork`, `setpgid`, `dup2`, `setup_redirections`, `execvp` | `ctx->foreground_pid`, `tab->running_pid` | `shell.c`, `unistd` |
 | **Pipeline ($N$ Pipes)**| `src/shell.c:shell_execute_pipeline` | `pipe`, `fork`, `dup2`, `close`, `setpgid`, `waitpid` | `Pipeline`, `Command`, `ctx->last_exit_status` | `shell.c`, `parser.c` |
 | **Multiline & Quote**| `src/parser.c:parse_line`| `is_command_incomplete`, `expand_variable`, `execute_substitution`| `tab->multiline_accum`, `tab->is_multiline` | `parser.c` |
 | **Globbing Expansion**| `src/parser.c:flush_token`| `glob`, `globfree` | `cmd->argv[]`, `cmd->argc` | `parser.c`, `<glob.h>` |
-| **`multiWatch`** | `src/multiwatch.c:builtin_multiwatch` | `parse_multiwatch_commands`, `spawn_watched_cmd`, `poll` | `WatchedCmd[]`, `g_mw_interrupted` | `multiwatch.c`, `time.h` |
+| **`multiWatch`** | `src/multiwatch.c:builtin_multiwatch` | `parse_multiwatch_commands`, `spawn_watched_cmd`, `poll`, `dprintf` | `WatchedCmd[]`, `g_mw_interrupted` | `multiwatch.c`, `time.h` |
 | **Hotkey Handling** | `src/gui.c:gui_handle_key_press` | `hotkeys_match`, `tab_delete_range`, `tab_insert_char` | `tab->input_buffer`, `tab->cursor_pos` | `gui.c`, `hotkeys.c` |
 | **Signal Delivery** | `src/gui.c:gui_handle_key_press` | `kill(-pgid, SIGINT)`, `kill(-pgid, SIGTSTP)` | `tab->running_pid`, `tab->is_running_cmd` | `gui.c`, `signal.h` |
 | **Background Job** | `src/shell.c:shell_execute_pipeline` | `fork`, `setpgid`, `jobs_add` | `ctx->job_table.jobs[]`, `Job` | `shell.c`, `jobs.c` |
