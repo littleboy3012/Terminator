@@ -141,11 +141,42 @@ static void *tab_worker_thread(void *arg) {
 static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
     signal(SIGINT, SIG_IGN);
     signal(SIGTSTP, SIG_IGN);
+
+    /* Redirect STDOUT and STDERR to out_fd so that all output goes to GUI */
+    dup2(out_fd, STDOUT_FILENO);
+    dup2(out_fd, STDERR_FILENO);
+    if (out_fd != STDOUT_FILENO && out_fd != STDERR_FILENO) {
+        close(out_fd);
+    }
+
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
+
+    /* Close in_fd on exec so child processes do not inherit the command pipe */
+    fcntl(in_fd, F_SETFD, FD_CLOEXEC);
+
     char cmd_line[MAX_LINE_CHARS * 4];
     FILE *in_fp = fdopen(in_fd, "r");
     if (!in_fp) _exit(1);
 
-    while (fgets(cmd_line, sizeof(cmd_line), in_fp) != NULL) {
+    while (1) {
+        /* Check status of any background jobs before next command */
+        char notif[1024];
+        notif[0] = '\0';
+        jobs_check_status(&tab->shell_ctx.job_table, notif, sizeof(notif));
+        if (notif[0] != '\0') {
+            printf("%s", notif);
+            fflush(stdout);
+        }
+
+        if (fgets(cmd_line, sizeof(cmd_line), in_fp) == NULL) {
+            if (errno == EINTR) {
+                clearerr(in_fp);
+                continue;
+            }
+            break;
+        }
+
         size_t len = strlen(cmd_line);
         while (len > 0 && (cmd_line[len - 1] == '\n' || cmd_line[len - 1] == '\r')) {
             cmd_line[--len] = '\0';
@@ -156,71 +187,40 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
             break;
         }
 
-        history_add(cmd_line);
-
         Pipeline pipeline;
         if (parse_line(cmd_line, &tab->shell_ctx, &pipeline) != 0) {
             const char *syn_err = "terminator: syntax error\n";
-            if (write(out_fd, syn_err, strlen(syn_err)) < 0) {}
+            if (write(STDOUT_FILENO, syn_err, strlen(syn_err)) < 0) {}
             continue;
         }
 
-        if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
-            Command *cmd = &pipeline.commands[0];
-            if (strcmp(cmd->argv[0], "exit") == 0) {
-                free_pipeline(&pipeline);
-                break;
-            }
-            if (strcasecmp(cmd->argv[0], "multiWatch") != 0) {
-                char out[8192];
-                out[0] = '\0';
-                int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
-                tab->shell_ctx.last_exit_status = ret;
-                if (tab->shell_ctx.should_exit) {
-                    free_pipeline(&pipeline);
-                    break;
-                }
-                if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
-                    if (getcwd(tab->cwd, sizeof(tab->cwd))) {
-                        char cwd_msg[PATH_MAX + 16];
-                        snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
-                        if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
-                    }
-                }
-                if (out[0] != '\0') {
-                    if (write(out_fd, out, strlen(out)) < 0) {}
-                }
-                free_pipeline(&pipeline);
-                continue;
-            }
+        if (pipeline.num_commands == 1 && strcmp(pipeline.commands[0].argv[0], "exit") == 0) {
+            free_pipeline(&pipeline);
+            break;
         }
 
-        /* External pipeline execution */
-        pid_t pid = fork();
-        if (pid == 0) {
-            signal(SIGINT, SIG_DFL);
-            signal(SIGTSTP, SIG_DFL);
-            dup2(out_fd, STDOUT_FILENO);
-            dup2(out_fd, STDERR_FILENO);
-            close(in_fd);
-            close(out_fd);
+        /* Execute pipeline directly in this tab process */
+        shell_execute_pipeline(&tab->shell_ctx, &pipeline);
 
-            Pipeline exec_pl = pipeline;
-            exec_pl.is_background = 0;
-            int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
-            _exit(ret);
+        /* If directory changed, notify GUI parent of new CWD */
+        if (getcwd(tab->cwd, sizeof(tab->cwd))) {
+            printf("[CWD]%s\n", tab->cwd);
+            fflush(stdout);
         }
 
-        if (pipeline.is_background) {
-            char launch_msg[128];
-            snprintf(launch_msg, sizeof(launch_msg), "[bg] %d\n", (int)pid);
-            if (write(out_fd, launch_msg, strlen(launch_msg)) < 0) {}
-        } else {
-            int status = 0;
-            waitpid(pid, &status, 0);
-            tab->shell_ctx.last_exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+        /* Check background job notifications after command execution */
+        notif[0] = '\0';
+        jobs_check_status(&tab->shell_ctx.job_table, notif, sizeof(notif));
+        if (notif[0] != '\0') {
+            printf("%s", notif);
+            fflush(stdout);
         }
+
         free_pipeline(&pipeline);
+
+        if (tab->shell_ctx.should_exit) {
+            break;
+        }
     }
     _exit(0);
 }
@@ -918,7 +918,7 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     /* Signals: Ctrl+C and Ctrl+Z */
     if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
         if (tab->use_process_mode && tab->tab_pid > 0) {
-            kill(-tab->tab_pid, SIGINT);
+            kill(tab->tab_pid, SIGINT);
         } else if (tab->is_running_cmd && tab->running_pid > 0) {
             pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
             kill(-target, SIGINT);
@@ -936,7 +936,7 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
 
     if (is_ctrl && !is_shift && (keysym == XK_Z || keysym == XK_z)) {
         if (tab->use_process_mode && tab->tab_pid > 0) {
-            kill(-tab->tab_pid, SIGTSTP);
+            kill(tab->tab_pid, SIGTSTP);
             tab_append_output(tab, "^Z\n", 3);
             gui_redraw(app);
             return;
@@ -1542,6 +1542,7 @@ void gui_run_loop(GuiApp *app) {
         for (int i = 0; i < app->num_tabs; i++) {
             Tab *t = app->tabs[i];
             if (!t) continue;
+            if (t->use_process_mode) continue;
             char notif[1024];
             notif[0] = '\0';
             jobs_check_status(&t->shell_ctx.job_table, notif, sizeof(notif));

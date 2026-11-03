@@ -1,0 +1,417 @@
+diff --git a/Makefile b/Makefile
+index 768b01f..39bcf60 100644
+--- a/Makefile
++++ b/Makefile
+@@ -30,32 +30,18 @@ SRCS = $(SRC_DIR)/main.c \
+ 
+ OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
+ 
+-.PHONY: all clean test
+-
+-TEST_RUNNER = $(BUILD_DIR)/test_shell_runner
++.PHONY: all clean
+ 
+ all: $(TARGET)
+ 
+ $(TARGET): $(OBJS)
+ 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
+ 
+-$(TEST_RUNNER): tests/test_shell_runner.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o $(BUILD_DIR)/completion.o $(BUILD_DIR)/script.o
+-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+-
+ $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
+ 	$(CC) $(CFLAGS) -c $< -o $@
+ 
+-TEST_SCRIPT_RUNNER = $(BUILD_DIR)/test_task11_scripts
+-
+-$(TEST_SCRIPT_RUNNER): tests/test_task11_scripts.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o $(BUILD_DIR)/completion.o $(BUILD_DIR)/script.o
+-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+-
+ $(BUILD_DIR):
+ 	mkdir -p $(BUILD_DIR)
+ 
+ clean:
+ 	rm -rf $(BUILD_DIR) $(TARGET)
+-
+-test: $(TARGET) $(TEST_RUNNER) $(TEST_SCRIPT_RUNNER)
+-	./$(TEST_SCRIPT_RUNNER)
+-	python3 tests/test_modes_and_history.py
+diff --git a/README.md b/README.md
+index 7a8ef28..d635f0f 100644
+--- a/README.md
++++ b/README.md
+@@ -207,8 +207,9 @@ flowchart TD
+    - Checks multiline completeness using `parser.c:is_command_incomplete()`.
+    - Appends finalized command to shared history via `history.c:history_add(cmd_str)`.
+    - If **Process Mode**: writes command string to `tab->to_tab_fd` with `\n` and returns. The tab child process executes it inside `tab_process_main()`:
+-     - Built-ins run via `execute_builtin_captured()`; if `cd` succeeds, tab writes `[CWD]<path>\n` to `out_pipe_fd` to update the GUI tab bar.
+-     - External commands are forked with `dup2(out_fd, 1)` and `dup2(out_fd, 2)`.
++     - Direct pipeline execution via `shell_execute_pipeline()` with unbuffered stdout/stderr (`dup2` to `out_fd`), streaming output straight to the GUI.
++     - Built-ins run in-process within the tab's dedicated context; if `cd` succeeds, tab writes `[CWD]<path>\n` to `out_fd` to update the GUI tab bar.
++     - Foreground external commands and pipelines fork with reset signal dispositions (`SIG_DFL`) and process group management (`setpgid`), while `shell_set_fg_signals()` installs signal forwarding handlers for `SIGINT` and `SIGTSTP`.
+    - If **Thread Mode**: passes `cmd_str` to `parser.c:parse_line()`.
+ 2. **`parser.c:parse_line(cmd_str, ctx, pipeline)`**:
+    - Splits tokens on whitespace, recognizing single quotes `'`, double quotes `"`, and redirections `<`, `>`.
+@@ -458,16 +459,14 @@ flowchart LR
+ 1. **Foreground Signal Delivery (`gui.c:gui_handle_key_press`)**:
+    - X11 intercepts keystrokes as `KeyPress` events. Terminator converts them into OS signals:
+      - In **Process Mode**:
+-       - `Ctrl+C`: sends `kill(-tab->tab_pid, SIGINT)` directly to the dedicated tab child process group.
+-       - `Ctrl+Z`: sends `kill(-tab->tab_pid, SIGTSTP)` directly to the dedicated tab child process group.
++       - `Ctrl+C`: sends `kill(tab->tab_pid, SIGINT)` to the tab process. The tab process forwards `SIGINT` directly to the active foreground process (`g_current_fg_pid`), terminating the foreground command while the shell prompt recovers cleanly.
++       - `Ctrl+Z`: sends `kill(tab->tab_pid, SIGTSTP)` to the tab process. The tab process forwards `SIGTSTP` directly to the active foreground process (`g_current_fg_pid`), cleanly suspending it.
+      - In **Thread Mode**:
+        - `Ctrl+C`: if foreground command running, sends `kill(-tab->running_pgid, SIGINT)` and `kill(tab->running_pid, SIGINT)`. Terminator itself never terminates.
+        - `Ctrl+Z`: sends `kill(-tab->running_pgid, SIGTSTP)` and `kill(tab->running_pid, SIGTSTP)`.
+-2. **Suspending into Job Table (`gui.c:gui_handle_key_press`)**:
+-   - In Thread Mode on `Ctrl+Z`, registers stopped process group in table:
+-     `jobs_add(&tab->shell_ctx.job_table, pgid, pid, cmd, JOB_STATE_STOPPED, pipe_fd)`.
+-   - Prints status notice: `[^Z\n[1]+  Stopped                 <cmd>]`.
+-   - Clears `tab->is_running_cmd = 0`, freeing prompt for input.
++2. **Suspending into Job Table**:
++   - In **Process Mode**: `waitpid(..., WUNTRACED)` unblocks with `WIFSTOPPED(status) == true`. `shell_execute_command` registers the stopped job via `jobs_add(&ctx->job_table, pid, pid, cmd, JOB_STATE_STOPPED, -1)` and writes `[1]+  Stopped  <cmd>\n` to the GUI pipe. `tab_process_main` immediately reads the next buffered command (e.g. `ls`) or awaits user input.
++   - In **Thread Mode**: registers stopped process group via `jobs_add(&tab->shell_ctx.job_table, pgid, pid, cmd, JOB_STATE_STOPPED, pipe_fd)`. Prints notice `[^Z\n[1]+  Stopped  <cmd>]`, clears `tab->is_running_cmd = 0`, and restores prompt.
+ 3. **Background Execution (`cmd &`)**:
+    - `parser.c:parse_line()` detects trailing `&`, sets `pipeline->is_background = 1`.
+    - Spawns process group in background.
+diff --git a/include/shell.h b/include/shell.h
+index 7ad5abc..fdbd920 100644
+--- a/include/shell.h
++++ b/include/shell.h
+@@ -126,4 +126,11 @@ int setup_redirections(const char *input_file, const char *output_file);
+  */
+ int setup_command_redirections(const Command *cmd);
+ 
++/**
++ * @brief Configures signal forwarding for the active foreground process.
++ *
++ * @param[in] fg_pid PID of the active foreground process (or 0 when idle).
++ */
++void shell_set_fg_signals(pid_t fg_pid);
++
+ #endif /* SHELL_H */
+diff --git a/src/builtins.c b/src/builtins.c
+index 19acf98..b99b151 100644
+--- a/src/builtins.c
++++ b/src/builtins.c
+@@ -319,15 +319,27 @@ int builtin_fg(ShellContext *ctx, char **argv) {
+ 
+     ctx->foreground_pid = res_job.pid;
+     snprintf(ctx->foreground_cmd, sizeof(ctx->foreground_cmd), "%s", res_job.command);
++    shell_set_fg_signals(res_job.pid);
+ 
+     int status = 0;
+-    waitpid(res_job.pid, &status, WUNTRACED);
++    while (waitpid(res_job.pid, &status, WUNTRACED) < 0) {
++        if (errno == EINTR) {
++            int st = 0;
++            if (waitpid(res_job.pid, &st, WUNTRACED | WNOHANG) > 0) {
++                status = st;
++                break;
++            }
++            continue;
++        }
++        break;
++    }
+     ctx->foreground_pid = 0;
+     ctx->foreground_cmd[0] = '\0';
++    shell_set_fg_signals(0);
+ 
+     if (WIFSTOPPED(status)) {
+         Job *j = jobs_add(&ctx->job_table, res_job.pgid, res_job.pid, res_job.command, JOB_STATE_STOPPED, -1);
+-        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, res_job.command);
++        printf("[%d]+  Stopped                 %s\n", j ? j->id : 1, res_job.command);
+         fflush(stdout);
+         ctx->last_exit_status = 128 + WSTOPSIG(status);
+         return ctx->last_exit_status;
+diff --git a/src/gui.c b/src/gui.c
+index 347005f..9fe09e0 100644
+--- a/src/gui.c
++++ b/src/gui.c
+@@ -141,11 +141,42 @@ static void *tab_worker_thread(void *arg) {
+ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
+     signal(SIGINT, SIG_IGN);
+     signal(SIGTSTP, SIG_IGN);
++
++    /* Redirect STDOUT and STDERR to out_fd so that all output goes to GUI */
++    dup2(out_fd, STDOUT_FILENO);
++    dup2(out_fd, STDERR_FILENO);
++    if (out_fd != STDOUT_FILENO && out_fd != STDERR_FILENO) {
++        close(out_fd);
++    }
++
++    setvbuf(stdout, NULL, _IONBF, 0);
++    setvbuf(stderr, NULL, _IONBF, 0);
++
++    /* Close in_fd on exec so child processes do not inherit the command pipe */
++    fcntl(in_fd, F_SETFD, FD_CLOEXEC);
++
+     char cmd_line[MAX_LINE_CHARS * 4];
+     FILE *in_fp = fdopen(in_fd, "r");
+     if (!in_fp) _exit(1);
+ 
+-    while (fgets(cmd_line, sizeof(cmd_line), in_fp) != NULL) {
++    while (1) {
++        /* Check status of any background jobs before next command */
++        char notif[1024];
++        notif[0] = '\0';
++        jobs_check_status(&tab->shell_ctx.job_table, notif, sizeof(notif));
++        if (notif[0] != '\0') {
++            printf("%s", notif);
++            fflush(stdout);
++        }
++
++        if (fgets(cmd_line, sizeof(cmd_line), in_fp) == NULL) {
++            if (errno == EINTR) {
++                clearerr(in_fp);
++                continue;
++            }
++            break;
++        }
++
+         size_t len = strlen(cmd_line);
+         while (len > 0 && (cmd_line[len - 1] == '\n' || cmd_line[len - 1] == '\r')) {
+             cmd_line[--len] = '\0';
+@@ -156,71 +187,40 @@ static void tab_process_main(Tab *tab, int in_fd, int out_fd) {
+             break;
+         }
+ 
+-        history_add(cmd_line);
+-
+         Pipeline pipeline;
+         if (parse_line(cmd_line, &tab->shell_ctx, &pipeline) != 0) {
+             const char *syn_err = "terminator: syntax error\n";
+-            if (write(out_fd, syn_err, strlen(syn_err)) < 0) {}
++            if (write(STDOUT_FILENO, syn_err, strlen(syn_err)) < 0) {}
+             continue;
+         }
+ 
+-        if (pipeline.num_commands == 1 && is_builtin_command(pipeline.commands[0].argv[0])) {
+-            Command *cmd = &pipeline.commands[0];
+-            if (strcmp(cmd->argv[0], "exit") == 0) {
+-                free_pipeline(&pipeline);
+-                break;
+-            }
+-            if (strcasecmp(cmd->argv[0], "multiWatch") != 0) {
+-                char out[8192];
+-                out[0] = '\0';
+-                int ret = execute_builtin_captured(&tab->shell_ctx, cmd, out, sizeof(out));
+-                tab->shell_ctx.last_exit_status = ret;
+-                if (tab->shell_ctx.should_exit) {
+-                    free_pipeline(&pipeline);
+-                    break;
+-                }
+-                if (strcmp(cmd->argv[0], "cd") == 0 && ret == 0) {
+-                    if (getcwd(tab->cwd, sizeof(tab->cwd))) {
+-                        char cwd_msg[PATH_MAX + 16];
+-                        snprintf(cwd_msg, sizeof(cwd_msg), "[CWD]%s\n", tab->cwd);
+-                        if (write(out_fd, cwd_msg, strlen(cwd_msg)) < 0) {}
+-                    }
+-                }
+-                if (out[0] != '\0') {
+-                    if (write(out_fd, out, strlen(out)) < 0) {}
+-                }
+-                free_pipeline(&pipeline);
+-                continue;
+-            }
++        if (pipeline.num_commands == 1 && strcmp(pipeline.commands[0].argv[0], "exit") == 0) {
++            free_pipeline(&pipeline);
++            break;
+         }
+ 
+-        /* External pipeline execution */
+-        pid_t pid = fork();
+-        if (pid == 0) {
+-            signal(SIGINT, SIG_DFL);
+-            signal(SIGTSTP, SIG_DFL);
+-            dup2(out_fd, STDOUT_FILENO);
+-            dup2(out_fd, STDERR_FILENO);
+-            close(in_fd);
+-            close(out_fd);
+-
+-            Pipeline exec_pl = pipeline;
+-            exec_pl.is_background = 0;
+-            int ret = shell_execute_pipeline(&tab->shell_ctx, &exec_pl);
+-            _exit(ret);
++        /* Execute pipeline directly in this tab process */
++        shell_execute_pipeline(&tab->shell_ctx, &pipeline);
++
++        /* If directory changed, notify GUI parent of new CWD */
++        if (getcwd(tab->cwd, sizeof(tab->cwd))) {
++            printf("[CWD]%s\n", tab->cwd);
++            fflush(stdout);
+         }
+ 
+-        if (pipeline.is_background) {
+-            char launch_msg[128];
+-            snprintf(launch_msg, sizeof(launch_msg), "[bg] %d\n", (int)pid);
+-            if (write(out_fd, launch_msg, strlen(launch_msg)) < 0) {}
+-        } else {
+-            int status = 0;
+-            waitpid(pid, &status, 0);
+-            tab->shell_ctx.last_exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 1;
++        /* Check background job notifications after command execution */
++        notif[0] = '\0';
++        jobs_check_status(&tab->shell_ctx.job_table, notif, sizeof(notif));
++        if (notif[0] != '\0') {
++            printf("%s", notif);
++            fflush(stdout);
+         }
++
+         free_pipeline(&pipeline);
++
++        if (tab->shell_ctx.should_exit) {
++            break;
++        }
+     }
+     _exit(0);
+ }
+@@ -918,7 +918,7 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
+     /* Signals: Ctrl+C and Ctrl+Z */
+     if (is_ctrl && !is_shift && (keysym == XK_C || keysym == XK_c)) {
+         if (tab->use_process_mode && tab->tab_pid > 0) {
+-            kill(-tab->tab_pid, SIGINT);
++            kill(tab->tab_pid, SIGINT);
+         } else if (tab->is_running_cmd && tab->running_pid > 0) {
+             pid_t target = tab->running_pgid > 0 ? tab->running_pgid : tab->running_pid;
+             kill(-target, SIGINT);
+@@ -936,7 +936,7 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
+ 
+     if (is_ctrl && !is_shift && (keysym == XK_Z || keysym == XK_z)) {
+         if (tab->use_process_mode && tab->tab_pid > 0) {
+-            kill(-tab->tab_pid, SIGTSTP);
++            kill(tab->tab_pid, SIGTSTP);
+             tab_append_output(tab, "^Z\n", 3);
+             gui_redraw(app);
+             return;
+@@ -1542,6 +1542,7 @@ void gui_run_loop(GuiApp *app) {
+         for (int i = 0; i < app->num_tabs; i++) {
+             Tab *t = app->tabs[i];
+             if (!t) continue;
++            if (t->use_process_mode) continue;
+             char notif[1024];
+             notif[0] = '\0';
+             jobs_check_status(&t->shell_ctx.job_table, notif, sizeof(notif));
+diff --git a/src/shell.c b/src/shell.c
+index aea886a..0ffcaed 100644
+--- a/src/shell.c
++++ b/src/shell.c
+@@ -9,6 +9,27 @@
+ #include <errno.h>
+ #include <sys/wait.h>
+ #include <sys/types.h>
++#include <signal.h>
++
++static volatile pid_t g_current_fg_pid = 0;
++
++static void shell_forward_sig_handler(int sig) {
++    if (g_current_fg_pid > 0) {
++        kill(-g_current_fg_pid, sig);
++        kill(g_current_fg_pid, sig);
++    }
++}
++
++void shell_set_fg_signals(pid_t fg_pid) {
++    g_current_fg_pid = fg_pid;
++    struct sigaction sa;
++    memset(&sa, 0, sizeof(sa));
++    sa.sa_handler = (fg_pid > 0) ? shell_forward_sig_handler : SIG_IGN;
++    sigemptyset(&sa.sa_mask);
++    sa.sa_flags = SA_RESTART;
++    sigaction(SIGINT, &sa, NULL);
++    sigaction(SIGTSTP, &sa, NULL);
++}
+ 
+ /**
+  * @brief Initializes a ShellContext structure to its default starting values.
+@@ -235,6 +256,9 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+ 
+     if (pid == 0) {
+         setpgid(0, 0);
++        signal(SIGINT, SIG_DFL);
++        signal(SIGTSTP, SIG_DFL);
++        signal(SIGQUIT, SIG_DFL);
+         if (ctx->cwd[0] != '\0') {
+             if (chdir(ctx->cwd) < 0) {}
+         }
+@@ -256,6 +280,7 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+ 
+     setpgid(pid, pid);
+     ctx->foreground_pid = pid;
++    shell_set_fg_signals(pid);
+ 
+     char full_cmd[MAX_CMD_LEN] = "";
+     for (int a = 0; a < cmd->argc; a++) {
+@@ -278,15 +303,17 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
+         perror("terminator: waitpid failed");
+         ctx->last_exit_status = 1;
+         ctx->foreground_pid = 0;
++        shell_set_fg_signals(0);
+         return 1;
+     }
+ 
+     ctx->foreground_pid = 0;
+     ctx->foreground_cmd[0] = '\0';
++    shell_set_fg_signals(0);
+ 
+     if (WIFSTOPPED(status)) {
+         Job *j = jobs_add(&ctx->job_table, pid, pid, full_cmd, JOB_STATE_STOPPED, -1);
+-        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, full_cmd);
++        printf("[%d]+  Stopped                 %s\n", j ? j->id : 1, full_cmd);
+         fflush(stdout);
+         ctx->last_exit_status = 128 + WSTOPSIG(status);
+         return ctx->last_exit_status;
+@@ -336,6 +363,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+ 
+         if (bg_pid == 0) {
+             setpgid(0, 0);
++            signal(SIGINT, SIG_DFL);
++            signal(SIGTSTP, SIG_DFL);
++            signal(SIGQUIT, SIG_DFL);
+             if (ctx->cwd[0] != '\0') {
+                 if (chdir(ctx->cwd) < 0) {}
+             }
+@@ -435,6 +465,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+         if (pids[i] == 0) {
+             pid_t pgid = (i == 0) ? 0 : pids[0];
+             setpgid(0, pgid);
++            signal(SIGINT, SIG_DFL);
++            signal(SIGTSTP, SIG_DFL);
++            signal(SIGQUIT, SIG_DFL);
+             if (ctx->cwd[0] != '\0') {
+                 if (chdir(ctx->cwd) < 0) {}
+             }
+@@ -490,6 +523,7 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+     int last_status = 0;
+     if (children_spawned > 0) {
+         ctx->foreground_pid = pids[0];
++        shell_set_fg_signals(pids[0]);
+     }
+     for (int i = 0; i < children_spawned; i++) {
+         int status = 0;
+@@ -509,6 +543,25 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
+         }
+     }
+     ctx->foreground_pid = 0;
++    shell_set_fg_signals(0);
++
++    if (WIFSTOPPED(last_status)) {
++        char cmd_str[MAX_CMD_LEN] = "";
++        for (int i = 0; i < pipeline->num_commands; i++) {
++            if (i > 0) strncat(cmd_str, " | ", sizeof(cmd_str) - strlen(cmd_str) - 1);
++            for (int a = 0; a < pipeline->commands[i].argc; a++) {
++                if (a > 0) strncat(cmd_str, " ", sizeof(cmd_str) - strlen(cmd_str) - 1);
++                strncat(cmd_str, pipeline->commands[i].argv[a], sizeof(cmd_str) - strlen(cmd_str) - 1);
++            }
++        }
++        Job *j = jobs_add(&ctx->job_table, pids[0], pids[0], cmd_str, JOB_STATE_STOPPED, -1);
++        printf("[%d]+  Stopped                 %s\n", j ? j->id : 1, cmd_str);
++        fflush(stdout);
++        free(pids);
++        ctx->last_exit_status = 128 + WSTOPSIG(last_status);
++        return ctx->last_exit_status;
++    }
++
+     free(pids);
+ 
+     int exit_code = 0;

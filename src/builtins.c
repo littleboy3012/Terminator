@@ -319,15 +319,27 @@ int builtin_fg(ShellContext *ctx, char **argv) {
 
     ctx->foreground_pid = res_job.pid;
     snprintf(ctx->foreground_cmd, sizeof(ctx->foreground_cmd), "%s", res_job.command);
+    shell_set_fg_signals(res_job.pid);
 
     int status = 0;
-    waitpid(res_job.pid, &status, WUNTRACED);
+    while (waitpid(res_job.pid, &status, WUNTRACED) < 0) {
+        if (errno == EINTR) {
+            int st = 0;
+            if (waitpid(res_job.pid, &st, WUNTRACED | WNOHANG) > 0) {
+                status = st;
+                break;
+            }
+            continue;
+        }
+        break;
+    }
     ctx->foreground_pid = 0;
     ctx->foreground_cmd[0] = '\0';
+    shell_set_fg_signals(0);
 
     if (WIFSTOPPED(status)) {
         Job *j = jobs_add(&ctx->job_table, res_job.pgid, res_job.pid, res_job.command, JOB_STATE_STOPPED, -1);
-        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, res_job.command);
+        printf("[%d]+  Stopped                 %s\n", j ? j->id : 1, res_job.command);
         fflush(stdout);
         ctx->last_exit_status = 128 + WSTOPSIG(status);
         return ctx->last_exit_status;

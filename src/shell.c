@@ -9,6 +9,27 @@
 #include <errno.h>
 #include <sys/wait.h>
 #include <sys/types.h>
+#include <signal.h>
+
+static volatile pid_t g_current_fg_pid = 0;
+
+static void shell_forward_sig_handler(int sig) {
+    if (g_current_fg_pid > 0) {
+        kill(-g_current_fg_pid, sig);
+        kill(g_current_fg_pid, sig);
+    }
+}
+
+void shell_set_fg_signals(pid_t fg_pid) {
+    g_current_fg_pid = fg_pid;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = (fg_pid > 0) ? shell_forward_sig_handler : SIG_IGN;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_RESTART;
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGTSTP, &sa, NULL);
+}
 
 /**
  * @brief Initializes a ShellContext structure to its default starting values.
@@ -235,6 +256,9 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
 
     if (pid == 0) {
         setpgid(0, 0);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTSTP, SIG_DFL);
+        signal(SIGQUIT, SIG_DFL);
         if (ctx->cwd[0] != '\0') {
             if (chdir(ctx->cwd) < 0) {}
         }
@@ -256,6 +280,7 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
 
     setpgid(pid, pid);
     ctx->foreground_pid = pid;
+    shell_set_fg_signals(pid);
 
     char full_cmd[MAX_CMD_LEN] = "";
     for (int a = 0; a < cmd->argc; a++) {
@@ -278,15 +303,17 @@ int shell_execute_command(ShellContext *ctx, const Command *cmd) {
         perror("terminator: waitpid failed");
         ctx->last_exit_status = 1;
         ctx->foreground_pid = 0;
+        shell_set_fg_signals(0);
         return 1;
     }
 
     ctx->foreground_pid = 0;
     ctx->foreground_cmd[0] = '\0';
+    shell_set_fg_signals(0);
 
     if (WIFSTOPPED(status)) {
         Job *j = jobs_add(&ctx->job_table, pid, pid, full_cmd, JOB_STATE_STOPPED, -1);
-        printf("\n[%d]+  Stopped                 %s\n", j ? j->id : 1, full_cmd);
+        printf("[%d]+  Stopped                 %s\n", j ? j->id : 1, full_cmd);
         fflush(stdout);
         ctx->last_exit_status = 128 + WSTOPSIG(status);
         return ctx->last_exit_status;
@@ -336,6 +363,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
 
         if (bg_pid == 0) {
             setpgid(0, 0);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
             if (ctx->cwd[0] != '\0') {
                 if (chdir(ctx->cwd) < 0) {}
             }
@@ -435,6 +465,9 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
         if (pids[i] == 0) {
             pid_t pgid = (i == 0) ? 0 : pids[0];
             setpgid(0, pgid);
+            signal(SIGINT, SIG_DFL);
+            signal(SIGTSTP, SIG_DFL);
+            signal(SIGQUIT, SIG_DFL);
             if (ctx->cwd[0] != '\0') {
                 if (chdir(ctx->cwd) < 0) {}
             }
@@ -490,6 +523,7 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
     int last_status = 0;
     if (children_spawned > 0) {
         ctx->foreground_pid = pids[0];
+        shell_set_fg_signals(pids[0]);
     }
     for (int i = 0; i < children_spawned; i++) {
         int status = 0;
@@ -509,6 +543,25 @@ int shell_execute_pipeline(ShellContext *ctx, const Pipeline *pipeline) {
         }
     }
     ctx->foreground_pid = 0;
+    shell_set_fg_signals(0);
+
+    if (WIFSTOPPED(last_status)) {
+        char cmd_str[MAX_CMD_LEN] = "";
+        for (int i = 0; i < pipeline->num_commands; i++) {
+            if (i > 0) strncat(cmd_str, " | ", sizeof(cmd_str) - strlen(cmd_str) - 1);
+            for (int a = 0; a < pipeline->commands[i].argc; a++) {
+                if (a > 0) strncat(cmd_str, " ", sizeof(cmd_str) - strlen(cmd_str) - 1);
+                strncat(cmd_str, pipeline->commands[i].argv[a], sizeof(cmd_str) - strlen(cmd_str) - 1);
+            }
+        }
+        Job *j = jobs_add(&ctx->job_table, pids[0], pids[0], cmd_str, JOB_STATE_STOPPED, -1);
+        printf("[%d]+  Stopped                 %s\n", j ? j->id : 1, cmd_str);
+        fflush(stdout);
+        free(pids);
+        ctx->last_exit_status = 128 + WSTOPSIG(last_status);
+        return ctx->last_exit_status;
+    }
+
     free(pids);
 
     int exit_code = 0;

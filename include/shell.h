@@ -126,4 +126,11 @@ int setup_redirections(const char *input_file, const char *output_file);
  */
 int setup_command_redirections(const Command *cmd);
 
+/**
+ * @brief Configures signal forwarding for the active foreground process.
+ *
+ * @param[in] fg_pid PID of the active foreground process (or 0 when idle).
+ */
+void shell_set_fg_signals(pid_t fg_pid);
+
 #endif /* SHELL_H */

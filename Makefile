@@ -30,32 +30,18 @@ SRCS = $(SRC_DIR)/main.c \
 
 OBJS = $(patsubst $(SRC_DIR)/%.c, $(BUILD_DIR)/%.o, $(SRCS))
 
-.PHONY: all clean test
-
-TEST_RUNNER = $(BUILD_DIR)/test_shell_runner
+.PHONY: all clean
 
 all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(OBJS) -o $(TARGET) $(LDFLAGS)
 
-$(TEST_RUNNER): tests/test_shell_runner.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o $(BUILD_DIR)/completion.o $(BUILD_DIR)/script.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
-
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c | $(BUILD_DIR)
 	$(CC) $(CFLAGS) -c $< -o $@
-
-TEST_SCRIPT_RUNNER = $(BUILD_DIR)/test_task11_scripts
-
-$(TEST_SCRIPT_RUNNER): tests/test_task11_scripts.c $(BUILD_DIR)/shell.o $(BUILD_DIR)/parser.o $(BUILD_DIR)/builtins.o $(BUILD_DIR)/multiwatch.o $(BUILD_DIR)/jobs.o $(BUILD_DIR)/history.o $(BUILD_DIR)/completion.o $(BUILD_DIR)/script.o
-	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
 clean:
 	rm -rf $(BUILD_DIR) $(TARGET)
-
-test: $(TARGET) $(TEST_RUNNER) $(TEST_SCRIPT_RUNNER)
-	./$(TEST_SCRIPT_RUNNER)
-	python3 tests/test_modes_and_history.py

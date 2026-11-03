@@ -207,8 +207,9 @@ flowchart TD
    - Checks multiline completeness using `parser.c:is_command_incomplete()`.
    - Appends finalized command to shared history via `history.c:history_add(cmd_str)`.
    - If **Process Mode**: writes command string to `tab->to_tab_fd` with `\n` and returns. The tab child process executes it inside `tab_process_main()`:
-     - Built-ins run via `execute_builtin_captured()`; if `cd` succeeds, tab writes `[CWD]<path>\n` to `out_pipe_fd` to update the GUI tab bar.
-     - External commands are forked with `dup2(out_fd, 1)` and `dup2(out_fd, 2)`.
+     - Direct pipeline execution via `shell_execute_pipeline()` with unbuffered stdout/stderr (`dup2` to `out_fd`), streaming output straight to the GUI.
+     - Built-ins run in-process within the tab's dedicated context; if `cd` succeeds, tab writes `[CWD]<path>\n` to `out_fd` to update the GUI tab bar.
+     - Foreground external commands and pipelines fork with reset signal dispositions (`SIG_DFL`) and process group management (`setpgid`), while `shell_set_fg_signals()` installs signal forwarding handlers for `SIGINT` and `SIGTSTP`.
    - If **Thread Mode**: passes `cmd_str` to `parser.c:parse_line()`.
 2. **`parser.c:parse_line(cmd_str, ctx, pipeline)`**:
    - Splits tokens on whitespace, recognizing single quotes `'`, double quotes `"`, and redirections `<`, `>`.
@@ -458,16 +459,14 @@ flowchart LR
 1. **Foreground Signal Delivery (`gui.c:gui_handle_key_press`)**:
    - X11 intercepts keystrokes as `KeyPress` events. Terminator converts them into OS signals:
      - In **Process Mode**:
-       - `Ctrl+C`: sends `kill(-tab->tab_pid, SIGINT)` directly to the dedicated tab child process group.
-       - `Ctrl+Z`: sends `kill(-tab->tab_pid, SIGTSTP)` directly to the dedicated tab child process group.
+       - `Ctrl+C`: sends `kill(tab->tab_pid, SIGINT)` to the tab process. The tab process forwards `SIGINT` directly to the active foreground process (`g_current_fg_pid`), terminating the foreground command while the shell prompt recovers cleanly.
+       - `Ctrl+Z`: sends `kill(tab->tab_pid, SIGTSTP)` to the tab process. The tab process forwards `SIGTSTP` directly to the active foreground process (`g_current_fg_pid`), cleanly suspending it.
      - In **Thread Mode**:
        - `Ctrl+C`: if foreground command running, sends `kill(-tab->running_pgid, SIGINT)` and `kill(tab->running_pid, SIGINT)`. Terminator itself never terminates.
        - `Ctrl+Z`: sends `kill(-tab->running_pgid, SIGTSTP)` and `kill(tab->running_pid, SIGTSTP)`.
-2. **Suspending into Job Table (`gui.c:gui_handle_key_press`)**:
-   - In Thread Mode on `Ctrl+Z`, registers stopped process group in table:
-     `jobs_add(&tab->shell_ctx.job_table, pgid, pid, cmd, JOB_STATE_STOPPED, pipe_fd)`.
-   - Prints status notice: `[^Z\n[1]+  Stopped                 <cmd>]`.
-   - Clears `tab->is_running_cmd = 0`, freeing prompt for input.
+2. **Suspending into Job Table**:
+   - In **Process Mode**: `waitpid(..., WUNTRACED)` unblocks with `WIFSTOPPED(status) == true`. `shell_execute_command` registers the stopped job via `jobs_add(&ctx->job_table, pid, pid, cmd, JOB_STATE_STOPPED, -1)` and writes `[1]+  Stopped  <cmd>\n` to the GUI pipe. `tab_process_main` immediately reads the next buffered command (e.g. `ls`) or awaits user input.
+   - In **Thread Mode**: registers stopped process group via `jobs_add(&tab->shell_ctx.job_table, pgid, pid, cmd, JOB_STATE_STOPPED, pipe_fd)`. Prints notice `[^Z\n[1]+  Stopped  <cmd>]`, clears `tab->is_running_cmd = 0`, and restores prompt.
 3. **Background Execution (`cmd &`)**:
    - `parser.c:parse_line()` detects trailing `&`, sets `pipeline->is_background = 1`.
    - Spawns process group in background.
