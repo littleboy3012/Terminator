@@ -79,6 +79,14 @@ typedef struct {
     char completion_dir_prefix[PATH_MAX];   /**< Directory prefix to prepend to candidate */
     char pending_cmds[MAX_PENDING_CMDS][MAX_LINE_CHARS * 4]; /**< Queued commands submitted while a foreground command was running */
     int pending_cmd_count;                  /**< Number of queued pending commands */
+
+    /* Mouse text selection */
+    int has_selection;                      /**< 1 if text is currently selected */
+    int is_selecting;                       /**< 1 while mouse drag selection is active */
+    int sel_start_line;                     /**< Start line index in buffer */
+    int sel_start_col;                      /**< Start column index */
+    int sel_end_line;                       /**< End line index in buffer */
+    int sel_end_col;                        /**< End column index */
 } Tab;
 
 /**
@@ -107,6 +115,8 @@ typedef struct {
     GC gc_tab_active_bg;     /**< Graphics Context for active tab highlight background */
     GC gc_tab_active_text;   /**< Graphics Context for active tab label text */
     GC gc_scrollbar;         /**< Graphics Context for the right-side scrollbar indicator */
+    GC gc_selection_bg;      /**< Graphics Context for highlighted text selection background */
+    GC gc_selection_text;    /**< Graphics Context for highlighted text characters */
 
     /* Tab management */
     Tab *tabs[MAX_TABS];     /**< Array of active Tab pointers */
@@ -120,7 +130,7 @@ typedef struct {
     Atom atom_utf8_string;   /**< X11 UTF8_STRING target atom */
     Atom atom_targets;       /**< X11 TARGETS atom */
     Atom atom_terminator_sel;/**< Custom property atom for receiving pasted selection data */
-    char clipboard_data[MAX_LINE_CHARS * 4]; /**< Internal clipboard buffer for copy/paste */
+    char clipboard_data[65536]; /**< Internal clipboard buffer for copy/paste */
     int clipboard_len;       /**< Length of active clipboard content */
 
     int is_running;          /**< Application loop flag (1 = running, 0 = exit application) */
@@ -212,6 +222,42 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event);
  * @param[in] event Pointer to XButtonEvent.
  */
 void gui_handle_button_press(GuiApp *app, XButtonEvent *event);
+
+/**
+ * @brief Handles X11 ButtonRelease events (finishing mouse text selection).
+ *
+ * @param[in,out] app Pointer to GuiApp.
+ * @param[in] event Pointer to XButtonEvent.
+ */
+void gui_handle_button_release(GuiApp *app, XButtonEvent *event);
+
+/**
+ * @brief Handles X11 MotionNotify events (dragging to select text).
+ *
+ * @param[in,out] app Pointer to GuiApp.
+ * @param[in] event Pointer to XMotionEvent.
+ */
+void gui_handle_motion_notify(GuiApp *app, XMotionEvent *event);
+
+/**
+ * @brief Converts window pixel coordinates to text line and column coordinates.
+ *
+ * @param[in] app Pointer to GuiApp.
+ * @param[in] tab Pointer to Tab.
+ * @param[in] x Mouse X pixel coordinate.
+ * @param[in] y Mouse Y pixel coordinate.
+ * @param[out] out_line Pointer to destination line index.
+ * @param[out] out_col Pointer to destination column index.
+ */
+void gui_pixel_to_coord(GuiApp *app, Tab *tab, int x, int y, int *out_line, int *out_col);
+
+/**
+ * @brief Copies currently selected text in tab to internal and X11 clipboards.
+ *
+ * @param[in,out] app Pointer to GuiApp.
+ * @param[in] tab Pointer to Tab.
+ */
+void tab_copy_selection_to_clipboard(GuiApp *app, Tab *tab);
 
 /**
  * @brief Redraws the entire terminal window: tab bar, scrollback text, prompt, and input line.

@@ -75,6 +75,13 @@ static TermLine *tab_new_line(Tab *tab, LineType type, int prompt_len) {
         tab->num_lines++;
     } else {
         memmove(&tab->lines[0], &tab->lines[1], sizeof(TermLine) * (MAX_BUFFER_LINES - 1));
+        if (tab->has_selection || tab->is_selecting) {
+            tab->sel_start_line--;
+            tab->sel_end_line--;
+            if (tab->sel_end_line < 0) {
+                tab->has_selection = 0;
+            }
+        }
     }
     TermLine *l = &tab->lines[tab->num_lines - 1];
     memset(l, 0, sizeof(TermLine));
@@ -257,6 +264,8 @@ int gui_init(GuiApp *app, int width, int height, const char *title, int use_proc
     unsigned long col_tab_act  = allocate_color(app->display, cm, 0x2A2A, 0x4444, 0x2A2A);
     unsigned long col_tab_text = allocate_color(app->display, cm, 0x8888, 0xAAAA, 0x8888);
     unsigned long col_scroll   = allocate_color(app->display, cm, 0x5555, 0x7777, 0x5555);
+    unsigned long col_sel_bg   = allocate_color(app->display, cm, 0x2A2A, 0x5555, 0x8888);
+    unsigned long col_white    = allocate_color(app->display, cm, 0xFFFF, 0xFFFF, 0xFFFF);
 
     app->window = XCreateSimpleWindow(app->display, RootWindow(app->display, app->screen),
                                       100, 100, app->win_width, app->win_height, 1,
@@ -264,7 +273,7 @@ int gui_init(GuiApp *app, int width, int height, const char *title, int use_proc
 
     XStoreName(app->display, app->window, title);
     XSetIconName(app->display, app->window, title);
-    XSelectInput(app->display, app->window, KeyPressMask | ButtonPressMask | ExposureMask | StructureNotifyMask);
+    XSelectInput(app->display, app->window, KeyPressMask | ButtonPressMask | ButtonReleaseMask | Button1MotionMask | ExposureMask | StructureNotifyMask);
 
     const char *font_candidates[] = {
         "-misc-fixed-medium-r-normal--20-*-*-*-*-*-iso8859-1", "10x20",
@@ -297,6 +306,8 @@ int gui_init(GuiApp *app, int width, int height, const char *title, int use_proc
     app->gc_tab_text       = create_gc(app->display, app->window, col_tab_text, app->font);
     app->gc_tab_active_text= create_gc(app->display, app->window, col_green, app->font);
     app->gc_scrollbar      = create_gc(app->display, app->window, col_scroll, NULL);
+    app->gc_selection_bg   = create_gc(app->display, app->window, col_sel_bg, app->font);
+    app->gc_selection_text = create_gc(app->display, app->window, col_white, app->font);
 
     app->back_buffer = XCreatePixmap(app->display, app->window, app->win_width, app->win_height,
                                      DefaultDepth(app->display, app->screen));
@@ -360,7 +371,8 @@ void gui_cleanup(GuiApp *app) {
 
     GC gcs[] = { app->gc_bg, app->gc_prompt, app->gc_input, app->gc_output, app->gc_cursor,
                  app->gc_tab_bar_bg, app->gc_tab_active_bg, app->gc_tab_text,
-                 app->gc_tab_active_text, app->gc_scrollbar };
+                 app->gc_tab_active_text, app->gc_scrollbar,
+                 app->gc_selection_bg, app->gc_selection_text };
     for (size_t i = 0; i < sizeof(gcs)/sizeof(gcs[0]); i++) {
         if (gcs[i]) XFreeGC(app->display, gcs[i]);
     }
@@ -571,6 +583,8 @@ static void tab_execute_cmd_string(GuiApp *app, Tab *tab, const char *cmd_str) {
         if (strcmp(cmd->argv[0], "clear") == 0) {
             tab->num_lines = 0;
             tab->scroll_offset = 0;
+            tab->has_selection = 0;
+            tab->is_selecting = 0;
             free_pipeline(&pipeline);
             gui_redraw(app);
             return;
@@ -718,6 +732,8 @@ static void tab_flush_pending_commands(GuiApp *app, Tab *tab) {
 void tab_submit_command(GuiApp *app, Tab *tab) {
     if (!app || !tab) return;
 
+    tab->has_selection = 0;
+    tab->is_selecting = 0;
     tab->scroll_offset = 0;
     const char *prompt_used = tab->is_multiline ? "> " : PROMPT_STRING;
     int p_len = (int)strlen(prompt_used);
@@ -1024,6 +1040,14 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
     }
 
     /* Basic cursor movement & submission */
+    if (keysym == XK_Escape) {
+        if (tab->has_selection) {
+            tab->has_selection = 0;
+            tab->is_selecting = 0;
+            gui_redraw(app);
+            return;
+        }
+    }
     if (keysym == XK_Home) { tab->cursor_pos = 0; gui_redraw(app); return; }
     if (keysym == XK_End)  { tab->cursor_pos = tab->input_len; gui_redraw(app); return; }
     if (keysym == XK_Return || keysym == XK_KP_Enter) {
@@ -1090,6 +1114,8 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
             case HOTKEY_CLEAR_SCREEN:
                 tab->num_lines = 0;
                 tab->scroll_offset = 0;
+                tab->has_selection = 0;
+                tab->is_selecting = 0;
                 gui_redraw(app);
                 return;
             case HOTKEY_EXIT_SHELL:
@@ -1100,6 +1126,10 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
                 }
                 break;
             case HOTKEY_COPY:
+                if (tab->has_selection) {
+                    tab_copy_selection_to_clipboard(app, tab);
+                    return;
+                }
                 if (tab->input_len > 0) {
                     snprintf(app->clipboard_data, sizeof(app->clipboard_data), "%s", tab->input_buffer);
                     app->clipboard_len = (int)strlen(app->clipboard_data);
@@ -1196,8 +1226,149 @@ void gui_handle_key_press(GuiApp *app, XKeyEvent *event) {
 
     /* Printable ASCII character entry */
     if (count > 0 && buffer[0] >= 32 && buffer[0] <= 126) {
+        tab->has_selection = 0;
         tab_insert_char(tab, buffer[0]);
         gui_redraw(app);
+    }
+}
+
+static void get_normalized_selection(Tab *tab, int *s_line, int *s_col, int *e_line, int *e_col) {
+    *s_line = tab->sel_start_line;
+    *s_col = tab->sel_start_col;
+    *e_line = tab->sel_end_line;
+    *e_col = tab->sel_end_col;
+
+    if (*s_line > *e_line || (*s_line == *e_line && *s_col > *e_col)) {
+        int tmp_l = *s_line; *s_line = *e_line; *e_line = tmp_l;
+        int tmp_c = *s_col; *s_col = *e_col; *e_col = tmp_c;
+    }
+}
+
+void gui_pixel_to_coord(GuiApp *app, Tab *tab, int x, int y, int *out_line, int *out_col) {
+    if (!app || !tab || !out_line || !out_col) return;
+
+    int cols = get_term_cols(app);
+    const char *active_p = tab->is_searching_history ? "Enter search term: " :
+                           (tab->is_multiline ? "> " : PROMPT_STRING);
+    int p_len = (int)strlen(active_p);
+    int first_cap = get_first_line_capacity(app, p_len);
+    int cur_input_len = tab->is_searching_history ? tab->search_query_len : tab->input_len;
+
+    int active_rows = 1;
+    if (cur_input_len > first_cap) {
+        active_rows = 1 + (cur_input_len - first_cap + cols - 1) / cols;
+    }
+
+    int content_top = TAB_BAR_HEIGHT + 10;
+    int visible_rows = (app->win_height - content_top - (active_rows * app->font_height)) / app->font_height;
+    if (visible_rows <= 0) visible_rows = 1;
+
+    int max_scroll = tab->num_lines > visible_rows ? (tab->num_lines - visible_rows) : 0;
+    int scroll_off = tab->scroll_offset;
+    if (scroll_off > max_scroll) scroll_off = max_scroll;
+    if (scroll_off < 0) scroll_off = 0;
+
+    int start_l = max_scroll - scroll_off;
+    int end_l = start_l + visible_rows;
+    if (end_l > tab->num_lines) end_l = tab->num_lines;
+
+    int row = (y - content_top) / app->font_height;
+    if (row < 0) row = 0;
+
+    int num_vis_buf = end_l - start_l;
+    if (row < num_vis_buf) {
+        *out_line = start_l + row;
+        if (*out_line >= tab->num_lines) *out_line = tab->num_lines > 0 ? tab->num_lines - 1 : 0;
+        if (*out_line < 0) *out_line = 0;
+    } else {
+        *out_line = tab->num_lines;
+    }
+
+    int col = (x - 10) / app->font_width;
+    if (col < 0) col = 0;
+
+    int max_col = 0;
+    if (*out_line < tab->num_lines) {
+        max_col = (int)strlen(tab->lines[*out_line].text);
+    } else {
+        max_col = p_len + cur_input_len;
+    }
+
+    if (col > max_col) col = max_col;
+    *out_col = col;
+}
+
+void tab_copy_selection_to_clipboard(GuiApp *app, Tab *tab) {
+    if (!app || !tab || !tab->has_selection) return;
+
+    int s_line, s_col, e_line, e_col;
+    get_normalized_selection(tab, &s_line, &s_col, &e_line, &e_col);
+
+    if (s_line == e_line && s_col == e_col) return;
+
+    int pos = 0;
+    int max_len = (int)sizeof(app->clipboard_data) - 1;
+    app->clipboard_data[0] = '\0';
+
+    const char *active_p = tab->is_searching_history ? "Enter search term: " :
+                           (tab->is_multiline ? "> " : PROMPT_STRING);
+    const char *cur_input = tab->is_searching_history ? tab->search_query : tab->input_buffer;
+    char prompt_buf[MAX_LINE_CHARS * 2];
+    snprintf(prompt_buf, sizeof(prompt_buf), "%s%s", active_p, cur_input);
+
+    for (int l = s_line; l <= e_line; l++) {
+        const char *src = NULL;
+        if (l < tab->num_lines) {
+            src = tab->lines[l].text;
+        } else if (l == tab->num_lines) {
+            src = prompt_buf;
+        } else {
+            break;
+        }
+
+        int len = (int)strlen(src);
+        int c_start = 0;
+        int c_end = len;
+
+        if (s_line == e_line) {
+            c_start = s_col;
+            c_end = e_col;
+        } else if (l == s_line) {
+            c_start = s_col;
+            c_end = len;
+        } else if (l == e_line) {
+            c_start = 0;
+            c_end = e_col;
+        } else {
+            c_start = 0;
+            c_end = len;
+        }
+
+        if (c_start < 0) c_start = 0;
+        if (c_start > len) c_start = len;
+        if (c_end < 0) c_end = 0;
+        if (c_end > len) c_end = len;
+
+        int count = c_end - c_start;
+        if (count > 0) {
+            if (pos + count > max_len) count = max_len - pos;
+            if (count > 0) {
+                memcpy(app->clipboard_data + pos, src + c_start, count);
+                pos += count;
+            }
+        }
+
+        if (l < e_line && pos < max_len) {
+            app->clipboard_data[pos++] = '\n';
+        }
+    }
+
+    app->clipboard_data[pos] = '\0';
+    app->clipboard_len = pos;
+
+    if (app->clipboard_len > 0) {
+        XSetSelectionOwner(app->display, app->atom_clipboard, app->window, CurrentTime);
+        XSetSelectionOwner(app->display, XA_PRIMARY, app->window, CurrentTime);
     }
 }
 
@@ -1219,25 +1390,86 @@ void gui_handle_button_press(GuiApp *app, XButtonEvent *event) {
         return;
     }
 
-    if (event->y > TAB_BAR_HEIGHT) return;
+    if (event->y <= TAB_BAR_HEIGHT) {
+        int plus_x, plus_w, tab_w, spacing;
+        get_tab_bar_layout(app, &plus_x, &plus_w, &tab_w, &spacing);
 
-    int plus_x, plus_w, tab_w, spacing;
-    get_tab_bar_layout(app, &plus_x, &plus_w, &tab_w, &spacing);
+        if (event->x >= plus_x && event->x <= plus_x + plus_w) {
+            gui_create_tab(app, tab->cwd);
+            gui_redraw(app);
+            return;
+        }
 
-    if (event->x >= plus_x && event->x <= plus_x + plus_w) {
-        gui_create_tab(app, tab->cwd);
+        int cur_x = 10;
+        for (int i = 0; i < app->num_tabs; i++) {
+            if (event->x >= cur_x && event->x < cur_x + tab_w) {
+                gui_switch_tab(app, i);
+                gui_redraw(app);
+                return;
+            }
+            cur_x += tab_w + spacing;
+        }
+        return;
+    }
+
+    /* Content Area handling */
+    if (event->button == 1) {
+        int line = 0, col = 0;
+        gui_pixel_to_coord(app, tab, event->x, event->y, &line, &col);
+        tab->is_selecting = 1;
+        tab->has_selection = 0;
+        tab->sel_start_line = line;
+        tab->sel_start_col = col;
+        tab->sel_end_line = line;
+        tab->sel_end_col = col;
         gui_redraw(app);
         return;
     }
 
-    int cur_x = 10;
-    for (int i = 0; i < app->num_tabs; i++) {
-        if (event->x >= cur_x && event->x < cur_x + tab_w) {
-            gui_switch_tab(app, i);
-            gui_redraw(app);
-            return;
+    if (event->button == 2) {
+        XConvertSelection(app->display, XA_PRIMARY, app->atom_utf8_string,
+                          app->atom_terminator_sel, app->window, CurrentTime);
+        return;
+    }
+}
+
+void gui_handle_motion_notify(GuiApp *app, XMotionEvent *event) {
+    if (!app || app->num_tabs == 0) return;
+    Tab *tab = app->tabs[app->active_tab_idx];
+    if (!tab || !tab->is_selecting) return;
+
+    int line = 0, col = 0;
+    gui_pixel_to_coord(app, tab, event->x, event->y, &line, &col);
+    tab->sel_end_line = line;
+    tab->sel_end_col = col;
+
+    if (tab->sel_start_line != tab->sel_end_line || tab->sel_start_col != tab->sel_end_col) {
+        tab->has_selection = 1;
+    } else {
+        tab->has_selection = 0;
+    }
+    gui_redraw(app);
+}
+
+void gui_handle_button_release(GuiApp *app, XButtonEvent *event) {
+    if (!app || app->num_tabs == 0) return;
+    Tab *tab = app->tabs[app->active_tab_idx];
+    if (!tab) return;
+
+    if (event->button == 1 && tab->is_selecting) {
+        tab->is_selecting = 0;
+        int line = 0, col = 0;
+        gui_pixel_to_coord(app, tab, event->x, event->y, &line, &col);
+        tab->sel_end_line = line;
+        tab->sel_end_col = col;
+
+        if (tab->sel_start_line != tab->sel_end_line || tab->sel_start_col != tab->sel_end_col) {
+            tab->has_selection = 1;
+            tab_copy_selection_to_clipboard(app, tab);
+        } else {
+            tab->has_selection = 0;
         }
-        cur_x += tab_w + spacing;
+        gui_redraw(app);
     }
 }
 
@@ -1248,6 +1480,11 @@ void gui_handle_button_press(GuiApp *app, XButtonEvent *event) {
 void gui_redraw(GuiApp *app) {
     if (!app || !app->display || app->num_tabs == 0) return;
     Tab *tab = app->tabs[app->active_tab_idx];
+
+    int s_line = 0, s_col = 0, e_line = 0, e_col = 0;
+    if (tab->has_selection) {
+        get_normalized_selection(tab, &s_line, &s_col, &e_line, &e_col);
+    }
 
     XFillRectangle(app->display, app->back_buffer, app->gc_bg, 0, 0, app->win_width, app->win_height);
     XFillRectangle(app->display, app->back_buffer, app->gc_tab_bar_bg, 0, 0, app->win_width, TAB_BAR_HEIGHT);
@@ -1336,6 +1573,43 @@ void gui_redraw(GuiApp *app) {
         } else {
             XDrawString(app->display, app->back_buffer, app->gc_output, 10, cur_y, line->text, (int)strlen(line->text));
         }
+
+        /* Draw selection highlight on line i if selected */
+        if (tab->has_selection && i >= s_line && i <= e_line) {
+            int line_len = (int)strlen(line->text);
+            int c_start = 0, c_end = line_len;
+            if (s_line == e_line) {
+                c_start = s_col;
+                c_end = e_col;
+            } else if (i == s_line) {
+                c_start = s_col;
+                c_end = line_len;
+            } else if (i == e_line) {
+                c_start = 0;
+                c_end = e_col;
+            } else {
+                c_start = 0;
+                c_end = line_len;
+            }
+
+            if (c_start < 0) c_start = 0;
+            if (c_start > line_len) c_start = line_len;
+            if (c_end < 0) c_end = 0;
+            if (c_end > line_len) c_end = line_len;
+
+            int sel_count = c_end - c_start;
+            if (sel_count > 0) {
+                int sel_x = 10 + c_start * app->font_width;
+                int sel_y = cur_y - app->font_ascent;
+                int sel_w = sel_count * app->font_width;
+                int sel_h = app->font_height;
+
+                XFillRectangle(app->display, app->back_buffer, app->gc_selection_bg, sel_x, sel_y, sel_w, sel_h);
+                XDrawString(app->display, app->back_buffer, app->gc_selection_text, sel_x, cur_y,
+                            line->text + c_start, sel_count);
+            }
+        }
+
         cur_y += app->font_height;
     }
 
@@ -1356,6 +1630,44 @@ void gui_redraw(GuiApp *app) {
                         10, cur_y + (row * app->font_height), cur_input_buf + off, chunk);
             off += chunk;
             row++;
+        }
+    }
+
+    /* Draw selection highlight on active prompt line if selected */
+    if (tab->has_selection && tab->num_lines >= s_line && tab->num_lines <= e_line) {
+        int prompt_total_len = p_len + line0_chars;
+        int c_start = 0, c_end = prompt_total_len;
+        if (s_line == e_line) {
+            c_start = s_col;
+            c_end = e_col;
+        } else if (tab->num_lines == s_line) {
+            c_start = s_col;
+            c_end = prompt_total_len;
+        } else if (tab->num_lines == e_line) {
+            c_start = 0;
+            c_end = e_col;
+        } else {
+            c_start = 0;
+            c_end = prompt_total_len;
+        }
+
+        if (c_start < 0) c_start = 0;
+        if (c_start > prompt_total_len) c_start = prompt_total_len;
+        if (c_end < 0) c_end = 0;
+        if (c_end > prompt_total_len) c_end = prompt_total_len;
+
+        int sel_count = c_end - c_start;
+        if (sel_count > 0) {
+            char pbuf[MAX_LINE_CHARS * 2];
+            snprintf(pbuf, sizeof(pbuf), "%s%.*s", active_p, line0_chars, cur_input_buf);
+            int sel_x = 10 + c_start * app->font_width;
+            int sel_y = cur_y - app->font_ascent;
+            int sel_w = sel_count * app->font_width;
+            int sel_h = app->font_height;
+
+            XFillRectangle(app->display, app->back_buffer, app->gc_selection_bg, sel_x, sel_y, sel_w, sel_h);
+            XDrawString(app->display, app->back_buffer, app->gc_selection_text, sel_x, cur_y,
+                        pbuf + c_start, sel_count);
         }
     }
 
@@ -1422,6 +1734,14 @@ void gui_run_loop(GuiApp *app) {
 
                 case ButtonPress:
                     gui_handle_button_press(app, &ev.xbutton);
+                    break;
+
+                case ButtonRelease:
+                    gui_handle_button_release(app, &ev.xbutton);
+                    break;
+
+                case MotionNotify:
+                    gui_handle_motion_notify(app, &ev.xmotion);
                     break;
 
                 case ClientMessage:
